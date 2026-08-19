@@ -106,6 +106,13 @@ pub enum AcceptorMode {
     /// speak a proxy protocol (RDCleanPath) that informs it of the
     /// lower-layer TLS; vanilla mstsc/xfreerdp will not work via this mode.
     PreAuthenticated,
+    /// Hyper-V Enhanced Session mode: read the Preconnection Blob (PCB V2)
+    /// from the stream before TLS, then perform TLS + CredSSP (before X.224),
+    /// then hand off to the IronRDP acceptor for the standard RDP flow.
+    ///
+    /// This mode is used by the vsock listener when Hyper-V Enhanced Session
+    /// is active (vmconnect.exe connects via HvSocket/vsock).
+    EnhancedSession,
 }
 
 impl fmt::Display for PeerAddr {
@@ -133,6 +140,15 @@ impl AcceptedConnection {
             peer,
             stream,
             mode: AcceptorMode::Standard,
+        }
+    }
+
+    /// Constructor for Hyper-V Enhanced Session mode (vsock + PCB + CredSSP before X.224).
+    pub fn enhanced_session(peer: PeerAddr, stream: Box<dyn AsyncRdpStream>) -> Self {
+        Self {
+            peer,
+            stream,
+            mode: AcceptorMode::EnhancedSession,
         }
     }
 }
@@ -405,7 +421,7 @@ impl Listener for VsockListenerImpl {
     async fn accept(&mut self) -> Result<Option<AcceptedConnection>, TransportError> {
         let (stream, peer_addr) = self.listener.accept().await.map_err(TransportError::Io)?;
         let _ = self.port; // suppress dead-code lint in case port isn't otherwise read
-        Ok(Some(AcceptedConnection::standard(
+        Ok(Some(AcceptedConnection::enhanced_session(
             PeerAddr::Vsock {
                 cid: peer_addr.cid(),
                 port: peer_addr.port(),

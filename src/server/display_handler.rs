@@ -95,6 +95,149 @@ use crate::{
     video::{BitmapConverter, BitmapUpdate, RdpPixelFormat},
 };
 
+/// Change the compositor output resolution to match the requested RDP desktop size.
+///
+/// On KDE/KWin, this calls `kscreen-doctor` to set the DRM output mode before
+/// the PipeWire stream is recreated. KWin's ScreenCast always captures at the
+/// output's current resolution, so without this step the recreated stream would
+/// still negotiate the old dimensions.
+///
+/// If the exact requested resolution is not available (e.g., the client asks for
+/// 2560x1440 but the DRM driver only supports up to 1920x1080), the closest
+/// available mode is selected by total pixel count.
+///
+/// On GNOME/mutter this is a no-op — mutter's ScreenCast API creates a stream
+/// at the requested resolution regardless of the output mode.
+fn change_compositor_resolution(width: u16, height: u16) -> (u16, u16) {
+    // Only attempt on KDE (check env vars and kscreen-doctor availability)
+    let xdg_current_desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
+    let is_kde = xdg_current_desktop.contains("KDE")
+        || std::env::var("KDE_FULL_SESSION").is_ok();
+
+    if !is_kde {
+        return (width, height);
+    }
+
+    // Query available modes from kscreen-doctor and find the best match.
+    // kscreen-doctor --outputs prints lines like:
+    //   Modes:  1:1024x768@60*!  2:1920x1080@60  3:1600x1200@60 ...
+    let modes_output = std::process::Command::new("kscreen-doctor")
+        .arg("--outputs")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output();
+
+    let (best_w, best_h) = match modes_output {
+        Ok(out) if out.status.success() => {
+            let text = String::from_utf8_lossy(&out.stdout);
+            find_best_mode(&text, width as u32, height as u32)
+        }
+        _ => {
+            // Can't query modes — try the exact resolution as a fallback
+            (width as u32, height as u32)
+        }
+    };
+
+    if (best_w, best_h) == (width as u32, height as u32) {
+        info!("Changing compositor output to {width}x{height} via kscreen-doctor");
+    } else {
+        info!(
+            "Requested {width}x{height} not available — using closest mode {best_w}x{best_h} via kscreen-doctor"
+        );
+    }
+
+    let mode_arg = format!("output.1.mode.{best_w}x{best_h}@60");
+
+    let result = std::process::Command::new("kscreen-doctor")
+        .arg(&mode_arg)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output();
+
+    match result {
+        Ok(output) => {
+            // kscreen-doctor may exit 0 even on failure (mode not found).
+            // Check stderr/stdout for "not found" to detect this.
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let combined = format!("{}{}", stdout, stderr);
+
+            if combined.contains("not found") || !output.status.success() {
+                warn!(
+                    "kscreen-doctor failed for {best_w}x{best_h}: {}",
+                    combined.trim()
+                );
+            } else {
+                info!("Compositor resolution changed to {best_w}x{best_h}");
+                // Give the compositor a brief moment to settle the mode change
+                // before we recreate the PipeWire stream.
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+        }
+        Err(e) => {
+            // kscreen-doctor not in PATH or exec error
+            warn!(
+                "Could not execute kscreen-doctor for {best_w}x{best_h}: {e} \
+                 — compositor output may stay at previous resolution"
+            );
+        }
+    }
+
+    (best_w as u16, best_h as u16)
+}
+
+/// Parse kscreen-doctor --outputs text and find the mode closest to the
+/// requested resolution. Modes are listed as "N:WxH@rate" on the Modes: line.
+/// Returns the (width, height) of the best matching mode, or the requested
+/// size if no modes are found.
+fn find_best_mode(kscreen_output: &str, req_w: u32, req_h: u32) -> (u32, u32) {
+    let req_pixels = req_w as u64 * req_h as u64;
+    let mut best: Option<(u32, u32, u64)> = None; // (w, h, pixel_diff)
+
+    for line in kscreen_output.lines() {
+        if !line.contains("Modes:") {
+            continue;
+        }
+        // Parse mode entries like "1:1024x768@60*!" or "2:1920x1080@60"
+        for token in line.split_whitespace() {
+            // Token format: "N:WxH@rate" possibly with trailing "*" or "!"
+            // Strip leading number and colon
+            let Some((_num, after_colon)) = token.split_once(':') else {
+                continue;
+            };
+            // Remove trailing markers like * or !
+            let mode_str = after_colon.trim_end_matches(|c| c == '*' || c == '!');
+            // Parse "WxH@rate"
+            let Some(size_part) = mode_str.split_once('@') else {
+                continue;
+            };
+            let Some((w_str, h_str)) = size_part.0.split_once('x') else {
+                continue;
+            };
+            let Ok(w) = w_str.parse::<u32>() else { continue };
+            let Ok(h) = h_str.parse::<u32>() else { continue };
+
+            let mode_pixels = w as u64 * h as u64;
+            let diff = mode_pixels.abs_diff(req_pixels);
+
+            // Prefer the mode with the smallest pixel difference.
+            // On ties, prefer the larger mode (better for the client).
+            if best.is_none() || diff < best.unwrap().2 {
+                best = Some((w, h, diff));
+            } else if diff == best.unwrap().2 && mode_pixels > req_pixels {
+                best = Some((w, h, diff));
+            }
+        }
+    }
+
+    match best {
+        Some((w, h, _)) => (w, h),
+        None => (req_w, req_h),
+    }
+}
+
 /// Client-initiated resize request
 ///
 /// Sent from `request_layout()` (sync context) to the pipeline loop (async)
@@ -1432,6 +1575,13 @@ impl LamcoDisplayHandler {
                             );
                             continue;
                         }
+
+                        // 0. Change the compositor output resolution to match
+                        // the requested RDP desktop size. On KDE/KWin the ScreenCast
+                        // stream always captures at the output's current mode, so we
+                        // must change the mode before recreating the stream. On
+                        // GNOME/mutter this is a no-op.
+                        change_compositor_resolution(req.width, req.height);
 
                         // 1. Destroy existing PipeWire stream. Use the live
                         // capture node — a session re-establishment may have
@@ -3048,6 +3198,32 @@ impl RdpServerDisplay for LamcoDisplayHandler {
     async fn size(&mut self) -> DesktopSize {
         let size = self.size.read().await;
         *size
+    }
+
+    /// Called by IronRDP during capability set processing.
+    ///
+    /// The server passes the client's requested desktop size (from the Bitmap
+    /// capability set). We return the current compositor size unchanged — the
+    /// RDP desktop must match the compositor's actual resolution to avoid
+    /// coordinate mismatches and cropping.
+    ///
+    /// Dynamic resolution changes happen later via `request_layout()` when the
+    /// RDP client resizes its window (Display Control channel).
+    async fn request_initial_size(&mut self, client_size: DesktopSize) -> DesktopSize {
+        let current = {
+            let s = self.size.read().await;
+            *s
+        };
+
+        info!(
+            "request_initial_size: client requested {}x{}, keeping compositor size {}x{}",
+            client_size.width, client_size.height, current.width, current.height
+        );
+
+        // Return the current compositor size — do NOT change the compositor
+        // here, as the RDP desktop was already negotiated at size() and
+        // changing it would cause a mismatch.
+        current
     }
 
     /// Called once per connection to establish the update stream.
