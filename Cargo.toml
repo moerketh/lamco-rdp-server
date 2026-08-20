@@ -28,6 +28,9 @@ path = "src/lib.rs"
 # Dependencies
 # =============================================================================
 
+[build-dependencies]
+cc = "1"
+
 [dependencies]
 # -----------------------------------------------------------------------------
 # Lamco crates (published to crates.io)
