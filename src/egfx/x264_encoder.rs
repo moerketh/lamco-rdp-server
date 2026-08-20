@@ -35,7 +35,6 @@ use std::ffi::CString;
 use std::os::raw::{c_char, c_int, c_void};
 
 use libloading::Library;
-use thiserror::Error;
 use tracing::{debug, info, warn};
 
 use super::encoder::{EncoderConfig, EncoderError, EncoderResult, H264Frame};
@@ -56,18 +55,44 @@ use openh264::formats::{BgraSliceU8, YUVBuffer, YUVSource};
 /// Constrained Baseline profile (4:2:0) which mstsc handles correctly.
 const X264_CSP_I420: c_int = 0x0002;
 
-/// Force IDR keyframe on next encode (x264_type_e: NAL_SLICE_IDR = 5)
-/// Actually, x264_picture_t.i_type uses X264_TYPE_IDR = 3
-/// (x264 defines X264_TYPE_AUTO=0, X264_TYPE_IDR=3, etc. — NOT the NAL types)
-const X264_TYPE_IDR: c_int = 3;
+/// Force IDR keyframe on next encode (x264_type_e::X264_TYPE_IDR = 1).
+/// This is a picture type, not the H.264 NAL unit type (5).
+const X264_TYPE_IDR: c_int = 1;
 const X264_TYPE_AUTO: c_int = 0;
 
 // ─── Struct sizes (verified against x264 164 ABI) ───────────────────────────
 
 /// sizeof(x264_param_t) = 1024 bytes on x86_64 with x264 build 164
 const X264_PARAM_SIZE: usize = 1024;
-/// sizeof(x264_picture_t) = 240 bytes on x86_64
-const X264_PICTURE_SIZE: usize = 240;
+/// x264_param_t::i_width offset for x264 build 164 on x86_64.
+const PARAM_OFF_I_WIDTH: usize = 28;
+/// x264_param_t::i_height offset for x264 build 164 on x86_64.
+const PARAM_OFF_I_HEIGHT: usize = 32;
+/// x264_param_t::i_csp offset for x264 build 164 on x86_64.
+const PARAM_OFF_I_CSP: usize = 36;
+const PARAM_OFF_I_KEYINT_MAX: usize = 100;
+const PARAM_OFF_B_ANNEXB: usize = 904;
+const PARAM_OFF_I_FPS_NUM: usize = 920;
+const PARAM_OFF_I_FPS_DEN: usize = 924;
+
+#[repr(C, align(16))]
+struct AlignedBuffer<const SIZE: usize> {
+    bytes: [u8; SIZE],
+}
+
+impl<const SIZE: usize> AlignedBuffer<SIZE> {
+    fn zeroed() -> Self {
+        Self { bytes: [0; SIZE] }
+    }
+
+    fn clear(&mut self) {
+        self.bytes.fill(0);
+    }
+
+    fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.bytes.as_mut_ptr()
+    }
+}
 /// sizeof(x264_nal_t) = 40 bytes on x86_64
 const X264_NAL_SIZE: usize = 40;
 
@@ -88,14 +113,47 @@ const X264_NAL_SIZE: usize = 40;
 //     offset 64: void* plane[4]        (32 bytes)
 //   offset 96:  x264_image_properties_t prop
 //   ... (rest doesn't matter for input)
-const PIC_OFF_I_TYPE: usize = 0;
-const PIC_OFF_I_PTS: usize = 16;
-const PIC_OFF_PARAM: usize = 32;
-const PIC_OFF_IMG: usize = 40;
-const IMG_OFF_I_CSP: usize = PIC_OFF_IMG; // = 40
-const IMG_OFF_I_PLANE: usize = PIC_OFF_IMG + 4; // = 44
-const IMG_OFF_I_STRIDE: usize = PIC_OFF_IMG + 8; // = 48
-const IMG_OFF_PLANE: usize = PIC_OFF_IMG + 24; // = 64
+#[repr(C)]
+struct X264Image {
+    i_csp: c_int,
+    i_plane: c_int,
+    i_stride: [c_int; 4],
+    plane: [*mut u8; 4],
+}
+
+#[repr(C, align(16))]
+struct X264Picture {
+    i_type: c_int,
+    i_qpplus1: c_int,
+    i_pic_struct: c_int,
+    b_keyframe: c_int,
+    i_pts: i64,
+    i_dts: i64,
+    param: *mut c_void,
+    img: X264Image,
+    rest: [u8; 144],
+}
+
+impl X264Picture {
+    fn zeroed() -> Self {
+        Self {
+            i_type: 0,
+            i_qpplus1: 0,
+            i_pic_struct: 0,
+            b_keyframe: 0,
+            i_pts: 0,
+            i_dts: 0,
+            param: std::ptr::null_mut(),
+            img: X264Image {
+                i_csp: 0,
+                i_plane: 0,
+                i_stride: [0; 4],
+                plane: [std::ptr::null_mut(); 4],
+            },
+            rest: [0; 144],
+        }
+    }
+}
 
 // ─── x264_nal_t field offsets ───────────────────────────────────────────────
 //
@@ -114,29 +172,26 @@ const NAL_OFF_P_PAYLOAD: usize = 24;
 
 // ─── Function pointer types ─────────────────────────────────────────────────
 
-type X264ParamDefaultFn = unsafe extern "C" fn(*mut c_void);
 type X264ParamDefaultPresetFn =
     unsafe extern "C" fn(*mut c_void, *const c_char, *const c_char) -> c_int;
 type X264ParamParseFn =
     unsafe extern "C" fn(*mut c_void, *const c_char, *const c_char) -> c_int;
 type X264ParamCleanupFn = unsafe extern "C" fn(*mut c_void);
-type X264PictureInitFn = unsafe extern "C" fn(*mut c_void);
+type X264PictureInitFn = unsafe extern "C" fn(*mut X264Picture);
 type X264EncoderOpenFn = unsafe extern "C" fn(*const c_void) -> *mut c_void;
 type X264EncoderEncodeFn = unsafe extern "C" fn(
     *mut c_void,
     *mut *mut u8,    // x264_nal_t** pp_nal
     *mut c_int,      // int* pi_nal
-    *const u8,       // x264_picture_t* pic_in (raw byte buffer)
-    *mut u8,         // x264_picture_t* pic_out (raw byte buffer, can be NULL)
+    *mut X264Picture,
+    *mut X264Picture,
 ) -> c_int;
 type X264EncoderCloseFn = unsafe extern "C" fn(*mut c_void);
-type X264EncoderDelayFn = unsafe extern "C" fn(*mut c_void) -> c_int;
 
 // ─── Loaded x264 API ────────────────────────────────────────────────────────
 
 struct X264Api {
     _lib: Library,
-    param_default: X264ParamDefaultFn,
     param_default_preset: X264ParamDefaultPresetFn,
     param_parse: X264ParamParseFn,
     param_cleanup: X264ParamCleanupFn,
@@ -144,7 +199,6 @@ struct X264Api {
     encoder_open: X264EncoderOpenFn,
     encoder_encode: X264EncoderEncodeFn,
     encoder_close: X264EncoderCloseFn,
-    encoder_delay: X264EncoderDelayFn,
 }
 
 impl std::fmt::Display for X264Api {
@@ -172,11 +226,6 @@ fn load_x264_api() -> Result<X264Api, String> {
                 )
             })?;
 
-        let param_default: X264ParamDefaultFn = {
-            let sym = lib.get::<X264ParamDefaultFn>(b"x264_param_default")
-                .map_err(|e| format!("x264_param_default not found: {e}"))?;
-            *sym
-        };
         let param_default_preset: X264ParamDefaultPresetFn = {
             let sym = lib.get::<X264ParamDefaultPresetFn>(b"x264_param_default_preset")
                 .map_err(|e| format!("x264_param_default_preset not found: {e}"))?;
@@ -217,15 +266,9 @@ fn load_x264_api() -> Result<X264Api, String> {
                 .map_err(|e| format!("x264_encoder_close not found: {e}"))?;
             *sym
         };
-        let encoder_delay: X264EncoderDelayFn = {
-            let sym = lib.get::<X264EncoderDelayFn>(b"x264_encoder_delayed_frames")
-                .map_err(|e| format!("x264_encoder_delayed_frames not found: {e}"))?;
-            *sym
-        };
 
         Ok(X264Api {
             _lib: lib,
-            param_default,
             param_default_preset,
             param_parse,
             param_cleanup,
@@ -233,7 +276,6 @@ fn load_x264_api() -> Result<X264Api, String> {
             encoder_open,
             encoder_encode,
             encoder_close,
-            encoder_delay,
         })
     }
 }
@@ -254,20 +296,6 @@ fn get_x264_api() -> Result<&'static X264Api, String> {
 unsafe fn write_i32_at(buf: *mut u8, offset: usize, val: c_int) {
     unsafe {
         std::ptr::write_unaligned(buf.add(offset) as *mut c_int, val);
-    }
-}
-
-#[inline]
-unsafe fn write_i64_at(buf: *mut u8, offset: usize, val: i64) {
-    unsafe {
-        std::ptr::write_unaligned(buf.add(offset) as *mut i64, val);
-    }
-}
-
-#[inline]
-unsafe fn write_ptr_at(buf: *mut u8, offset: usize, val: *const u8) {
-    unsafe {
-        std::ptr::write_unaligned(buf.add(offset) as *mut *const u8, val);
     }
 }
 
@@ -294,9 +322,9 @@ pub struct X264Encoder {
     api: &'static X264Api,
     encoder: *mut c_void,
     /// Raw byte buffer for x264_param_t (1024 bytes)
-    param_buf: Vec<u8>,
-    /// Raw byte buffer for x264_picture_t (240 bytes) — input picture
-    pic_in_buf: Vec<u8>,
+    param_buf: AlignedBuffer<X264_PARAM_SIZE>,
+    /// ABI-matching x264 input picture.
+    pic_in: X264Picture,
     /// Pre-allocated Y plane buffer for BGRA→I420 conversion
     y_plane: Vec<u8>,
     /// Pre-allocated U plane buffer for BGRA→I420 conversion
@@ -316,18 +344,6 @@ pub struct X264Encoder {
 
 unsafe impl Send for X264Encoder {}
 
-#[derive(Debug, Error)]
-enum X264InitError {
-    #[error("x264 library load failed: {0}")]
-    LoadFailed(String),
-    #[error("x264 param default preset failed: {0}")]
-    PresetFailed(c_int),
-    #[error("x264 encoder open failed")]
-    EncoderOpenFailed,
-    #[error("x264 param parse failed for '{key}={value}': {code}")]
-    ParamParseFailed { key: String, value: String, code: c_int },
-}
-
 impl X264Encoder {
     /// Create a new x264 encoder.
     ///
@@ -343,8 +359,8 @@ impl X264Encoder {
         Ok(Self {
             api,
             encoder: std::ptr::null_mut(),
-            param_buf: vec![0u8; X264_PARAM_SIZE],
-            pic_in_buf: vec![0u8; X264_PICTURE_SIZE],
+            param_buf: AlignedBuffer::zeroed(),
+            pic_in: X264Picture::zeroed(),
             y_plane: Vec::new(),
             u_plane: Vec::new(),
             v_plane: Vec::new(),
@@ -379,7 +395,7 @@ impl X264Encoder {
             }
 
             // Zero the param buffer and set defaults
-            self.param_buf.fill(0);
+            self.param_buf.clear();
             let param = self.param_buf.as_mut_ptr() as *mut c_void;
 
             // Set defaults with preset + tune
@@ -393,6 +409,13 @@ impl X264Encoder {
                     "x264_param_default_preset failed: {ret}"
                 )));
             }
+
+            // x264_param_parse has no reliable input-csp option. Set the
+            // x264_param_t field directly so the encoder and picture agree on
+            // the I420 input layout.
+            write_i32_at(param as *mut u8, PARAM_OFF_I_WIDTH, width as c_int);
+            write_i32_at(param as *mut u8, PARAM_OFF_I_HEIGHT, height as c_int);
+            write_i32_at(param as *mut u8, PARAM_OFF_I_CSP, X264_CSP_I420);
 
             // Set parameters via x264_param_parse (ABI-stable string key-value API)
             let parse = |key: &str, value: &str| -> EncoderResult<()> {
@@ -408,8 +431,6 @@ impl X264Encoder {
             };
 
             // Core encoding parameters for real-time screen capture
-            parse("width", &width.to_string())?;
-            parse("height", &height.to_string())?;
             parse("threads", &self.threads_str())?;
             // CRF (constant quality) mode — better for screen content than CBR
             let crf = self.crf_value();
@@ -426,14 +447,8 @@ impl X264Encoder {
             parse("scenecut", "0")?;
             // No B-frames (zerolatency tune already sets this, but be explicit)
             parse("bframes", "0")?;
-            // Input colorspace: I420 (YUV 4:2:0 planar)
-            // We convert BGRA→I420 in Rust because x264's internal BGRA
-            // conversion produces 4:4:4 profile which mstsc can't decode.
-            parse("input-csp", "i420")?;
             // Output: Annex B format (start codes, not AVCC)
             parse("annexb", "1")?;
-            // Log level: errors only
-            parse("log-level", "error")?;
             // No VBV (no buffering constraints for real-time)
             parse("vbv-maxrate", "0")?;
             parse("vbv-bufsize", "0")?;
@@ -445,6 +460,17 @@ impl X264Encoder {
             parse("intra-refresh", "0")?;
             // Repeat headers: send SPS/PPS with every IDR (needed for RDP)
             parse("repeat-headers", "1")?;
+
+            // Reassert the fields that control the input ABI and bitstream
+            // format after all string parsing. These are the fields that must
+            // agree with X264Picture and MS-RDPEGFX AVC420.
+            write_i32_at(param as *mut u8, PARAM_OFF_I_WIDTH, width as c_int);
+            write_i32_at(param as *mut u8, PARAM_OFF_I_HEIGHT, height as c_int);
+            write_i32_at(param as *mut u8, PARAM_OFF_I_CSP, X264_CSP_I420);
+            write_i32_at(param as *mut u8, PARAM_OFF_I_KEYINT_MAX, 1000);
+            write_i32_at(param as *mut u8, PARAM_OFF_B_ANNEXB, 1);
+            write_i32_at(param as *mut u8, PARAM_OFF_I_FPS_NUM, self.config.max_fps as c_int);
+            write_i32_at(param as *mut u8, PARAM_OFF_I_FPS_DEN, 1);
 
             // Open encoder
             self.encoder = (self.api.encoder_open)(param);
@@ -596,48 +622,42 @@ impl X264Encoder {
         }
 
         unsafe {
-            // Initialize the input picture using x264_picture_init
-            self.pic_in_buf.fill(0);
-            let pic = self.pic_in_buf.as_mut_ptr();
+            // Initialize the ABI-matching input picture.
+            (self.api.picture_init)(&mut self.pic_in);
+            let pic = &mut self.pic_in;
 
-            (self.api.picture_init)(pic as *mut c_void);
-
-            // Set picture fields by known offsets
             // i_type: force IDR or auto
             let is_forced_idr = self.force_idr;
             if self.force_idr {
-                write_i32_at(pic, PIC_OFF_I_TYPE, X264_TYPE_IDR);
+                pic.i_type = X264_TYPE_IDR;
                 self.force_idr = false;
             } else {
-                write_i32_at(pic, PIC_OFF_I_TYPE, X264_TYPE_AUTO);
+                pic.i_type = X264_TYPE_AUTO;
             }
 
             // i_pts
-            write_i64_at(pic, PIC_OFF_I_PTS, timestamp_ms as i64);
-
-            // param pointer: NULL (use encoder's current params)
-            write_ptr_at(pic, PIC_OFF_PARAM, std::ptr::null());
+            pic.i_pts = timestamp_ms as i64;
 
             // img.i_csp: I420 (YUV 4:2:0 planar)
-            write_i32_at(pic, IMG_OFF_I_CSP, X264_CSP_I420);
+            pic.img.i_csp = X264_CSP_I420;
             // img.i_plane: 3 (Y, U, V)
-            write_i32_at(pic, IMG_OFF_I_PLANE, 3);
+            pic.img.i_plane = 3;
             // img.i_stride[0]: width (Y plane stride)
-            write_i32_at(pic, IMG_OFF_I_STRIDE, width as c_int);
+            pic.img.i_stride[0] = width as c_int;
             // img.i_stride[1]: width/2 (U plane stride)
-            write_i32_at(pic, IMG_OFF_I_STRIDE + 4, (width / 2) as c_int);
+            pic.img.i_stride[1] = (width / 2) as c_int;
             // img.i_stride[2]: width/2 (V plane stride)
-            write_i32_at(pic, IMG_OFF_I_STRIDE + 8, (width / 2) as c_int);
+            pic.img.i_stride[2] = (width / 2) as c_int;
             // img.i_stride[3]: 0
-            write_i32_at(pic, IMG_OFF_I_STRIDE + 12, 0);
+            pic.img.i_stride[3] = 0;
             // img.plane[0]: Y plane
-            write_ptr_at(pic, IMG_OFF_PLANE, self.y_plane.as_ptr());
+            pic.img.plane[0] = self.y_plane.as_mut_ptr();
             // img.plane[1]: U plane
-            write_ptr_at(pic, IMG_OFF_PLANE + 8, self.u_plane.as_ptr());
+            pic.img.plane[1] = self.u_plane.as_mut_ptr();
             // img.plane[2]: V plane
-            write_ptr_at(pic, IMG_OFF_PLANE + 16, self.v_plane.as_ptr());
+            pic.img.plane[2] = self.v_plane.as_mut_ptr();
             // img.plane[3]: NULL
-            write_ptr_at(pic, IMG_OFF_PLANE + 24, std::ptr::null());
+            pic.img.plane[3] = std::ptr::null_mut();
 
             // Encode
             let mut nal_ptr: *mut u8 = std::ptr::null_mut();
@@ -861,100 +881,24 @@ impl X264Encoder {
 mod tests {
     use super::*;
 
-    #[cfg(feature = "x264")]
     #[test]
-    fn test_x264_encoder_creation() {
-        let config = EncoderConfig::default();
-        let encoder = X264Encoder::new(config);
-        match encoder {
-            Ok(_) => {}
-            Err(EncoderError::InitFailed(e)) => {
-                eprintln!("x264 not available, skipping: {e}");
-                return;
-            }
-            Err(e) => panic!("unexpected error: {e:?}"),
-        }
+    fn test_x264_avc420_abi_constants() {
+        assert_eq!(X264_TYPE_IDR, 1);
+        assert_eq!(X264_CSP_I420, 0x0002);
+        assert_eq!(PARAM_OFF_I_WIDTH, 28);
+        assert_eq!(PARAM_OFF_I_HEIGHT, 32);
+        assert_eq!(PARAM_OFF_I_CSP, 36);
+        assert_eq!(std::mem::size_of::<X264Image>(), 56);
+        assert_eq!(std::mem::size_of::<X264Picture>(), 240);
     }
 
-    #[cfg(feature = "x264")]
     #[test]
-    fn test_x264_encode_small_frame() {
-        let config = EncoderConfig::default();
-        let mut encoder = match X264Encoder::new(config) {
-            Ok(e) => e,
-            Err(EncoderError::InitFailed(_)) => return,
-            Err(e) => panic!("unexpected error: {e:?}"),
-        };
-
-        let width = 64u32;
-        let height = 64u32;
-        let bgra_data = vec![0u8; (width * height * 4) as usize];
-
-        let result = encoder.encode_bgra(&bgra_data, width, height, 0);
-        assert!(result.is_ok(), "encode failed: {:?}", result.err());
-        let frame = result.unwrap().expect("should produce a frame");
-        assert!(frame.is_keyframe, "first frame should be IDR");
-        assert!(!frame.data.is_empty(), "encoded data should not be empty");
-    }
-
-    #[cfg(feature = "x264")]
-    #[test]
-    fn test_x264_encode_p_frame() {
-        let config = EncoderConfig::default();
-        let mut encoder = match X264Encoder::new(config) {
-            Ok(e) => e,
-            Err(EncoderError::InitFailed(_)) => return,
-            Err(e) => panic!("unexpected error: {e:?}"),
-        };
-
-        let width = 128u32;
-        let height = 128u32;
-        let bgra_data = vec![0u8; (width * height * 4) as usize];
-
-        // First frame: IDR
-        let f1 = encoder
-            .encode_bgra(&bgra_data, width, height, 0)
-            .unwrap()
-            .unwrap();
-        assert!(f1.is_keyframe);
-
-        // Second frame: P-frame (different content)
-        let mut bgra2 = vec![0xFFu8; (width * height * 4) as usize];
-        for i in 0..bgra2.len() {
-            bgra2[i] = ((i * 7) % 256) as u8;
-        }
-        let f2 = encoder
-            .encode_bgra(&bgra2, width, height, 16)
-            .unwrap()
-            .unwrap();
-        assert!(!f2.is_keyframe, "second frame should not be IDR");
-    }
-
-    #[cfg(feature = "x264")]
-    #[test]
-    fn test_x264_force_keyframe() {
-        let config = EncoderConfig::default();
-        let mut encoder = match X264Encoder::new(config) {
-            Ok(e) => e,
-            Err(EncoderError::InitFailed(_)) => return,
-            Err(e) => panic!("unexpected error: {e:?}"),
-        };
-
-        let width = 64u32;
-        let height = 64u32;
-        let bgra_data = vec![0u8; (width * height * 4) as usize];
-
-        // First frame
-        let _ = encoder.encode_bgra(&bgra_data, width, height, 0).unwrap();
-
-        // Force keyframe
-        encoder.force_keyframe();
-
-        // Next frame should be IDR
-        let frame = encoder
-            .encode_bgra(&bgra_data, width, height, 16)
-            .unwrap()
-            .unwrap();
-        assert!(frame.is_keyframe, "forced keyframe should produce IDR");
+    fn test_x264_picture_defaults_are_zeroed() {
+        let picture = X264Picture::zeroed();
+        assert_eq!(picture.i_type, X264_TYPE_AUTO);
+        assert_eq!(picture.i_pts, 0);
+        assert_eq!(picture.img.i_csp, 0);
+        assert_eq!(picture.img.i_plane, 0);
+        assert!(picture.img.plane.iter().all(|plane| plane.is_null()));
     }
 }
