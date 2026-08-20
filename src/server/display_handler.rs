@@ -81,11 +81,11 @@ use tokio::sync::{Mutex, RwLock, mpsc};
 use tracing::{debug, error, info, trace, warn};
 
 use super::pipeline_decisions;
+#[cfg(feature = "x264")]
+use crate::egfx::X264Encoder;
 use crate::{
     damage::{DamageConfig, DamageDetector, DamageRegion},
     egfx::{Avc420Encoder, Avc444Encoder, ColorSpaceConfig, EncoderConfig},
-    #[cfg(feature = "x264")]
-    egfx::X264Encoder,
     performance::{AdaptiveFpsController, EncodingDecision, LatencyGovernor, LatencyMode},
     pipewire::{PipeWireThreadCommand, PipeWireThreadManager, VideoFrame},
     portal::StreamInfo,
