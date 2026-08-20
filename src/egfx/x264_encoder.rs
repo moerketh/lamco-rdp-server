@@ -40,6 +40,12 @@ use tracing::{debug, info, warn};
 
 use super::encoder::{EncoderConfig, EncoderError, EncoderResult, H264Frame};
 
+// When the `h264` feature is also enabled, we can reuse OpenH264's optimized
+// BGRA→YUV420 conversion (YUVBuffer::from_rgb_source) instead of our naive
+// per-pixel loop. This is the same conversion the OpenH264 encoder path uses.
+#[cfg(feature = "h264")]
+use openh264::formats::{BgraSliceU8, YUVBuffer, YUVSource};
+
 // ─── x264 C API constants ───────────────────────────────────────────────────
 
 /// Input colorspace: I420 (YUV 4:2:0 planar)
@@ -522,35 +528,70 @@ impl X264Encoder {
         }
 
         // BGRA → I420 (YUV 4:2:0 planar) conversion
-        // BT.601 limited range, matching OpenH264's conversion
+        // When the `h264` feature is enabled, reuse OpenH264's optimized
+        // YUVBuffer::from_rgb_source (same conversion the OpenH264 encoder uses).
+        // Otherwise, fall back to a naive per-pixel BT.601 conversion.
         let w = width as usize;
         let h = height as usize;
         let half_w = w / 2;
         let half_h = h / 2;
 
-        // Y plane
-        for j in 0..h {
-            for i in 0..w {
-                let idx = (j * w + i) * 4;
-                let b = bgra_data[idx] as i32;
-                let g = bgra_data[idx + 1] as i32;
-                let r = bgra_data[idx + 2] as i32;
-                // BT.601: Y = (66*R + 129*G + 25*B + 128) >> 8 + 16
-                self.y_plane[j * w + i] = (((66 * r + 129 * g + 25 * b + 128) >> 8) + 16) as u8;
+        #[cfg(feature = "h264")]
+        {
+            let bgra_source = BgraSliceU8::new(bgra_data, (w, h));
+            let yuv = YUVBuffer::from_rgb_source(bgra_source);
+            let (y_stride, u_stride, v_stride) = yuv.strides();
+
+            // Copy Y plane (stride may differ from width)
+            if y_stride == w {
+                self.y_plane.copy_from_slice(yuv.y());
+            } else {
+                for j in 0..h {
+                    self.y_plane[j * w..(j + 1) * w]
+                        .copy_from_slice(&yuv.y()[j * y_stride..j * y_stride + w]);
+                }
+            }
+            // Copy U plane
+            if u_stride == half_w {
+                self.u_plane.copy_from_slice(yuv.u());
+            } else {
+                for j in 0..half_h {
+                    self.u_plane[j * half_w..(j + 1) * half_w]
+                        .copy_from_slice(&yuv.u()[j * u_stride..j * u_stride + half_w]);
+                }
+            }
+            // Copy V plane
+            if v_stride == half_w {
+                self.v_plane.copy_from_slice(yuv.v());
+            } else {
+                for j in 0..half_h {
+                    self.v_plane[j * half_w..(j + 1) * half_w]
+                        .copy_from_slice(&yuv.v()[j * v_stride..j * v_stride + half_w]);
+                }
             }
         }
 
-        // U and V planes (subsampled 2x2)
-        for j in 0..half_h {
-            for i in 0..half_w {
-                let idx = ((j * 2) * w + (i * 2)) * 4;
-                let b = bgra_data[idx] as i32;
-                let g = bgra_data[idx + 1] as i32;
-                let r = bgra_data[idx + 2] as i32;
-                // U = (-38*R - 74*G + 112*B + 128) >> 8 + 128
-                self.u_plane[j * half_w + i] = (((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128) as u8;
-                // V = (112*R - 94*G - 18*B + 128) >> 8 + 128
-                self.v_plane[j * half_w + i] = (((112 * r - 94 * g - 18 * b + 128) >> 8) + 128) as u8;
+        #[cfg(not(feature = "h264"))]
+        {
+            // Fallback: naive per-pixel BT.601 limited range conversion
+            for j in 0..h {
+                for i in 0..w {
+                    let idx = (j * w + i) * 4;
+                    let b = bgra_data[idx] as i32;
+                    let g = bgra_data[idx + 1] as i32;
+                    let r = bgra_data[idx + 2] as i32;
+                    self.y_plane[j * w + i] = (((66 * r + 129 * g + 25 * b + 128) >> 8) + 16) as u8;
+                }
+            }
+            for j in 0..half_h {
+                for i in 0..half_w {
+                    let idx = ((j * 2) * w + (i * 2)) * 4;
+                    let b = bgra_data[idx] as i32;
+                    let g = bgra_data[idx + 1] as i32;
+                    let r = bgra_data[idx + 2] as i32;
+                    self.u_plane[j * half_w + i] = (((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128) as u8;
+                    self.v_plane[j * half_w + i] = (((112 * r - 94 * g - 18 * b + 128) >> 8) + 128) as u8;
+                }
             }
         }
 
