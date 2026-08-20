@@ -507,23 +507,13 @@ impl LamcoRdpServer {
                 .await
                 .context("Failed to create ScreenCast session for input-only video")?;
 
-            // Pick best available cursor mode from what the portal actually supports.
-            // Hyprland's portal only offers Hidden+Embedded (no Metadata).
-            let cursor_mode = if capabilities
-                .portal
-                .available_cursor_modes
-                .contains(&crate::compositor::CursorMode::Metadata)
-            {
-                CursorMode::Metadata
-            } else if capabilities
-                .portal
-                .available_cursor_modes
-                .contains(&crate::compositor::CursorMode::Embedded)
-            {
-                CursorMode::Embedded
-            } else {
-                CursorMode::Hidden
-            };
+            // Pick cursor mode for the standalone ScreenCast portal.
+            // Use Hidden: the portal hides the cursor from the video frame,
+            // and the RDP client renders its own cursor via pointer PDUs
+            // (metadata cursor mode). This matches xrdp's approach where
+            // the cursor is sent as a separate low-latency PDU and the
+            // client renders it locally — zero cursor latency.
+            let cursor_mode = CursorMode::Hidden;
             debug!("Using cursor mode {:?} for ScreenCast", cursor_mode);
 
             use ashpd::desktop::screencast::SelectSourcesOptions;
@@ -534,7 +524,7 @@ impl LamcoRdpServer {
                         .set_cursor_mode(cursor_mode)
                         .set_sources(enumflags2::BitFlags::from(ScSourceType::Monitor))
                         .set_multiple(false)
-                        .set_persist_mode(PersistMode::DoNot),
+                        .set_persist_mode(PersistMode::ExplicitlyRevoked),
                 )
                 .await
                 .context("Failed to select ScreenCast sources for input-only video")?;
@@ -702,6 +692,7 @@ impl LamcoRdpServer {
 
             let (graphics_tx, graphics_rx) = tokio::sync::mpsc::channel(64);
 
+            let egfx_enabled = config.egfx.enabled;
             let force_avc420_only = false;
             let compression_mode = match config.egfx.zgfx_compression.to_lowercase().as_str() {
                 "auto" => CompressionMode::Auto,
@@ -715,6 +706,9 @@ impl LamcoRdpServer {
                 config.egfx.max_frames_in_flight,
                 compression_mode,
             );
+            if !egfx_enabled {
+                warn!("EGFX disabled in config — using lossless surface commands (RemoteFx/QOI) instead of H.264");
+            }
             gfx_factory.set_monitoring(Arc::clone(&metrics), snapshot_collector.egfx_state());
             gfx_factory.set_health_reporter(health_reporter.clone());
 
@@ -736,8 +730,8 @@ impl LamcoRdpServer {
                 ),
             ));
 
-            let gfx_handler_state = gfx_factory.handler_state();
-            let gfx_server_handle = gfx_factory.server_handle();
+            let gfx_handler_state = if egfx_enabled { Some(gfx_factory.handler_state()) } else { None };
+            let gfx_server_handle = if egfx_enabled { Some(gfx_factory.server_handle()) } else { None };
 
             let display_handler = Arc::new(match pipewire_source {
                 PipeWireSource::Fd(raw_fd) => {
@@ -773,8 +767,8 @@ impl LamcoRdpServer {
                         pipewire_fd,
                         stream_info.clone(),
                         Some(graphics_tx),
-                        Some(gfx_server_handle),
-                        Some(gfx_handler_state),
+                        gfx_server_handle,
+                        gfx_handler_state,
                         Arc::clone(&config),
                         Arc::clone(&service_registry),
                         use_dmabuf,
@@ -789,8 +783,8 @@ impl LamcoRdpServer {
                     raw_rx,
                     stream_info.clone(),
                     Some(graphics_tx),
-                    Some(gfx_server_handle),
-                    Some(gfx_handler_state),
+                    gfx_server_handle,
+                    gfx_handler_state,
                     Arc::clone(&config),
                     Arc::clone(&service_registry),
                     Arc::clone(&client_active_flag),
@@ -1011,7 +1005,7 @@ impl LamcoRdpServer {
                     .with_display_handler((*display_handler).clone())
                     .with_bitmap_codecs(codecs)
                     .with_cliprdr_factory(wlr_clipboard_factory)
-                    .with_gfx_factory(Some(Box::new(gfx_factory)))
+                    .with_gfx_factory(if egfx_enabled { Some(Box::new(gfx_factory)) } else { None })
                     .with_sound_factory(Some(Box::new(sound_factory)))
                     .build()
             } else {
@@ -1035,7 +1029,7 @@ impl LamcoRdpServer {
                     .with_display_handler((*display_handler).clone())
                     .with_bitmap_codecs(codecs)
                     .with_cliprdr_factory(None)
-                    .with_gfx_factory(Some(Box::new(gfx_factory)))
+                    .with_gfx_factory(if egfx_enabled { Some(Box::new(gfx_factory)) } else { None })
                     .with_sound_factory(Some(Box::new(sound_factory)))
                     .build()
             };
@@ -1520,6 +1514,10 @@ impl LamcoRdpServer {
         }
 
         info!("Building IronRDP server");
+        let egfx_enabled = config.egfx.enabled;
+        if !egfx_enabled {
+            warn!("EGFX disabled in config — using lossless surface commands (RemoteFx/QOI) instead of H.264");
+        }
         let listen_addr: SocketAddr = config
             .server
             .listen_addr
@@ -1545,7 +1543,7 @@ impl LamcoRdpServer {
             .with_display_handler((*display_handler).clone())
             .with_bitmap_codecs(codecs)
             .with_cliprdr_factory(Some(Box::new(clipboard_factory)))
-            .with_gfx_factory(Some(Box::new(gfx_factory)))
+            .with_gfx_factory(if egfx_enabled { Some(Box::new(gfx_factory)) } else { None })
             .with_sound_factory(Some(Box::new(sound_factory)))
             .build();
 

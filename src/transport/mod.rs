@@ -160,6 +160,15 @@ impl AcceptDispatcher {
                                 )
                                 .await
                         }
+                        crate::transport::listener::AcceptorMode::EnhancedSession => {
+                            // Hyper-V Enhanced Session: PCB → TLS → CredSSP → X.224 → RDP.
+                            // The IronRDP fork's run_connection_enhanced handles the
+                            // full enhanced handshake (read PCB, TLS, CredSSP before X.224).
+                            rdp_server
+                                .run_connection_enhanced(stream)
+                                .await
+                                .map(|_| ())
+                        }
                     };
                     let duration = start.elapsed();
 
