@@ -2507,22 +2507,22 @@ impl LamcoDisplayHandler {
                                     }
 
                                     if video_encoder.is_none() {
-                                    match Avc420Encoder::new(config) {
-                                        Ok(mut encoder) => {
-                                            encoder.set_diagnostics(encoder_diagnostics.clone());
-                                            video_encoder = Some(VideoEncoder::Avc420(encoder));
-                                            info!(
-                                                "✅ AVC420 encoder initialized for {}×{} (4:2:0 fallback)",
-                                                aligned_width, aligned_height
-                                            );
+                                        match Avc420Encoder::new(config) {
+                                            Ok(mut encoder) => {
+                                                encoder.set_diagnostics(encoder_diagnostics.clone());
+                                                video_encoder = Some(VideoEncoder::Avc420(encoder));
+                                                info!(
+                                                    "✅ AVC420 encoder initialized for {}×{} (4:2:0 fallback)",
+                                                    aligned_width, aligned_height
+                                                );
+                                            }
+                                            Err(e) => {
+                                                warn!(
+                                                    "Failed to create AVC420 encoder: {:?} - falling back to RemoteFX",
+                                                    e
+                                                );
+                                            }
                                         }
-                                        Err(e) => {
-                                            warn!(
-                                                "Failed to create AVC420 encoder: {:?} - falling back to RemoteFX",
-                                                e
-                                            );
-                                        }
-                                    }
                                     }
                                 }
                             }
@@ -2563,13 +2563,14 @@ impl LamcoDisplayHandler {
                                         info!(
                                             "✅ AVC420 encoder initialized for {}×{} (aligned)",
                                             aligned_width, aligned_height
-                                    );
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        "Failed to create H.264 encoder: {:?} - falling back to RemoteFX",
-                                        e
-                                    );
+                                        );
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            "Failed to create H.264 encoder: {:?} - falling back to RemoteFX",
+                                            e
+                                        );
+                                    }
                                 }
                             }
                         }
