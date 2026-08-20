@@ -42,11 +42,13 @@ use super::encoder::{EncoderConfig, EncoderError, EncoderResult, H264Frame};
 
 // ─── x264 C API constants ───────────────────────────────────────────────────
 
-/// Input colorspace: BGRA (packed BGR 32bits, 4 bytes/pixel)
-/// x264_csp_e: X264_CSP_BGRA = 0x000f (from x264.h)
-/// Note: x264 does NOT use the high-16-bits-bytes-per-pixel convention.
-/// The CSP value is just the enum value (0x000f for BGRA).
-const X264_CSP_BGRA: c_int = 0x000f;
+/// Input colorspace: I420 (YUV 4:2:0 planar)
+/// x264_csp_e: X264_CSP_I420 = 0x0002 (from x264.h)
+/// We convert BGRA→I420 in Rust before feeding to x264, because x264's
+/// internal BGRA conversion produces 4:4:4 (High 4:4:4 Predictive profile)
+/// which mstsc cannot decode in AVC420 mode. Feeding I420 produces
+/// Constrained Baseline profile (4:2:0) which mstsc handles correctly.
+const X264_CSP_I420: c_int = 0x0002;
 
 /// Force IDR keyframe on next encode (x264_type_e: NAL_SLICE_IDR = 5)
 /// Actually, x264_picture_t.i_type uses X264_TYPE_IDR = 3
@@ -289,6 +291,12 @@ pub struct X264Encoder {
     param_buf: Vec<u8>,
     /// Raw byte buffer for x264_picture_t (240 bytes) — input picture
     pic_in_buf: Vec<u8>,
+    /// Pre-allocated Y plane buffer for BGRA→I420 conversion
+    y_plane: Vec<u8>,
+    /// Pre-allocated U plane buffer for BGRA→I420 conversion
+    u_plane: Vec<u8>,
+    /// Pre-allocated V plane buffer for BGRA→I420 conversion
+    v_plane: Vec<u8>,
     config: EncoderConfig,
     frame_count: u64,
     width: u32,
@@ -331,6 +339,9 @@ impl X264Encoder {
             encoder: std::ptr::null_mut(),
             param_buf: vec![0u8; X264_PARAM_SIZE],
             pic_in_buf: vec![0u8; X264_PICTURE_SIZE],
+            y_plane: Vec::new(),
+            u_plane: Vec::new(),
+            v_plane: Vec::new(),
             config,
             frame_count: 0,
             width: 0,
@@ -409,13 +420,10 @@ impl X264Encoder {
             parse("scenecut", "0")?;
             // No B-frames (zerolatency tune already sets this, but be explicit)
             parse("bframes", "0")?;
-            // Input colorspace: BGRA
-            parse("input-csp", "bgra")?;
-            // Force Main profile (4:2:0) — required for MS-RDPEGFX AVC420.
-            // x264 defaults to High 4:4:4 Predictive when input is BGRA, which
-            // mstsc's Windows Media Foundation decoder cannot handle in AVC420 mode.
-            // Main profile produces 4:2:0 H.264 that mstsc can decode.
-            parse("profile", "main")?;
+            // Input colorspace: I420 (YUV 4:2:0 planar)
+            // We convert BGRA→I420 in Rust because x264's internal BGRA
+            // conversion produces 4:4:4 profile which mstsc can't decode.
+            parse("input-csp", "i420")?;
             // Output: Annex B format (start codes, not AVCC)
             parse("annexb", "1")?;
             // Log level: errors only
@@ -505,6 +513,45 @@ impl X264Encoder {
         // (Re)initialize encoder if dimensions changed or first frame
         if self.needs_reinit || self.width != width || self.height != height {
             self.reinit(width, height)?;
+            // Allocate I420 plane buffers
+            let y_size = (width * height) as usize;
+            let uv_size = ((width / 2) * (height / 2)) as usize;
+            self.y_plane = vec![0u8; y_size];
+            self.u_plane = vec![0u8; uv_size];
+            self.v_plane = vec![0u8; uv_size];
+        }
+
+        // BGRA → I420 (YUV 4:2:0 planar) conversion
+        // BT.601 limited range, matching OpenH264's conversion
+        let w = width as usize;
+        let h = height as usize;
+        let half_w = w / 2;
+        let half_h = h / 2;
+
+        // Y plane
+        for j in 0..h {
+            for i in 0..w {
+                let idx = (j * w + i) * 4;
+                let b = bgra_data[idx] as i32;
+                let g = bgra_data[idx + 1] as i32;
+                let r = bgra_data[idx + 2] as i32;
+                // BT.601: Y = (66*R + 129*G + 25*B + 128) >> 8 + 16
+                self.y_plane[j * w + i] = (((66 * r + 129 * g + 25 * b + 128) >> 8) + 16) as u8;
+            }
+        }
+
+        // U and V planes (subsampled 2x2)
+        for j in 0..half_h {
+            for i in 0..half_w {
+                let idx = ((j * 2) * w + (i * 2)) * 4;
+                let b = bgra_data[idx] as i32;
+                let g = bgra_data[idx + 1] as i32;
+                let r = bgra_data[idx + 2] as i32;
+                // U = (-38*R - 74*G + 112*B + 128) >> 8 + 128
+                self.u_plane[j * half_w + i] = (((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128) as u8;
+                // V = (112*R - 94*G - 18*B + 128) >> 8 + 128
+                self.v_plane[j * half_w + i] = (((112 * r - 94 * g - 18 * b + 128) >> 8) + 128) as u8;
+            }
         }
 
         unsafe {
@@ -530,21 +577,25 @@ impl X264Encoder {
             // param pointer: NULL (use encoder's current params)
             write_ptr_at(pic, PIC_OFF_PARAM, std::ptr::null());
 
-            // img.i_csp: BGRA (X264_CSP_BGRA = 0x000f)
-            write_i32_at(pic, IMG_OFF_I_CSP, X264_CSP_BGRA);
-            // img.i_plane: 1 (packed format)
-            write_i32_at(pic, IMG_OFF_I_PLANE, 1);
-            // img.i_stride[0]: width * 4 bytes (BGRA)
-            write_i32_at(pic, IMG_OFF_I_STRIDE, (width * 4) as c_int);
-            // img.i_stride[1..3]: 0
-            write_i32_at(pic, IMG_OFF_I_STRIDE + 4, 0);
-            write_i32_at(pic, IMG_OFF_I_STRIDE + 8, 0);
+            // img.i_csp: I420 (YUV 4:2:0 planar)
+            write_i32_at(pic, IMG_OFF_I_CSP, X264_CSP_I420);
+            // img.i_plane: 3 (Y, U, V)
+            write_i32_at(pic, IMG_OFF_I_PLANE, 3);
+            // img.i_stride[0]: width (Y plane stride)
+            write_i32_at(pic, IMG_OFF_I_STRIDE, width as c_int);
+            // img.i_stride[1]: width/2 (U plane stride)
+            write_i32_at(pic, IMG_OFF_I_STRIDE + 4, (width / 2) as c_int);
+            // img.i_stride[2]: width/2 (V plane stride)
+            write_i32_at(pic, IMG_OFF_I_STRIDE + 8, (width / 2) as c_int);
+            // img.i_stride[3]: 0
             write_i32_at(pic, IMG_OFF_I_STRIDE + 12, 0);
-            // img.plane[0]: pointer to BGRA data
-            write_ptr_at(pic, IMG_OFF_PLANE, bgra_data.as_ptr());
-            // img.plane[1..3]: NULL
-            write_ptr_at(pic, IMG_OFF_PLANE + 8, std::ptr::null());
-            write_ptr_at(pic, IMG_OFF_PLANE + 16, std::ptr::null());
+            // img.plane[0]: Y plane
+            write_ptr_at(pic, IMG_OFF_PLANE, self.y_plane.as_ptr());
+            // img.plane[1]: U plane
+            write_ptr_at(pic, IMG_OFF_PLANE + 8, self.u_plane.as_ptr());
+            // img.plane[2]: V plane
+            write_ptr_at(pic, IMG_OFF_PLANE + 16, self.v_plane.as_ptr());
+            // img.plane[3]: NULL
             write_ptr_at(pic, IMG_OFF_PLANE + 24, std::ptr::null());
 
             // Encode
