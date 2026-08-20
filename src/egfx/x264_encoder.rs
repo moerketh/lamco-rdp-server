@@ -42,11 +42,11 @@ use super::encoder::{EncoderConfig, EncoderError, EncoderResult, H264Frame};
 
 // ─── x264 C API constants ───────────────────────────────────────────────────
 
-/// Input colorspace: BGRA (4 bytes/pixel, BGRx with ignored alpha)
-/// x264_csp_e: X264_CSP_BGRA = 0x0002
-/// For packed formats, high 16 bits = bytes per pixel: (4 << 16) | 0x0002
-const X264_CSP_BGRA: c_int = 0x0002;
-const X264_CSP_BGRA_PACKED: c_int = (4 << 16) | X264_CSP_BGRA;
+/// Input colorspace: BGRA (packed BGR 32bits, 4 bytes/pixel)
+/// x264_csp_e: X264_CSP_BGRA = 0x000f (from x264.h)
+/// Note: x264 does NOT use the high-16-bits-bytes-per-pixel convention.
+/// The CSP value is just the enum value (0x000f for BGRA).
+const X264_CSP_BGRA: c_int = 0x000f;
 
 /// Force IDR keyframe on next encode (x264_type_e: NAL_SLICE_IDR = 5)
 /// Actually, x264_picture_t.i_type uses X264_TYPE_IDR = 3
@@ -525,8 +525,8 @@ impl X264Encoder {
             // param pointer: NULL (use encoder's current params)
             write_ptr_at(pic, PIC_OFF_PARAM, std::ptr::null());
 
-            // img.i_csp: BGRA packed
-            write_i32_at(pic, IMG_OFF_I_CSP, X264_CSP_BGRA_PACKED);
+            // img.i_csp: BGRA (X264_CSP_BGRA = 0x000f)
+            write_i32_at(pic, IMG_OFF_I_CSP, X264_CSP_BGRA);
             // img.i_plane: 1 (packed format)
             write_i32_at(pic, IMG_OFF_I_PLANE, 1);
             // img.i_stride[0]: width * 4 bytes (BGRA)
