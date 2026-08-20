@@ -411,6 +411,11 @@ impl X264Encoder {
             parse("bframes", "0")?;
             // Input colorspace: BGRA
             parse("input-csp", "bgra")?;
+            // Force Main profile (4:2:0) — required for MS-RDPEGFX AVC420.
+            // x264 defaults to High 4:4:4 Predictive when input is BGRA, which
+            // mstsc's Windows Media Foundation decoder cannot handle in AVC420 mode.
+            // Main profile produces 4:2:0 H.264 that mstsc can decode.
+            parse("profile", "main")?;
             // Output: Annex B format (start codes, not AVCC)
             parse("annexb", "1")?;
             // Log level: errors only
