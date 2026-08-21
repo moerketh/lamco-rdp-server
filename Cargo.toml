@@ -108,17 +108,17 @@ x509-parser = "0.18"
 # Drop fork when picky ships with stable RustCrypto deps.
 # See: docs/analysis/UNIFIED-ARCHITECTURE-RESEARCH-2026-04-05.md
 # -----------------------------------------------------------------------------
-ironrdp = { git = "https://github.com/moerketh/IronRDP", rev = "397fb9e4fb027d2ea0a354e83892086bd6bb26e4", default-features = false, features = ["server"] }
-ironrdp-server = { git = "https://github.com/moerketh/IronRDP", rev = "397fb9e4fb027d2ea0a354e83892086bd6bb26e4", features = ["egfx", "helper"] }
-ironrdp-pdu = { git = "https://github.com/moerketh/IronRDP", rev = "397fb9e4fb027d2ea0a354e83892086bd6bb26e4" }
-ironrdp-displaycontrol = { git = "https://github.com/moerketh/IronRDP", rev = "397fb9e4fb027d2ea0a354e83892086bd6bb26e4" }
-ironrdp-cliprdr = { git = "https://github.com/moerketh/IronRDP", rev = "397fb9e4fb027d2ea0a354e83892086bd6bb26e4" }
-ironrdp-core = { git = "https://github.com/moerketh/IronRDP", rev = "397fb9e4fb027d2ea0a354e83892086bd6bb26e4" }
-ironrdp-dvc = { git = "https://github.com/moerketh/IronRDP", rev = "397fb9e4fb027d2ea0a354e83892086bd6bb26e4" }
-ironrdp-svc = { git = "https://github.com/moerketh/IronRDP", rev = "397fb9e4fb027d2ea0a354e83892086bd6bb26e4" }
-ironrdp-egfx = { git = "https://github.com/moerketh/IronRDP", rev = "397fb9e4fb027d2ea0a354e83892086bd6bb26e4" }
-ironrdp-graphics = { git = "https://github.com/moerketh/IronRDP", rev = "397fb9e4fb027d2ea0a354e83892086bd6bb26e4" }
-ironrdp-rdpsnd = { git = "https://github.com/moerketh/IronRDP", rev = "397fb9e4fb027d2ea0a354e83892086bd6bb26e4" }
+ironrdp = { git = "https://github.com/moerketh/IronRDP", rev = "8e7ef3345100e58a0b30f515cd23a2363b945191", default-features = false, features = ["server"] }
+ironrdp-server = { git = "https://github.com/moerketh/IronRDP", rev = "8e7ef3345100e58a0b30f515cd23a2363b945191", features = ["egfx", "helper"] }
+ironrdp-pdu = { git = "https://github.com/moerketh/IronRDP", rev = "8e7ef3345100e58a0b30f515cd23a2363b945191" }
+ironrdp-displaycontrol = { git = "https://github.com/moerketh/IronRDP", rev = "8e7ef3345100e58a0b30f515cd23a2363b945191" }
+ironrdp-cliprdr = { git = "https://github.com/moerketh/IronRDP", rev = "8e7ef3345100e58a0b30f515cd23a2363b945191" }
+ironrdp-core = { git = "https://github.com/moerketh/IronRDP", rev = "8e7ef3345100e58a0b30f515cd23a2363b945191" }
+ironrdp-dvc = { git = "https://github.com/moerketh/IronRDP", rev = "8e7ef3345100e58a0b30f515cd23a2363b945191" }
+ironrdp-svc = { git = "https://github.com/moerketh/IronRDP", rev = "8e7ef3345100e58a0b30f515cd23a2363b945191" }
+ironrdp-egfx = { git = "https://github.com/moerketh/IronRDP", rev = "8e7ef3345100e58a0b30f515cd23a2363b945191" }
+ironrdp-graphics = { git = "https://github.com/moerketh/IronRDP", rev = "8e7ef3345100e58a0b30f515cd23a2363b945191" }
+ironrdp-rdpsnd = { git = "https://github.com/moerketh/IronRDP", rev = "8e7ef3345100e58a0b30f515cd23a2363b945191" }
 
 # -----------------------------------------------------------------------------
 # Wayland and Portal integration
@@ -214,7 +214,7 @@ tokio-vsock = { version = "0.7", optional = true }
 # WebSocket transport for browser/WASM clients via RDCleanPath. Gated behind
 # the `websocket` Cargo feature.
 tokio-tungstenite = { version = "0.29", optional = true, default-features = false, features = ["handshake"] }
-ironrdp-rdcleanpath = { git = "https://github.com/moerketh/IronRDP", rev = "397fb9e4fb027d2ea0a354e83892086bd6bb26e4", optional = true }
+ironrdp-rdcleanpath = { git = "https://github.com/moerketh/IronRDP", rev = "8e7ef3345100e58a0b30f515cd23a2363b945191", optional = true }
 
 # -----------------------------------------------------------------------------
 # System and utilities
@@ -505,14 +505,14 @@ cast_precision_loss = "allow"
 # To hack on IronRDP locally against this server, temporarily swap the
 # `git`/`rev` entries below for `path = "/home/greg/IronRDP/crates/<crate>"`
 # (do NOT commit the path form — it couples the build to the working tree).
-ironrdp = { git = "https://github.com/moerketh/IronRDP", rev = "397fb9e4fb027d2ea0a354e83892086bd6bb26e4" }
-ironrdp-pdu = { git = "https://github.com/moerketh/IronRDP", rev = "397fb9e4fb027d2ea0a354e83892086bd6bb26e4" }
-ironrdp-server = { git = "https://github.com/moerketh/IronRDP", rev = "397fb9e4fb027d2ea0a354e83892086bd6bb26e4" }
-ironrdp-graphics = { git = "https://github.com/moerketh/IronRDP", rev = "397fb9e4fb027d2ea0a354e83892086bd6bb26e4" }
-ironrdp-cliprdr = { git = "https://github.com/moerketh/IronRDP", rev = "397fb9e4fb027d2ea0a354e83892086bd6bb26e4" }
-ironrdp-svc = { git = "https://github.com/moerketh/IronRDP", rev = "397fb9e4fb027d2ea0a354e83892086bd6bb26e4" }
-ironrdp-dvc = { git = "https://github.com/moerketh/IronRDP", rev = "397fb9e4fb027d2ea0a354e83892086bd6bb26e4" }
-ironrdp-core = { git = "https://github.com/moerketh/IronRDP", rev = "397fb9e4fb027d2ea0a354e83892086bd6bb26e4" }
-ironrdp-displaycontrol = { git = "https://github.com/moerketh/IronRDP", rev = "397fb9e4fb027d2ea0a354e83892086bd6bb26e4" }
-ironrdp-egfx = { git = "https://github.com/moerketh/IronRDP", rev = "397fb9e4fb027d2ea0a354e83892086bd6bb26e4" }
-ironrdp-rdpsnd = { git = "https://github.com/moerketh/IronRDP", rev = "397fb9e4fb027d2ea0a354e83892086bd6bb26e4" }
+ironrdp = { git = "https://github.com/moerketh/IronRDP", rev = "8e7ef3345100e58a0b30f515cd23a2363b945191" }
+ironrdp-pdu = { git = "https://github.com/moerketh/IronRDP", rev = "8e7ef3345100e58a0b30f515cd23a2363b945191" }
+ironrdp-server = { git = "https://github.com/moerketh/IronRDP", rev = "8e7ef3345100e58a0b30f515cd23a2363b945191" }
+ironrdp-graphics = { git = "https://github.com/moerketh/IronRDP", rev = "8e7ef3345100e58a0b30f515cd23a2363b945191" }
+ironrdp-cliprdr = { git = "https://github.com/moerketh/IronRDP", rev = "8e7ef3345100e58a0b30f515cd23a2363b945191" }
+ironrdp-svc = { git = "https://github.com/moerketh/IronRDP", rev = "8e7ef3345100e58a0b30f515cd23a2363b945191" }
+ironrdp-dvc = { git = "https://github.com/moerketh/IronRDP", rev = "8e7ef3345100e58a0b30f515cd23a2363b945191" }
+ironrdp-core = { git = "https://github.com/moerketh/IronRDP", rev = "8e7ef3345100e58a0b30f515cd23a2363b945191" }
+ironrdp-displaycontrol = { git = "https://github.com/moerketh/IronRDP", rev = "8e7ef3345100e58a0b30f515cd23a2363b945191" }
+ironrdp-egfx = { git = "https://github.com/moerketh/IronRDP", rev = "8e7ef3345100e58a0b30f515cd23a2363b945191" }
+ironrdp-rdpsnd = { git = "https://github.com/moerketh/IronRDP", rev = "8e7ef3345100e58a0b30f515cd23a2363b945191" }
