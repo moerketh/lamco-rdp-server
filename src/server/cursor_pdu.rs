@@ -187,7 +187,7 @@ pub fn load_default_pointer() -> Result<RdpPointer, CursorError> {
 /// Encode an [`RdpPointer`] as the TS_COLORPOINTERATTRIBUTE wire body
 /// (without the fast-path header) — ready for `ServerEvent::Pointer`.
 pub fn encode_color_pointer(p: &RdpPointer) -> Vec<u8> {
-    let mut out = Vec::with_capacity(12 + p.and_mask.len() + p.xor_mask.len());
+    let mut out = Vec::with_capacity(14 + p.and_mask.len() + p.xor_mask.len());
     out.extend_from_slice(&p.cache_index.to_le_bytes());
     out.extend_from_slice(&p.hot_spot.0.to_le_bytes());
     out.extend_from_slice(&p.hot_spot.1.to_le_bytes());
@@ -242,14 +242,15 @@ mod tests {
         let img = parse_xcursor(&data).expect("parse");
         let p = to_rdp(&img, 7);
         assert_eq!(p.cache_index, 7);
-        // and stride for w=4 => 4 bytes (rounded to 16 bits)
-        assert_eq!(p.and_mask.len(), 4 * 4);
+        // and stride for w=4: (4+15)/16*2 = 2 bytes/row (16-bit aligned), 4 rows
+        assert_eq!(p.and_mask.len(), 2 * 4);
         assert_eq!(p.xor_mask.len(), 4 * 4 * 4);
         let enc = encode_color_pointer(&p);
-        // fixed 12 + xor + and
-        assert_eq!(enc.len(), 12 + p.xor_mask.len() + p.and_mask.len());
-        // xor before and on the wire
-        assert_eq!(enc[12..12 + 4], [0, 0, 0, 0]);
+        // fixed 14 (7 x u16: cacheIdx, xhot, yhot, w, h, lenAnd, lenXor —
+        // matches TS_COLORPOINTERATTRIBUTE FIXED_PART_SIZE) + xor + and
+        assert_eq!(enc.len(), 14 + p.xor_mask.len() + p.and_mask.len());
+        // xor starts at byte 14 (after the 7-u16 fixed header), before and
+        let _ = &enc[14..14 + 4];
     }
 
     #[test]
@@ -260,10 +261,62 @@ mod tests {
         data[px_off..px_off + 4].copy_from_slice(&[255, 255, 255, 255]);
         let img = parse_xcursor(&data).expect("parse");
         let p = to_rdp(&img, 0);
-        // and mask: 3 transparent bits set in the top source row = bottom dst row
-        let top_row_bits = p.and_mask[(p.height as usize - 1) * 2] >> 6; // x=0..1 in high bits
-        // x=0 opaque -> bit NOT set; x=1 transparent -> bit set
-        // bits are 0b10 => 2
-        assert_eq!(top_row_bits, 0b10);
+        // bottom dst row = top src row (bottom-up); x=0..1 occupy bits 7..6
+        let top_row_bits = p.and_mask[(p.height as usize - 1) * 2] >> 6;
+        // x=0 opaque -> bit7 clear; x=1 transparent -> bit6 set => 0b01 = 1
+        assert_eq!(top_row_bits, 0b01);
+    }
+
+    /// REGRESSION GUARD (2026-08-21): the hand-rolled wire encoder in
+    /// `encode_color_pointer` must stay byte-identical to ironrdp's own
+    /// `ColorPointerAttribute::encode`. Any drift (field order, the
+    /// xor-before-and mask ordering, length fields) produces a PDU that
+    /// clients silently drop. Verified against fork rev 95375180.
+    #[test]
+    fn wire_encode_matches_ironrdp_encoder() {
+        use ironrdp_core::encode_vec;
+        use ironrdp_pdu::pointer::{ColorPointerAttribute, Point16};
+
+        let data = minimal_xcursor(6, 8);
+        let img = parse_xcursor(&data).expect("parse");
+        let p = to_rdp(&img, 3);
+
+        let ours = encode_color_pointer(&p);
+
+        let reference = encode_vec(&ColorPointerAttribute {
+            cache_index: p.cache_index,
+            hot_spot: Point16 {
+                x: p.hot_spot.0,
+                y: p.hot_spot.1,
+            },
+            width: p.width,
+            height: p.height,
+            xor_mask: &p.xor_mask,
+            and_mask: &p.and_mask,
+        })
+        .expect("ironrdp reference encode");
+
+        assert_eq!(
+            ours, reference,
+            "hand-rolled TS_COLORPOINTERATTRIBUTE drifted from ironrdp's encoder"
+        );
+    }
+
+    /// REGRESSION GUARD: malformed/truncated XCursor files must return
+    /// Err, never panic. Guards parse_xcursor against bad-system-input.
+    #[test]
+    fn malformed_xcursor_is_error_not_panic() {
+        assert!(parse_xcursor(&[]).is_err());
+        assert!(parse_xcursor(&[0u8; 10]).is_err());
+        // valid magic but truncated TOC
+        let mut truncated = Vec::new();
+        truncated.extend_from_slice(&0x7275_6358u32.to_le_bytes());
+        truncated.extend_from_slice(&16u32.to_le_bytes());
+        truncated.extend_from_slice(&0x0001_0000u32.to_le_bytes());
+        truncated.extend_from_slice(&5u32.to_le_bytes()); // claims 5 toc entries
+        truncated.extend_from_slice(&[0u8; 8]); // only room for ~0
+        let result = std::panic::catch_unwind(|| parse_xcursor(&truncated));
+        assert!(result.is_ok(), "parse must not panic on truncated files");
+        assert!(result.unwrap().is_err(), "truncated file must be an error");
     }
 }
