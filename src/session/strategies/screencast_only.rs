@@ -102,26 +102,16 @@ impl ScreenCastOnlyStrategy {
     }
 
     /// Pick the best cursor mode from what the portal supports.
-    /// Preference: Metadata > Embedded > Hidden
+    ///
+    /// Always Hidden: KWin 6.3 Metadata mode emits cursor-only refresh frames
+    /// flagged SPA_CHUNK_FLAG_CORRUPTED (empty video), which the pipewire
+    /// consumer doesn't skip, painting stale cursor bytes into the video —
+    /// perceived as a double cursor + pixel dust around pointer movement.
+    /// With Hidden, KWin does zero cursor work; the RDP client renders its
+    /// own zero-latency pointer from pointer position PDUs. Preference when
+    /// clients gain CORRUPTED-flag awareness: Metadata > Embedded > Hidden.
     fn best_cursor_mode(&self) -> CursorMode {
-        use crate::compositor::CursorMode as CompCursorMode;
-
-        if self.available_cursor_modes.is_empty() {
-            return CursorMode::Metadata;
-        }
-        if self
-            .available_cursor_modes
-            .contains(&CompCursorMode::Metadata)
-        {
-            CursorMode::Metadata
-        } else if self
-            .available_cursor_modes
-            .contains(&CompCursorMode::Embedded)
-        {
-            CursorMode::Embedded
-        } else {
-            CursorMode::Hidden
-        }
+        CursorMode::Hidden
     }
 
     /// Check if ScreenCast portal is available (without requiring RemoteDesktop)
