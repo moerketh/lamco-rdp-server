@@ -63,7 +63,7 @@
     reason = "OwnedFd::from_raw_fd for Portal/PipeWire file descriptors"
 )]
 
-mod cursor_pdu;
+pub mod cursor_pdu;
 mod deployment;
 mod display_handler;
 mod egfx_sender;

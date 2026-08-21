@@ -830,7 +830,7 @@ impl LamcoDisplayHandler {
     ///
     /// Failure is non-fatal (logged): worst case the client keeps its
     /// default arrow, which is the pre-existing behavior.
-    async fn send_pointer_shape(handler: &Arc<DisplayPipelineHandler>) {
+    async fn send_pointer_shape(handler: &Arc<LamcoDisplayHandler>) {
         let sender = handler.server_event_tx.read().await.clone();
         let Some(sender) = sender else {
             debug!("cursor PDU: no server event sender yet — skipping");
@@ -1930,11 +1930,9 @@ impl LamcoDisplayHandler {
                                 .egfx_needs_init
                                 .store(true, std::sync::atomic::Ordering::SeqCst);
                             info!("Pipeline state reset for new client connection");
-                            // xrdp parity: push the guest cursor shape to the
-                            // client as a ColorPointer PDU so only ONE cursor
-                            // is visible — the client-side rendering of the
-                            // Parrot pointer (zero latency, no video trail).
-                            Self::send_pointer_shape(&handler).await;
+                            // Pointer shape is sent after the FIRST frame is
+                            // delivered (see egfx_frames_sent==1 below): mstsc
+                            // discards pointer PDUs that race activation.
                         }
                         debug!("Received frame from PipeWire");
                         f
@@ -2028,8 +2026,6 @@ impl LamcoDisplayHandler {
                                 .egfx_needs_init
                                 .store(true, std::sync::atomic::Ordering::SeqCst);
                             info!("Pipeline state reset for new client connection (no-frame path)");
-                            // See the frame-path reset above for rationale.
-                            Self::send_pointer_shape(&handler).await;
                         }
 
                         let needs_init = handler
@@ -3024,6 +3020,14 @@ impl LamcoDisplayHandler {
                                 match send_result {
                                     Ok(_frame_id) => {
                                         egfx_frames_sent += 1;
+                                        // First successful frame = session provably
+                                        // activated (client accepted EGFX video).
+                                        // mstsc drops pointer PDUs sent earlier —
+                                        // the initial attempt at pipeline reset
+                                        // races the activation handshake.
+                                        if egfx_frames_sent == 1 {
+                                            Self::send_pointer_shape(&handler).await;
+                                        }
                                         if egfx_frames_sent.is_multiple_of(30) {
                                             let codec = encoder.codec_name();
                                             debug!(
