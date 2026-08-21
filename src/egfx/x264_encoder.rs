@@ -10,7 +10,6 @@
 use openh264::formats::{BgraSliceU8, YUVBuffer, YUVSource};
 use std::os::raw::{c_int, c_void};
 use tracing::{debug, info, warn};
-
 use super::encoder::{EncoderConfig, EncoderError, EncoderResult, H264Frame};
 
 const X264_TYPE_AUTO: c_int = 0;
@@ -89,6 +88,10 @@ unsafe extern "C" {
 }
 
 /// H.264 encoder using x264 for AVC420.
+///
+/// Thread handling is CPU-count agnostic: `encoder_threads = 0` (the default)
+/// is forwarded to x264 as `i_threads = 0` (X264_THREADS_AUTO), which sizes
+/// the thread pool after the machine the server runs on.
 pub struct X264Encoder {
     #[cfg(feature = "x264")]
     encoder: *mut c_void,
@@ -97,9 +100,10 @@ pub struct X264Encoder {
     width: u32,
     height: u32,
     force_idr: bool,
-    y_plane: Vec<u8>,
-    u_plane: Vec<u8>,
-    v_plane: Vec<u8>,
+    /// Reusable contiguous Y/U/V buffer (Y then U then V, densely packed).
+    /// Restored on resolution change; never re-allocated per frame.
+    #[cfg(any(feature = "x264", feature = "h264"))]
+    yuv: Vec<u8>,
     diagnostics: Option<std::sync::Arc<super::encode_diagnostics::EncodeDiagnostics>>,
 }
 
@@ -116,9 +120,8 @@ impl X264Encoder {
             width: 0,
             height: 0,
             force_idr: true,
-            y_plane: Vec::new(),
-            u_plane: Vec::new(),
-            v_plane: Vec::new(),
+            #[cfg(any(feature = "x264", feature = "h264"))]
+            yuv: Vec::new(),
             diagnostics: None,
         })
     }
@@ -181,39 +184,42 @@ impl X264Encoder {
         self.ensure_encoder(width, height)?;
         let y_size = (width * height) as usize;
         let uv_size = ((width / 2) * (height / 2)) as usize;
-        self.y_plane.resize(y_size, 0);
-        self.u_plane.resize(uv_size, 0);
-        self.v_plane.resize(uv_size, 0);
+        self.yuv.resize(y_size + 2 * uv_size, 0);
 
-        let source = BgraSliceU8::new(bgra_data, (width as usize, height as usize));
-        let yuv = YUVBuffer::from_rgb_source(source);
-        let (y_stride, u_stride, v_stride) = yuv.strides();
-        copy_plane(&mut self.y_plane, yuv.y(), y_stride, width as usize, height as usize);
-        copy_plane(
-            &mut self.u_plane,
-            yuv.u(),
-            u_stride,
-            (width / 2) as usize,
-            (height / 2) as usize,
+        // Zero-allocation integer BT.601 BGRA -> I420 conversion writing
+        // straight into the contiguous Y/U/V buffer. Coefficients match the
+        // openh264 crate's fast scalar path (write_yuv_scalar), so output is
+        // bit-comparable with the previous from_rgb_source pipeline.
+        let convert_start = std::time::Instant::now();
+        #[cfg(feature = "h264")]
+        super::bgra_to_i420::convert(
+            bgra_data,
+            width as usize,
+            height as usize,
+            &mut self.yuv,
         );
-        copy_plane(
-            &mut self.v_plane,
-            yuv.v(),
-            v_stride,
-            (width / 2) as usize,
-            (height / 2) as usize,
-        );
+        #[cfg(not(feature = "h264"))]
+        {
+            let _ = &mut self.yuv;
+            let _ = bgra_data;
+            return Err(EncoderError::FeatureDisabled);
+        }
+        let convert_elapsed = convert_start.elapsed();
 
         let force_idr = self.force_idr;
         let mut output = std::ptr::null_mut();
         let mut output_size = 0;
         let mut is_keyframe = 0;
+        let y_ptr = self.yuv.as_ptr();
+        let u_ptr = unsafe { self.yuv.as_ptr().add(y_size) };
+        let v_ptr = unsafe { self.yuv.as_ptr().add(y_size + uv_size) };
+        let encode_start = std::time::Instant::now();
         let result = unsafe {
             lamco_x264_encode(
                 self.encoder,
-                self.y_plane.as_ptr(),
-                self.u_plane.as_ptr(),
-                self.v_plane.as_ptr(),
+                y_ptr,
+                u_ptr,
+                v_ptr,
                 width as c_int,
                 (width / 2) as c_int,
                 width as c_int,
@@ -225,7 +231,13 @@ impl X264Encoder {
                 &mut is_keyframe,
             )
         };
+        let encode_elapsed = encode_start.elapsed();
         self.force_idr = false;
+        debug!(
+            convert_us = convert_elapsed.as_micros() as u64,
+            encode_us = encode_elapsed.as_micros() as u64,
+            "x264 stage timing"
+        );
         if result <= 0 || output.is_null() || output_size <= 0 {
             return Ok(None);
         }
@@ -318,7 +330,6 @@ fn copy_plane(destination: &mut [u8], source: &[u8], source_stride: usize, width
             .copy_from_slice(&source[source_start..source_start + width]);
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;

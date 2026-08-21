@@ -48,6 +48,8 @@ mod openh264_compat;
 mod x264_encoder;
 
 mod avc444_encoder;
+#[cfg(any(feature = "x264", feature = "h264", test))]
+pub(crate) mod bgra_to_i420;
 mod color_convert;
 mod color_space;
 pub(crate) mod encode_diagnostics;

@@ -75,8 +75,10 @@ void *lamco_x264_create(uint32_t width, uint32_t height, uint32_t fps,
     param.b_intra_refresh = 0;
     param.rc.i_rc_method = X264_RC_CRF;
     /* CRF 0 is lossless and rejected by the 4:2:0 profiles required for
-     * MS-RDPEGFX AVC420. Clamp to the lossy range. */
-    param.rc.f_rf_constant = qp_min < 1 ? 1.0f : (qp_min > 51 ? 51.0f : (float)qp_min);
+     * MS-RDPEGFX AVC420. Screen content is visually lossless around CRF 15;
+     * OpenH264-style qp_min values (0-10) must not map to CRF 1, which makes
+     * the encoder ~10x slower for no perceptible gain on text/UI. */
+    param.rc.f_rf_constant = qp_min < 15 ? 15.0f : (qp_min > 30 ? 30.0f : (float)qp_min);
     if (apply_profile(&param, "main") != 0) {
         cleanup(&param);
         dlclose(library);

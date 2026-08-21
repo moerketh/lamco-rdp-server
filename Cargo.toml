@@ -314,7 +314,9 @@ h264-source = ["openh264", "openh264-sys2", "libloading", "openh264/source", "op
 # Loaded dynamically via libloading (same pattern as OpenH264).
 # Requires libx264.so (libx264-dev / libx264-164) on the target system.
 # When enabled, the encoder backend selection config can choose "x264" or "openh264".
-x264 = ["libloading"]
+# Depends on h264 for the shared BGRA->I420 conversion path (bgra_to_i420) and
+# the encoder-selection tests.
+x264 = ["libloading", "h264"]
 
 # Hardware-accelerated H.264 encoding (premium feature)
 # VA-API: Intel (iHD/i965) and AMD (radeonsi) GPU encoding
