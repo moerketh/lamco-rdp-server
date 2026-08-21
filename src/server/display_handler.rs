@@ -2718,7 +2718,7 @@ impl LamcoDisplayHandler {
                         // and ext-image-copy-capture-v1; see adaptive_fps.rs module docs).
                         let mut damage_source = "forced";
 
-                        let damage_regions = if force_full_frame {
+                        let mut damage_regions = if force_full_frame {
                             // Force full frame - either periodic IDR or first frame after init
                             if periodic_idr_due {
                                 debug!(
