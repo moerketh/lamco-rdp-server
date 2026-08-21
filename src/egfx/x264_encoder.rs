@@ -7,9 +7,11 @@
 #![expect(unsafe_code, reason = "FFI calls to the x264 C shim")]
 
 #[cfg(feature = "h264")]
-use openh264::formats::{BgraSliceU8, YUVBuffer, YUVSource};
+use openh264::formats::BgraSliceU8;
+#[cfg(test)]
+use openh264::formats::{YUVBuffer, YUVSource};
 use std::os::raw::{c_int, c_void};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 use super::encoder::{EncoderConfig, EncoderError, EncoderResult, H264Frame};
 
 const X264_TYPE_AUTO: c_int = 0;
@@ -67,6 +69,7 @@ unsafe extern "C" {
         qp_min: u32,
         qp_max: u32,
         threads: u32,
+        fullrange: u32,
     ) -> *mut c_void;
     fn lamco_x264_encode(
         encoder: *mut c_void,
@@ -150,6 +153,7 @@ impl X264Encoder {
                 self.config.qp_min as u32,
                 self.config.qp_max as u32,
                 self.config.encoder_threads as u32,
+                self.fullrange() as u32,
             )
         };
         if encoder.is_null() {
@@ -160,8 +164,22 @@ impl X264Encoder {
         self.encoder = encoder;
         self.width = width;
         self.height = height;
-        info!("x264 encoder opened: {}x{}, I420, ultrafast/zerolatency", width, height);
+        let range_desc = if self.fullrange() { "full" } else { "limited" };
+        info!(
+            "x264 encoder opened: {width}x{height}, I420, ultrafast/zerolatency, range={range_desc}"
+        );
         Ok(())
+    }
+
+    /// Whether the encoder runs in full-range (Y 0-255) mode.
+    ///
+    /// Derived from `EncoderConfig.color_space` (populated from the
+    /// `egfx.color_range` config knob). Default Limited to stay bit-identical
+    /// with the OpenH264 path.
+    fn fullrange(&self) -> bool {
+        self.config
+            .color_space
+            .is_some_and(|cs| cs.range == super::color_space::ColorRange::Full)
     }
 
     #[cfg(feature = "x264")]
@@ -188,15 +206,23 @@ impl X264Encoder {
 
         // Zero-allocation integer BT.601 BGRA -> I420 conversion writing
         // straight into the contiguous Y/U/V buffer. Coefficients match the
-        // openh264 crate's fast scalar path (write_yuv_scalar), so output is
-        // bit-comparable with the previous from_rgb_source pipeline.
+        // openh264 crate's fast scalar path (write_yuv_scalar) in Limited
+        // mode; Full mode maps black to Y0 for clients (mstsc) that do not
+        // expand limited range.
         let convert_start = std::time::Instant::now();
+        // Range decision must precede the mutable borrow of self.yuv.
+        let range = if self.fullrange() {
+            super::bgra_to_i420::Range::Full
+        } else {
+            super::bgra_to_i420::Range::Limited
+        };
         #[cfg(feature = "h264")]
         super::bgra_to_i420::convert(
             bgra_data,
             width as usize,
             height as usize,
             &mut self.yuv,
+            range,
         );
         #[cfg(not(feature = "h264"))]
         {

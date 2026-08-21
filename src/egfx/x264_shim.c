@@ -25,7 +25,8 @@ static void *load_symbol(void *library, const char *name) {
 }
 
 void *lamco_x264_create(uint32_t width, uint32_t height, uint32_t fps,
-                        uint32_t qp_min, uint32_t qp_max, uint32_t threads) {
+                        uint32_t qp_min, uint32_t qp_max, uint32_t threads,
+                        uint32_t fullrange) {
     const char *names[] = {"libx264.so.164", "libx264.so.148", "libx264.so"};
     void *library = NULL;
     for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
@@ -74,6 +75,15 @@ void *lamco_x264_create(uint32_t width, uint32_t height, uint32_t fps,
     param.b_aud = 0;
     param.b_intra_refresh = 0;
     param.rc.i_rc_method = X264_RC_CRF;
+    /* Colorimetry VUI: signal BT.601 with the requested range. mstsc does
+     * not perform limited->full expansion (limited black Y16 renders as
+     * RGB 16 = grey), so fullrange=1 encoding + flag is the grey-blacks
+     * fix. Values: colmatrix 6=BT.601 (SMPTE170M), colorprim 6=SMPTE170M,
+     * transfer 1=BT.709 (standard for computer graphics per sRGB). */
+    param.vui.i_colmatrix = 6;   /* X264_VUI_COLORSPEC_SMPTE170M */
+    param.vui.i_colorprim = 6;   /* SMPTE170M */
+    param.vui.i_transfer = 1;    /* BT.709 */
+    param.vui.b_fullrange = fullrange ? 1 : 0;
     /* CRF 0 is lossless and rejected by the 4:2:0 profiles required for
      * MS-RDPEGFX AVC420. Screen content is visually lossless around CRF 15;
      * OpenH264-style qp_min values (0-10) must not map to CRF 1, which makes
