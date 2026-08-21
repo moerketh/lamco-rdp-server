@@ -1,0 +1,269 @@
+//! XCursor → RDP ColorPointer conversion (xrdp-parity single cursor).
+//!
+//! Reads the guest's XCursor file for `left_ptr` (arrow), picks the
+//! best-size image chunk, and converts ARGB pixels to the monochrome
+//! `andMask` + color `xorMask` pair that TS_COLORPOINTERATTRIBUTE requires
+//! ([MS-RDPBCGR] 2.2.9.1.1.4.1):
+//!
+//! - Both masks are bottom-up (last scanline first) and 1-bit for and,
+//!   24bpp BGR for xor in color-pointer mode... in practice TS pointers use
+//!   32bpp XOR BGRx. Single fragment, no compression.
+//! - andMask bit=1 keeps the pixel transparent (client doesn't draw xor);
+//!   bit=0 lets the xor color show. We set and=1 only for fully transparent
+//!   source pixels so anti-aliased edges carry through the color mask.
+
+use std::path::Path;
+
+/// An RDP color pointer attribute, ready for `FastPathUpdate::Pointer`.
+pub struct RdpPointer {
+    pub cache_index: u16,
+    pub hot_spot: (u16, u16),
+    pub width: u16,
+    pub height: u16,
+    pub and_mask: Vec<u8>,
+    pub xor_mask: Vec<u8>,
+}
+
+const MAGIC: u32 = 0x7275_6358; // "Xcur" as little-endian u32 read
+const CHUNK_IMAGE: u32 = 0xFFFD_0002;
+
+#[derive(Debug)]
+pub enum CursorError {
+    Io(std::io::Error),
+    Malformed(&'static str),
+    NoImage,
+}
+
+impl std::fmt::Display for CursorError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(e) => write!(f, "cursor file_io: {e}"),
+            Self::Malformed(why) => write!(f, "cursor malformed: {why}"),
+            Self::NoImage => write!(f, "cursor file has no image chunk"),
+        }
+    }
+}
+
+struct ImageChunk {
+    nominal: u32,
+    width: u32,
+    height: u32,
+    xhot: u32,
+    yhot: u32,
+    pixels: Vec<u8>, // ARGB rows, top-down, width*height*4
+}
+
+/// Parse an XCursor file and pick the image chunk closest to 24px.
+fn parse_xcursor(data: &[u8]) -> Result<ImageChunk, CursorError> {
+    let rd_u32 = |off: usize| -> Result<u32, CursorError> {
+        data.get(off..off + 4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .ok_or(CursorError::Malformed("truncated header/toc"))
+    };
+
+    if data.len() < 16 {
+        return Err(CursorError::Malformed("file too small"));
+    }
+    if rd_u32(0)? != MAGIC {
+        return Err(CursorError::Malformed("bad magic"));
+    }
+    let ntoc = rd_u32(12)? as usize;
+
+    let mut best: Option<ImageChunk> = None;
+    for i in 0..ntoc {
+        let entry = 16 + i * 12;
+        let ctype = rd_u32(entry)?;
+        if ctype != CHUNK_IMAGE {
+            continue;
+        }
+        let nominal = rd_u32(entry + 4)?;
+        let pos = rd_u32(entry + 8)? as usize;
+        // chunk header per Xcursor spec (9 CARD32):
+        // header, type, subtype, version, width, height, xhot, yhot, delay
+        if rd_u32(pos)? != 36 {
+            continue; // not a chunk header we understand
+        }
+        let _chunk_type = rd_u32(pos + 4)?;
+        let _version = rd_u32(pos + 12)?;
+        let width = rd_u32(pos + 16)?;
+        let height = rd_u32(pos + 20)?;
+        let xhot = rd_u32(pos + 24)?;
+        let yhot = rd_u32(pos + 28)?;
+        let pixels_off = pos + 36;
+        let len = width as usize * height as usize * 4;
+        let pixels = data
+            .get(pixels_off..pixels_off + len)
+            .ok_or(CursorError::Malformed("truncated pixels"))?
+            .to_vec();
+
+        let chunk = ImageChunk { nominal, width, height, xhot, yhot, pixels };
+        let better = match &best {
+            None => true,
+            Some(b) => (chunk.nominal as i32 - 24).abs() < (b.nominal as i32 - 24).abs(),
+        };
+        if better {
+            best = Some(chunk);
+        }
+    }
+    best.ok_or(CursorError::NoImage)
+}
+
+/// Convert an XCursor image to RDP masks.
+///
+/// RDP masks are bottom-up; andMask is 1bpp padded to 16-bit scanlines;
+/// xorMask is 32bpp BGRx (BGRA byte order, alpha ignored, transparent
+/// pixels black). Max size for ColorPointer is 96×96 ([MS-RDPBCGR]).
+fn to_rdp(img: &ImageChunk, cache_index: u16) -> RdpPointer {
+    let w = img.width.min(96) as usize;
+    let h = img.height.min(96) as usize;
+
+    // Stride math
+    let and_stride = (w + 15) / 16 * 2; // bytes per scanline, 16-bit aligned
+    let mut and_mask = vec![0u8; and_stride * h];
+    let mut xor_mask = vec![0u8; w * 4 * h];
+
+    for y in 0..h {
+        // bottom-up destination row
+        let dst_y = h - 1 - y;
+        for x in 0..w {
+            let src = &img.pixels[(y * img.width as usize + x) * 4..];
+            let (b, g, r, a) = (src[0], src[1], src[2], src[3]);
+
+            // xor: BGRx bottom-up
+            let xo = (dst_y * w + x) * 4;
+            xor_mask[xo] = if a > 128 { b } else { 0 };
+            xor_mask[xo + 1] = if a > 128 { g } else { 0 };
+            xor_mask[xo + 2] = if a > 128 { r } else { 0 };
+            xor_mask[xo + 3] = 0;
+
+            // and: 1 => transparent (hide xor pixel)
+            if a <= 128 {
+                let byte = dst_y * and_stride + x / 8;
+                and_mask[byte] |= 0x80 >> (x % 8);
+            }
+        }
+    }
+
+    RdpPointer {
+        cache_index,
+        hot_spot: (
+            img.xhot.min(96) as u16,
+            img.yhot.min(96) as u16,
+        ),
+        width: w as u16,
+        height: h as u16,
+        and_mask,
+        xor_mask,
+    }
+}
+
+/// Load the system arrow pointer and convert it for RDP.
+///
+/// Search order: the configured theme dir first (from $XCURSOR_PATH or
+/// /usr/share/icons), falling back to breeze_cursors.
+pub fn load_default_pointer() -> Result<RdpPointer, CursorError> {
+    let candidates = [
+        "/usr/share/icons/breeze_cursors/cursors/left_ptr",
+        "/usr/share/icons/default/cursors/left_ptr",
+        "/usr/share/icons/whiteglass/cursors/left_ptr",
+    ];
+    let mut last = CursorError::NoImage;
+    for path in candidates {
+        let p = Path::new(path);
+        if !p.exists() {
+            continue;
+        }
+        match std::fs::read(p) {
+            Ok(data) => match parse_xcursor(&data) {
+                Ok(img) => return Ok(to_rdp(&img, 0)),
+                Err(e) => last = e,
+            },
+            Err(e) => last = CursorError::Io(e),
+        }
+    }
+    Err(last)
+}
+
+/// Encode an [`RdpPointer`] as the TS_COLORPOINTERATTRIBUTE wire body
+/// (without the fast-path header) — ready for `ServerEvent::Pointer`.
+pub fn encode_color_pointer(p: &RdpPointer) -> Vec<u8> {
+    let mut out = Vec::with_capacity(12 + p.and_mask.len() + p.xor_mask.len());
+    out.extend_from_slice(&p.cache_index.to_le_bytes());
+    out.extend_from_slice(&p.hot_spot.0.to_le_bytes());
+    out.extend_from_slice(&p.hot_spot.1.to_le_bytes());
+    out.extend_from_slice(&p.width.to_le_bytes());
+    out.extend_from_slice(&p.height.to_le_bytes());
+    out.extend_from_slice(&(p.and_mask.len() as u16).to_le_bytes());
+    out.extend_from_slice(&(p.xor_mask.len() as u16).to_le_bytes());
+    // NOTE wire order per MS-RDPBCGR: xorBmp first, then andBmp
+    out.extend_from_slice(&p.xor_mask);
+    out.extend_from_slice(&p.and_mask);
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn minimal_xcursor(w: u32, h: u32) -> Vec<u8> {
+        // header (16) + toc (12) + one image chunk (36 + w*h*4)
+        let pixels = vec![0u8; (w * h * 4) as usize];
+        let mut v = Vec::new();
+        v.extend_from_slice(&MAGIC.to_le_bytes());
+        v.extend_from_slice(&16u32.to_le_bytes());
+        v.extend_from_slice(&0x0001_0000u32.to_le_bytes());
+        v.extend_from_slice(&1u32.to_le_bytes());
+        v.extend_from_slice(&CHUNK_IMAGE.to_le_bytes());
+        v.extend_from_slice(&24u32.to_le_bytes()); // subtype nominal size
+        v.extend_from_slice(&28u32.to_le_bytes()); // chunk position
+        v.extend_from_slice(&36u32.to_le_bytes()); // chunk header size
+        v.extend_from_slice(&CHUNK_IMAGE.to_le_bytes());
+        v.extend_from_slice(&24u32.to_le_bytes()); // subtype
+        v.extend_from_slice(&1u32.to_le_bytes()); // version
+        v.extend_from_slice(&w.to_le_bytes());
+        v.extend_from_slice(&h.to_le_bytes());
+        v.extend_from_slice(&1u32.to_le_bytes()); // xhot
+        v.extend_from_slice(&2u32.to_le_bytes()); // yhot
+        v.extend_from_slice(&1u32.to_le_bytes()); // delay
+        v.extend_from_slice(&pixels);
+        v
+    }
+
+    #[test]
+    fn parses_minimal_file() {
+        let data = minimal_xcursor(4, 4);
+        let img = parse_xcursor(&data).expect("parse");
+        assert_eq!((img.width, img.height, img.xhot, img.yhot), (4, 4, 1, 2));
+    }
+
+    #[test]
+    fn rdp_masks_layout() {
+        let data = minimal_xcursor(4, 4);
+        let img = parse_xcursor(&data).expect("parse");
+        let p = to_rdp(&img, 7);
+        assert_eq!(p.cache_index, 7);
+        // and stride for w=4 => 4 bytes (rounded to 16 bits)
+        assert_eq!(p.and_mask.len(), 4 * 4);
+        assert_eq!(p.xor_mask.len(), 4 * 4 * 4);
+        let enc = encode_color_pointer(&p);
+        // fixed 12 + xor + and
+        assert_eq!(enc.len(), 12 + p.xor_mask.len() + p.and_mask.len());
+        // xor before and on the wire
+        assert_eq!(enc[12..12 + 4], [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn transparent_pixels_get_and_bit() {
+        let mut data = minimal_xcursor(2, 2);
+        // make pixel (0,0) opaque white, everything else transparent
+        let px_off = 16 + 12 + 36; // header + toc + chunk header
+        data[px_off..px_off + 4].copy_from_slice(&[255, 255, 255, 255]);
+        let img = parse_xcursor(&data).expect("parse");
+        let p = to_rdp(&img, 0);
+        // and mask: 3 transparent bits set in the top source row = bottom dst row
+        let top_row_bits = p.and_mask[(p.height as usize - 1) * 2] >> 6; // x=0..1 in high bits
+        // x=0 opaque -> bit NOT set; x=1 transparent -> bit set
+        // bits are 0b10 => 2
+        assert_eq!(top_row_bits, 0b10);
+    }
+}

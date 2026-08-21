@@ -823,6 +823,38 @@ impl LamcoDisplayHandler {
         info!("Client disconnect signaled to pipeline - frame processing paused");
     }
 
+    /// Send the guest cursor shape to the client as an RDP ColorPointer
+    /// update (xrdp parity). Called once per client connection, right
+    /// after the pipeline state reset. The client then renders the Parrot
+    /// arrow locally — single cursor, zero latency, no video-cursor trail.
+    ///
+    /// Failure is non-fatal (logged): worst case the client keeps its
+    /// default arrow, which is the pre-existing behavior.
+    async fn send_pointer_shape(handler: &Arc<DisplayPipelineHandler>) {
+        let sender = handler.server_event_tx.read().await.clone();
+        let Some(sender) = sender else {
+            debug!("cursor PDU: no server event sender yet — skipping");
+            return;
+        };
+        match crate::server::cursor_pdu::load_default_pointer() {
+            Ok(pointer) => {
+                let payload = crate::server::cursor_pdu::encode_color_pointer(&pointer);
+                let sent = sender.send(ServerEvent::Pointer(payload));
+                match sent {
+                    Ok(()) => info!(
+                        width = pointer.width,
+                        height = pointer.height,
+                        "cursor PDU sent: guest pointer shape pushed to client (xrdp parity)"
+                    ),
+                    Err(e) => warn!("cursor PDU send failed: {e}"),
+                }
+            }
+            Err(e) => {
+                warn!("cursor PDU: could not load guest pointer ({e}) — client keeps default arrow");
+            }
+        }
+    }
+
     /// Rebind the capture pipeline to a new PipeWire node after a session
     /// re-establishment (the `PerConnection` lifecycle re-creates the compositor
     /// session, which yields a fresh node). Destroys the stream on the old node
@@ -1898,6 +1930,11 @@ impl LamcoDisplayHandler {
                                 .egfx_needs_init
                                 .store(true, std::sync::atomic::Ordering::SeqCst);
                             info!("Pipeline state reset for new client connection");
+                            // xrdp parity: push the guest cursor shape to the
+                            // client as a ColorPointer PDU so only ONE cursor
+                            // is visible — the client-side rendering of the
+                            // Parrot pointer (zero latency, no video trail).
+                            Self::send_pointer_shape(&handler).await;
                         }
                         debug!("Received frame from PipeWire");
                         f
@@ -1991,6 +2028,8 @@ impl LamcoDisplayHandler {
                                 .egfx_needs_init
                                 .store(true, std::sync::atomic::Ordering::SeqCst);
                             info!("Pipeline state reset for new client connection (no-frame path)");
+                            // See the frame-path reset above for rationale.
+                            Self::send_pointer_shape(&handler).await;
                         }
 
                         let needs_init = handler
