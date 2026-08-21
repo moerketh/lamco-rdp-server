@@ -566,13 +566,17 @@ impl LamcoDisplayHandler {
         ));
 
         for (idx, stream) in stream_info.iter().enumerate() {
+            // buffer_count 5: with 3 buffers and damage-driven capture the pw
+            // timing log shows queued=2/3 (67% pressure) because the async
+            // runtime still holds a buffer while x264 encodes. Two spares
+            // let the compositor keep writing without stalling capture.
             let config = lamco_pipewire::StreamConfig {
                 name: format!("monitor-{idx}"),
                 width: stream.size.0,
                 height: stream.size.1,
                 framerate: 60,
                 use_dmabuf,
-                buffer_count: 3,
+                buffer_count: 5,
                 preferred_format: Some(lamco_pipewire::PixelFormat::BGRx),
                 dmabuf_passthrough: false,
             };
@@ -873,7 +877,7 @@ impl LamcoDisplayHandler {
             height,
             framerate: 60,
             use_dmabuf: self.use_dmabuf,
-            buffer_count: 3,
+            buffer_count: 5,
             preferred_format: Some(lamco_pipewire::PixelFormat::BGRx),
             dmabuf_passthrough: false,
         };
@@ -1650,7 +1654,7 @@ impl LamcoDisplayHandler {
                                     height: req.height as u32,
                                     framerate: 60,
                                     use_dmabuf: use_dmabuf_for_resize,
-                                    buffer_count: 3,
+                                    buffer_count: 5,
                                     preferred_format: Some(lamco_pipewire::PixelFormat::BGRx),
                                     dmabuf_passthrough: false,
                                 };
