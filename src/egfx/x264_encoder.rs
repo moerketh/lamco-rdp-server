@@ -357,6 +357,13 @@ mod tests {
             .windows(5)
             .position(|window| window == [0, 0, 0, 1, 0x67])
             .expect("IDR output must include an SPS NAL");
-        assert_eq!(frame.data[sps_start + 5], 0x42);
+        // profile_idc must be a 4:2:0 profile decodable by mstsc's AVC420
+        // decoder: 66=Baseline, 77=Main, 88=Extended, 100=High.
+        // 244 (High 4:4:4 Predictive) is what caused the black screen.
+        let profile_idc = frame.data[sps_start + 5];
+        assert!(
+            matches!(profile_idc, 66 | 77 | 88 | 100),
+            "SPS profile_idc {profile_idc} is not 4:2:0-compatible"
+        );
     }
 }

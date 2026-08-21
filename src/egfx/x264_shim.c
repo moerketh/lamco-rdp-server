@@ -17,6 +17,7 @@ typedef void (*x264_encoder_close_fn)(x264_t *);
 typedef void (*x264_picture_init_fn)(x264_picture_t *);
 typedef int (*x264_param_default_preset_fn)(x264_param_t *, const char *, const char *);
 typedef int (*x264_param_parse_fn)(x264_param_t *, const char *, const char *);
+typedef int (*x264_param_apply_profile_fn)(x264_param_t *, const char *);
 typedef void (*x264_param_cleanup_fn)(x264_param_t *);
 
 static void *load_symbol(void *library, const char *name) {
@@ -37,6 +38,8 @@ void *lamco_x264_create(uint32_t width, uint32_t height, uint32_t fps,
         (x264_param_default_preset_fn)load_symbol(library, "x264_param_default_preset");
     x264_param_parse_fn parse =
         (x264_param_parse_fn)load_symbol(library, "x264_param_parse");
+    x264_param_apply_profile_fn apply_profile =
+        (x264_param_apply_profile_fn)load_symbol(library, "x264_param_apply_profile");
     x264_param_cleanup_fn cleanup =
         (x264_param_cleanup_fn)load_symbol(library, "x264_param_cleanup");
     x264_encoder_open_fn open =
@@ -44,7 +47,7 @@ void *lamco_x264_create(uint32_t width, uint32_t height, uint32_t fps,
     if (!open) open = (x264_encoder_open_fn)load_symbol(library, "x264_encoder_open_148");
     x264_picture_init_fn picture_init =
         (x264_picture_init_fn)load_symbol(library, "x264_picture_init");
-    if (!default_preset || !parse || !cleanup || !open || !picture_init) {
+    if (!default_preset || !parse || !apply_profile || !cleanup || !open || !picture_init) {
         dlclose(library);
         return NULL;
     }
@@ -71,7 +74,14 @@ void *lamco_x264_create(uint32_t width, uint32_t height, uint32_t fps,
     param.b_aud = 0;
     param.b_intra_refresh = 0;
     param.rc.i_rc_method = X264_RC_CRF;
-    param.rc.f_rf_constant = (float)qp_min;
+    /* CRF 0 is lossless and rejected by the 4:2:0 profiles required for
+     * MS-RDPEGFX AVC420. Clamp to the lossy range. */
+    param.rc.f_rf_constant = qp_min < 1 ? 1.0f : (qp_min > 51 ? 51.0f : (float)qp_min);
+    if (apply_profile(&param, "main") != 0) {
+        cleanup(&param);
+        dlclose(library);
+        return NULL;
+    }
 
     lamco_x264_encoder *result = calloc(1, sizeof(*result));
     if (!result) {
