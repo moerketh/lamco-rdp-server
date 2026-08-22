@@ -282,6 +282,8 @@ mod tests {
         let mut data = minimal_xcursor(2, 2);
         let px_off = 16 + 12 + 36;
         // pixel (0,0): WEAK alpha (10) with color — must DRAW.
+        // XCursor pixels are little-endian 0xAARRGGBB, i.e. file bytes
+        // [B, G, R, A] — so this is B=200, G=100, R=50, A=10:
         data[px_off..px_off + 4].copy_from_slice(&[200, 100, 50, 10]);
         // pixel (1,0): fully transparent — must stay punched out.
         // (all-zero from minimal_xcursor)
@@ -292,9 +294,11 @@ mod tests {
         // and-bit for x=0 must be CLEAR (drawn) despite tiny alpha…
         let byte = p.and_mask[(p.height as usize - 1) * 2];
         assert_eq!(byte >> 7 & 1, 0, "a=10 pixel must be drawn, not punched");
-        // …and its xor color present:
-        let xo = ((p.height as usize - 1) * 2) * 4 * 2; // bottom row, x=0
-        assert_eq!(&p.xor_mask[xo..xo + 3], &[50, 100, 200], "BGR color preserved");
+        // …and its xor color present (x=0 on bottom dst row for a 2×2
+        // cursor: offset = (h-1) * w * 4 = 4 bytes). to_rdp keeps file
+        // order [B, G, R] verbatim in the xor mask, so expect 200,100,50:
+        let xo = (p.height as usize - 1) * p.width as usize * 4;
+        assert_eq!(&p.xor_mask[xo..xo + 3], &[200, 100, 50], "BGR color preserved");
         // x=1 (transparent) still punched:
         assert_eq!(byte >> 6 & 1, 1, "a=0 pixel stays transparent");
     }
