@@ -6,8 +6,11 @@
 //! ([MS-RDPBCGR] 2.2.9.1.1.4.1):
 //!
 //! - Both masks are bottom-up (last scanline first) and 1-bit for and,
-//!   24bpp BGR for xor in color-pointer mode... in practice TS pointers use
-//!   32bpp XOR BGRx. Single fragment, no compression.
+//!   24bpp BGR for xor (3 bytes per pixel, scanlines padded to an even
+//!   byte count). TS_COLORPOINTERATTRIBUTE has no xorBpp field, so 24bpp
+//!   is what every conformant client decodes; 32bpp xor data is only
+//!   valid in NewPointer (TS_POINTERATTRIBUTE, update 0xB).
+//!   Single fragment, no compression.
 //! - andMask bit=1 keeps the pixel transparent (client doesn't draw xor);
 //!   bit=0 lets the xor color show. We set and=1 only for fully transparent
 //!   source pixels so anti-aliased edges carry through the color mask.
@@ -111,16 +114,23 @@ fn parse_xcursor(data: &[u8]) -> Result<ImageChunk, CursorError> {
 /// Convert an XCursor image to RDP masks.
 ///
 /// RDP masks are bottom-up; andMask is 1bpp padded to 16-bit scanlines;
-/// xorMask is 32bpp BGRx (BGRA byte order, alpha ignored, transparent
-/// pixels black). Max size for ColorPointer is 96×96 ([MS-RDPBCGR]).
+/// xorMask is 24bpp BGR (3 bytes per pixel, scanlines padded to an even
+/// byte count — ColorPointer has no xorBpp field, so every conformant
+/// client decodes it at 24bpp). Alpha flattens: a>0 draws opaque, a==0 is
+/// punch-through transparent via the and mask. Max size for ColorPointer
+/// is 96×96 ([MS-RDPBCGR]).
 fn to_rdp(img: &ImageChunk, cache_index: u16) -> RdpPointer {
     let w = img.width.min(96) as usize;
     let h = img.height.min(96) as usize;
 
     // Stride math
     let and_stride = (w + 15) / 16 * 2; // bytes per scanline, 16-bit aligned
+    // 24bpp xor scanlines are padded to a 16-bit boundary: width 5 →
+    // 15 data bytes + 1 pad = 16-byte stride. xrdp writes the same layout
+    // in its legacy color-pointer path (libxrdp.c, TS_COLORPOINTERATTRIBUTE).
+    let xor_stride = (w * 3 + 1) & !1;
     let mut and_mask = vec![0u8; and_stride * h];
-    let mut xor_mask = vec![0u8; w * 4 * h];
+    let mut xor_mask = vec![0u8; xor_stride * h];
 
     for y in 0..h {
         // bottom-up destination row
@@ -129,20 +139,30 @@ fn to_rdp(img: &ImageChunk, cache_index: u16) -> RdpPointer {
             let src = &img.pixels[(y * img.width as usize + x) * 4..];
             let (b, g, r, a) = (src[0], src[1], src[2], src[3]);
 
-            // xor: BGRx bottom-up.
-            // Alpha rule (2026-08-22 fix): only FULLY transparent (a==0)
-            // pixels are transparent; every a>0 pixel draws its color.
-            // The previous a>128 threshold dropped the breeze arrow's 85
-            // anti-aliased edge/shadow pixels to transparent — speckled
-            // holes that read as a glitch around the cursor.
+            // xor: 24bpp BGR, bottom-up.
+            // Alpha rule: only FULLY transparent (a==0) pixels are
+            // transparent; every a>0 pixel draws its color (the earlier
+            // a>128 threshold dropped the breeze arrow's 85 anti-aliased
+            // edge/shadow pixels — speckled holes around the cursor).
+            // ColorPointer carries no alpha channel, so semi-transparent
+            // source pixels flatten to opaque — the same tradeoff xrdp
+            // makes on its 24bpp path.
+            //
+            // 2026-08-22 fix: the xor mask MUST be 24bpp. The previous
+            // w*4 layout wrote 4 bytes/px into a field clients decode at
+            // 3 bytes/px, shearing every scanline left by one cursor
+            // width — clients rendered three side-by-side contour ghosts.
             let opaque = a > 0;
-            let xo = (dst_y * w + x) * 4;
-            xor_mask[xo] = if opaque { b } else { 0 };
-            xor_mask[xo + 1] = if opaque { g } else { 0 };
-            xor_mask[xo + 2] = if opaque { r } else { 0 };
-            xor_mask[xo + 3] = 0;
+            if opaque {
+                let xo = dst_y * xor_stride + x * 3;
+                xor_mask[xo] = b;
+                xor_mask[xo + 1] = g;
+                xor_mask[xo + 2] = r;
+            }
 
-            // and: 1 => transparent (hide xor pixel)
+            // and: 1 => transparent (hide xor pixel). Transparent source
+            // pixels keep their xor bytes zero: black + and-bit reads as
+            // fully transparent on the client.
             if !opaque {
                 let byte = dst_y * and_stride + x / 8;
                 and_mask[byte] |= 0x80 >> (x % 8);
@@ -250,13 +270,28 @@ mod tests {
         assert_eq!(p.cache_index, 7);
         // and stride for w=4: (4+15)/16*2 = 2 bytes/row (16-bit aligned), 4 rows
         assert_eq!(p.and_mask.len(), 2 * 4);
-        assert_eq!(p.xor_mask.len(), 4 * 4 * 4);
+        // xor stride for w=4 at 24bpp: 4*3=12 (already even), 4 rows
+        assert_eq!(p.xor_mask.len(), 12 * 4);
         let enc = encode_color_pointer(&p);
         // fixed 14 (7 x u16: cacheIdx, xhot, yhot, w, h, lenAnd, lenXor —
         // matches TS_COLORPOINTERATTRIBUTE FIXED_PART_SIZE) + xor + and
         assert_eq!(enc.len(), 14 + p.xor_mask.len() + p.and_mask.len());
         // xor starts at byte 14 (after the 7-u16 fixed header), before and
         let _ = &enc[14..14 + 4];
+    }
+
+    #[test]
+    fn xor_stride_pads_odd_widths() {
+        // REGRESSION (2026-08-22): 24bpp xor scanlines must be padded to
+        // an even byte count — clients compute the stride as
+        // ceil(w*24/16)*2. A width-5 cursor needs a 16-byte stride
+        // (15 data + 1 pad), not 15. The length check in IronRDP's
+        // decode_pointer (InvalidXorMaskSize) rejects the unpadded form,
+        // and the pre-fix 4-bytes/px form sheared every scanline.
+        let data = minimal_xcursor(5, 4);
+        let img = parse_xcursor(&data).expect("parse");
+        let p = to_rdp(&img, 0);
+        assert_eq!(p.xor_mask.len(), 16 * 4, "w=5 → 15 data bytes + 1 pad per row");
     }
 
     #[test]
@@ -295,12 +330,69 @@ mod tests {
         let byte = p.and_mask[(p.height as usize - 1) * 2];
         assert_eq!(byte >> 7 & 1, 0, "a=10 pixel must be drawn, not punched");
         // …and its xor color present (x=0 on bottom dst row for a 2×2
-        // cursor: offset = (h-1) * w * 4 = 4 bytes). to_rdp keeps file
-        // order [B, G, R] verbatim in the xor mask, so expect 200,100,50:
-        let xo = (p.height as usize - 1) * p.width as usize * 4;
+        // cursor at 24bpp: offset = (h-1) * 6 = 6 bytes). to_rdp writes
+        // [B, G, R] in the xor mask, so expect 200,100,50:
+        let xo = (p.height as usize - 1) * 6;
         assert_eq!(&p.xor_mask[xo..xo + 3], &[200, 100, 50], "BGR color preserved");
         // x=1 (transparent) still punched:
         assert_eq!(byte >> 6 & 1, 1, "a=0 pixel stays transparent");
+    }
+
+    /// REGRESSION (2026-08-22, THE bug): round-trip our ColorPointer PDU
+    /// through IronRDP's own CLIENT decoder. The pre-fix 32bpp xor mask
+    /// made decode_pointer fail InvalidXorMaskSize (it expects
+    /// ceil(w*3/16)*2 * h bytes); on clients that don't length-check,
+    /// the extra byte per pixel sheared each scanline — rendering as
+    /// three side-by-side contour ghosts. This test pins the full
+    /// producer→consumer conformance: iterator decode, exact colors,
+    /// transparency, and hotspot.
+    #[test]
+    fn decodes_via_ironrdp_client_decoder() {
+        use ironrdp_core::{Decode, ReadCursor};
+        use ironrdp_graphics::pointer::{DecodedPointer, PointerBitmapTarget};
+        use ironrdp_pdu::pointer::ColorPointerAttribute;
+
+        // Asymmetric width so the even-stride padding is exercised
+        // (w=5 → stride 16, not 15).
+        let mut data = minimal_xcursor(5, 4);
+        let px_off = 16 + 12 + 36; // header + toc + chunk header
+        // Row 0 (top): x=0 red, x=1 transparent, x=2..4 stay zero (transparent).
+        // XCursor file bytes are little-endian 0xAARRGGBB → [B, G, R, A].
+        data[px_off..px_off + 4].copy_from_slice(&[0, 0, 255, 255]); // red
+        data[px_off + 4..px_off + 8].copy_from_slice(&[0, 255, 0, 255]); // green
+        // Row 1: x=0 blue.
+        data[px_off + 20..px_off + 24].copy_from_slice(&[255, 0, 0, 255]); // blue
+        let img = parse_xcursor(&data).expect("parse");
+        let p = to_rdp(&img, 0);
+
+        let wire = encode_color_pointer(&p);
+        let mut cursor = ReadCursor::new(&wire);
+        let attr = ColorPointerAttribute::decode(&mut cursor).expect("decode PDU body");
+        let decoded = DecodedPointer::decode_color_pointer_attribute(
+            &attr,
+            PointerBitmapTarget::Accelerated,
+        )
+        .expect("client-side decode");
+
+        assert_eq!((decoded.width, decoded.height), (5, 4));
+        assert_eq!((decoded.hotspot_x, decoded.hotspot_y), (1, 2));
+
+        // bitmap_data is top-down RGBA (Accelerated: no premultiply).
+        // Row 0: red, green, then three transparent punch-throughs.
+        let px = |x: usize, y: usize| -> [u8; 4] {
+            let o = (y * decoded.width as usize + x) * 4;
+            decoded.bitmap_data[o..o + 4].try_into().unwrap()
+        };
+        assert_eq!(px(0, 0), [255, 0, 0, 255], "source red at top-left");
+        assert_eq!(px(1, 0), [0, 255, 0, 255], "source green next to it");
+        assert_eq!(px(2, 0), [0, 0, 0, 0], "a=0 → and-mask punch-through");
+        assert_eq!(px(3, 0), [0, 0, 0, 0]);
+        assert_eq!(px(4, 0), [0, 0, 0, 0]);
+        // Row 1: blue at x=0 (bottom-up xor rows flip back to top-down).
+        assert_eq!(px(0, 1), [0, 0, 255, 255], "source blue on second row");
+        // Also the very last source row (h-1) must land in decoded row 3.
+        let last_row = &decoded.bitmap_data[3 * 5 * 4..];
+        assert!(last_row.iter().all(|&b| b == 0), "all-transparent bottom row");
     }
 
     /// REGRESSION GUARD (2026-08-21): the hand-rolled wire encoder in
