@@ -129,15 +129,21 @@ fn to_rdp(img: &ImageChunk, cache_index: u16) -> RdpPointer {
             let src = &img.pixels[(y * img.width as usize + x) * 4..];
             let (b, g, r, a) = (src[0], src[1], src[2], src[3]);
 
-            // xor: BGRx bottom-up
+            // xor: BGRx bottom-up.
+            // Alpha rule (2026-08-22 fix): only FULLY transparent (a==0)
+            // pixels are transparent; every a>0 pixel draws its color.
+            // The previous a>128 threshold dropped the breeze arrow's 85
+            // anti-aliased edge/shadow pixels to transparent — speckled
+            // holes that read as a glitch around the cursor.
+            let opaque = a > 0;
             let xo = (dst_y * w + x) * 4;
-            xor_mask[xo] = if a > 128 { b } else { 0 };
-            xor_mask[xo + 1] = if a > 128 { g } else { 0 };
-            xor_mask[xo + 2] = if a > 128 { r } else { 0 };
+            xor_mask[xo] = if opaque { b } else { 0 };
+            xor_mask[xo + 1] = if opaque { g } else { 0 };
+            xor_mask[xo + 2] = if opaque { r } else { 0 };
             xor_mask[xo + 3] = 0;
 
             // and: 1 => transparent (hide xor pixel)
-            if a <= 128 {
+            if !opaque {
                 let byte = dst_y * and_stride + x / 8;
                 and_mask[byte] |= 0x80 >> (x % 8);
             }
@@ -265,6 +271,32 @@ mod tests {
         let top_row_bits = p.and_mask[(p.height as usize - 1) * 2] >> 6;
         // x=0 opaque -> bit7 clear; x=1 transparent -> bit6 set => 0b01 = 1
         assert_eq!(top_row_bits, 0b01);
+    }
+
+    /// REGRESSION (2026-08-22): the a>128 alpha threshold dropped the
+    /// breeze arrow's 85 anti-aliased pixels to fully transparent,
+    /// producing speckled holes around the rendered cursor ("glitching").
+    /// Any alpha > 0 must draw its color; only a==0 is punch-through.
+    #[test]
+    fn semi_transparent_pixels_are_drawn() {
+        let mut data = minimal_xcursor(2, 2);
+        let px_off = 16 + 12 + 36;
+        // pixel (0,0): WEAK alpha (10) with color — must DRAW.
+        data[px_off..px_off + 4].copy_from_slice(&[200, 100, 50, 10]);
+        // pixel (1,0): fully transparent — must stay punched out.
+        // (all-zero from minimal_xcursor)
+        let img = parse_xcursor(&data).expect("parse");
+        let p = to_rdp(&img, 0);
+
+        // Top source row lands at bottom dst row (bottom-up). x=0 first.
+        // and-bit for x=0 must be CLEAR (drawn) despite tiny alpha…
+        let byte = p.and_mask[(p.height as usize - 1) * 2];
+        assert_eq!(byte >> 7 & 1, 0, "a=10 pixel must be drawn, not punched");
+        // …and its xor color present:
+        let xo = ((p.height as usize - 1) * 2) * 4 * 2; // bottom row, x=0
+        assert_eq!(&p.xor_mask[xo..xo + 3], &[50, 100, 200], "BGR color preserved");
+        // x=1 (transparent) still punched:
+        assert_eq!(byte >> 6 & 1, 1, "a=0 pixel stays transparent");
     }
 
     /// REGRESSION GUARD (2026-08-21): the hand-rolled wire encoder in
