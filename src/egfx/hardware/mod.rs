@@ -220,11 +220,22 @@ pub trait HardwareEncoder {
             ));
         }
 
+        // The flat copy below is only correct for linear layouts.
+        if desc.modifier != 0 {
+            return Err(HardwareEncoderError::EncodeFailed(
+                format!(
+                    "non-linear DMA-BUF modifier {:#x} not supported by CPU read path",
+                    desc.modifier
+                ),
+            ));
+        }
+
         let plane = &desc.planes[0];
         let size = (desc.height * plane.stride) as usize;
 
         // SAFETY: plane.fd is a valid OwnedFd from the PipeWire dup path.
         // mmap is read-only and we copy into a Vec immediately.
+        // dma_buf_mmap requires pgoff == 0; plane.offset indexes into the mapping.
         let data = unsafe {
             use std::{num::NonZeroUsize, os::fd::BorrowedFd};
 
@@ -241,17 +252,30 @@ pub trait HardwareEncoder {
                 ProtFlags::PROT_READ,
                 MapFlags::MAP_SHARED,
                 borrowed,
-                plane.offset as i64,
+                // dma-buf mmap offset must be 0; skip plane bytes via offset
+                0,
             )
             .map_err(|e| HardwareEncoderError::EncodeFailed(format!("DMA-BUF mmap failed: {e}")))?;
 
+            let _sync = crate::egfx::dmabuf_access::DmaBufSyncGuard::begin_read(&plane.fd);
+
+            let src = ptr.as_ptr().add(plane.offset as usize) as *const u8;
             let mut vec = Vec::with_capacity(size);
-            std::ptr::copy_nonoverlapping(ptr.as_ptr() as *const u8, vec.as_mut_ptr(), size);
+            std::ptr::copy_nonoverlapping(src, vec.as_mut_ptr(), size);
             vec.set_len(size);
 
+            drop(_sync);
             let _ = munmap(ptr, size);
             vec
         };
+
+        let nonzero = crate::egfx::encoder::dmabuf_stats::record(&data);
+        if !nonzero {
+            tracing::warn!(
+                "encode_dmabuf(hw): mapped frame is all-zero ({}x{} mod={:#x}) — sync/mapping issue suspected",
+                desc.width, desc.height, desc.modifier
+            );
+        }
 
         self.encode_bgra(&data, desc.width, desc.height, timestamp_ms)
     }

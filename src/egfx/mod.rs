@@ -57,6 +57,7 @@ mod yuv444_packing;
 
 #[cfg(any(feature = "vaapi", feature = "nvenc"))]
 pub mod hardware;
+pub mod dmabuf_access;
 
 pub mod flow_controller;
 mod h264_level;
