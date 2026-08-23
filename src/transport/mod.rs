@@ -160,6 +160,23 @@ impl AcceptDispatcher {
                                 )
                                 .await
                         }
+                        crate::transport::listener::AcceptorMode::EnhancedSession => {
+                            // Hyper-V Enhanced Session guest backend. vmms terminated
+                            // TLS and authenticated the user against vmconnect.exe on
+                            // the host, and relays plaintext RDP to us, so IronRDP runs
+                            // the X.224 exchange and skips both TLS and CredSSP.
+                            //
+                            // HostRelayed authenticates nobody. It is safe only because
+                            // this arm is reachable only from the AF_VSOCK listener,
+                            // whose peer can only be the hosting hypervisor. Never
+                            // widen it to a TCP listener.
+                            rdp_server
+                                .run_connection_with(
+                                    stream,
+                                    ironrdp_server::TransportTls::HostRelayed,
+                                )
+                                .await
+                        }
                     };
                     let duration = start.elapsed();
 

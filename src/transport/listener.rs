@@ -106,12 +106,21 @@ pub enum AcceptorMode {
     /// speak a proxy protocol (RDCleanPath) that informs it of the
     /// lower-layer TLS; vanilla mstsc/xfreerdp will not work via this mode.
     PreAuthenticated,
-    /// Hyper-V Enhanced Session mode: read the Preconnection Blob (PCB V2)
-    /// from the stream before TLS, then perform TLS + CredSSP (before X.224),
-    /// then hand off to the IronRDP acceptor for the standard RDP flow.
+    /// Use `rdp_server.run_connection_with(stream, TransportTls::HostRelayed)`
+    /// — Hyper-V Enhanced Session guest backend.
     ///
-    /// This mode is used by the vsock listener when Hyper-V Enhanced Session
-    /// is active (vmconnect.exe connects via HvSocket/vsock).
+    /// vmconnect.exe talks to the host's vmms service (PCB, TLS, CredSSP, then
+    /// X.224); vmms terminates all of that and relays a **plaintext** RDP stream
+    /// into the guest over HvSocket/vsock. So IronRDP performs the X.224
+    /// exchange and then skips both the TLS upgrade and CredSSP — there is no
+    /// TLS record layer here and no second CredSSP exchange to have.
+    ///
+    /// # Security
+    ///
+    /// Unlike `PreAuthenticated`, this mode authenticates nobody: the session is
+    /// neither encrypted nor authenticated by us. It is sound only because the
+    /// AF_VSOCK transport is itself the proof of identity — the peer can only be
+    /// the hosting hypervisor. Only the vsock listener may produce this mode.
     EnhancedSession,
 }
 
