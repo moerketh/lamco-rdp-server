@@ -64,6 +64,7 @@
 )]
 
 pub mod cursor_pdu;
+mod cursor_theme;
 mod deployment;
 mod display_handler;
 mod egfx_sender;
@@ -1905,6 +1906,10 @@ pub(crate) async fn perform_disconnect_cleanup(
 ) -> bool {
     if served {
         info!("Client disconnected - performing cleanup");
+
+        // Restore the guest console cursor (was made transparent for the
+        // RDP session so the stream carries no composited sprite).
+        display_handler.restore_console_cursor();
 
         // Stop the pipeline from encoding/sending frames to a dead channel.
         // PipeWire frames are still drained to keep the stream responsive,
