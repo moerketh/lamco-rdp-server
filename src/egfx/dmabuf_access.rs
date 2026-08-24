@@ -38,7 +38,10 @@ const DMA_BUF_SYNC_START: u64 = 0 << 2;
 const DMA_BUF_SYNC_END: u64 = 1 << 2;
 
 /// `_IOW(b, 0, struct dma_buf_sync)` as an unsigned long ioctl request.
-const DMA_BUF_IOCTL_SYNC: libc::c_ulong = 0x4004_6200;
+/// 0x4008_6200: the size field is 8 because `struct dma_buf_sync` is a
+/// single `__u64`. (0x4004_6200 encodes size=4 and would get ENOTTY.)
+/// Verified by compiling the macro from linux/dma-buf.h.
+const DMA_BUF_IOCTL_SYNC: libc::c_ulong = 0x4008_6200;
 
 /// DRM_FORMAT_MOD_LINEAR — the only layout this CPU read path supports.
 pub const DRM_FORMAT_MOD_LINEAR: u64 = 0;
