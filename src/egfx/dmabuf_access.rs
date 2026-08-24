@@ -90,6 +90,33 @@ impl Drop for DmaBufSyncGuard<'_> {
     }
 }
 
+/// Frame-content instrumentation shared across DMA-BUF read paths.
+/// Counts mapped frames that contained at least one non-zero byte —
+/// the measurement that distinguishes "reads zeros" from "renders wrong".
+pub mod dmabuf_stats {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static FRAMES_TOTAL: AtomicU64 = AtomicU64::new(0);
+    static FRAMES_NONZERO: AtomicU64 = AtomicU64::new(0);
+
+    /// Record one frame; returns whether it contained any non-zero byte.
+    pub fn record(data: &[u8]) -> bool {
+        FRAMES_TOTAL.fetch_add(1, Ordering::Relaxed);
+        let nonzero = data.iter().any(|&b| b != 0);
+        if nonzero {
+            FRAMES_NONZERO.fetch_add(1, Ordering::Relaxed);
+        }
+        nonzero
+    }
+
+    pub fn snapshot() -> (u64, u64) {
+        (
+            FRAMES_TOTAL.load(Ordering::Relaxed),
+            FRAMES_NONZERO.load(Ordering::Relaxed),
+        )
+    }
+}
+
 /// Count of frames whose mapped plane contained at least one non-zero byte.
 /// Instrumentation for diagnosing zero-read ("black screen") captures.
 #[derive(Debug, Default)]

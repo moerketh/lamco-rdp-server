@@ -1905,6 +1905,12 @@ impl LamcoDisplayHandler {
 
                 let mut frame = match frame {
                     Some(f) => {
+                        // Materialize DMA-BUF frames to CPU memory BEFORE caching:
+                        // - the software EGFX paths consume FrameBuffer::Memory only
+                        // - cloning a DmaBuf variant yields an empty buffer (loses the FD)
+                        // - a cached DmaBuf read later may hit a recycled, unstable buffer
+                        let f = super::dmabuf_materialize::materialize_dmabuf_frame(f);
+
                         // Always cache the latest frame for replay on EGFX init.
                         // Clone is cheap: VideoFrame.data is Arc<Vec<u8>>.
                         cached_frame = Some(f.clone());

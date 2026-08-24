@@ -269,7 +269,7 @@ pub trait HardwareEncoder {
             vec
         };
 
-        let nonzero = crate::egfx::encoder::dmabuf_stats::record(&data);
+        let nonzero = crate::egfx::dmabuf_access::dmabuf_stats::record(&data);
         if !nonzero {
             tracing::warn!(
                 "encode_dmabuf(hw): mapped frame is all-zero ({}x{} mod={:#x}) — sync/mapping issue suspected",

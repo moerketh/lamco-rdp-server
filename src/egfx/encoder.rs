@@ -32,32 +32,8 @@ use super::dmabuf_access;
 #[cfg(feature = "h264")]
 use super::openh264_compat;
 
-/// Frame-content instrumentation shared across encoder paths.
-/// Counts mapped DMA-BUF frames that contained at least one non-zero byte —
-/// the measurement that distinguishes "reads zeros" from "renders wrong".
-pub(crate) mod dmabuf_stats {
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    static FRAMES_TOTAL: AtomicU64 = AtomicU64::new(0);
-    static FRAMES_NONZERO: AtomicU64 = AtomicU64::new(0);
-
-    /// Record a frame's content; returns true if it contained any non-zero byte.
-    pub fn record(data: &[u8]) -> bool {
-        FRAMES_TOTAL.fetch_add(1, Ordering::Relaxed);
-        let nonzero = data.iter().any(|&b| b != 0);
-        if nonzero {
-            FRAMES_NONZERO.fetch_add(1, Ordering::Relaxed);
-        }
-        nonzero
-    }
-
-    pub fn snapshot() -> (u64, u64) {
-        (
-            FRAMES_TOTAL.load(Ordering::Relaxed),
-            FRAMES_NONZERO.load(Ordering::Relaxed),
-        )
-    }
-}
+#[cfg(feature = "h264")]
+pub(crate) use dmabuf_access::dmabuf_stats;
 
 /// Errors that can occur during H.264 encoding
 #[derive(Debug, Error)]
@@ -642,9 +618,11 @@ impl Avc420Encoder {
 
         let nonzero = dmabuf_stats::record(&data);
         if !nonzero {
-            tracing::warn!(
-                "encode_dmabuf: mapped frame is all-zero ({}x{} mod={:#x}) — sync/mapping issue suspected",
-                desc.width, desc.height, desc.modifier
+            tracing::debug!(
+                width = desc.width,
+                height = desc.height,
+                modifier = desc.modifier,
+                "encode_dmabuf: mapped frame is all-zero"
             );
         }
 

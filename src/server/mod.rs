@@ -66,6 +66,7 @@
 pub mod cursor_pdu;
 mod cursor_theme;
 mod deployment;
+mod dmabuf_materialize;
 mod display_handler;
 mod egfx_sender;
 #[expect(dead_code, reason = "WIP: not yet integrated into the server pipeline")]
