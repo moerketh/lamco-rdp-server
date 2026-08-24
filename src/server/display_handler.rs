@@ -533,6 +533,10 @@ pub struct LamcoDisplayHandler {
     /// tracks it so a subsequent client resize acts on the current node rather
     /// than the one captured at startup (which `stream_info` still holds).
     capture_node: Arc<std::sync::atomic::AtomicU32>,
+    /// Capture buffer type. Atomic so the pipeline task can flip it during
+    /// the one-shot DmaBuf→MemFd fallback rebind (virtual GPUs negotiate
+    /// DmaBuf but never deliver a frame).
+    use_dmabuf: Arc<std::sync::atomic::AtomicBool>,
 
     /// Set true by `on_client_disconnect` on a real disconnect; consumed
     /// (swap→false) by the connect-start reset in `updates()`. Distinguishes a
@@ -575,10 +579,6 @@ pub struct LamcoDisplayHandler {
     /// True when using direct frame channel (portal-generic) instead of PipeWire.
     /// Resize via PipeWire DestroyStream/CreateStream is not available in this mode.
     direct_channel_mode: bool,
-
-    /// Whether to request DMA-BUF buffers from PipeWire.
-    /// Set based on compositor recommendation (DmaBuf for real GPUs, MemFd for virtual/software).
-    use_dmabuf: bool,
 }
 
 impl LamcoDisplayHandler {
@@ -709,7 +709,7 @@ impl LamcoDisplayHandler {
             fps_state: Arc::new(RwLock::new(None)),
             stream_active_flag: parking_lot::RwLock::new(None),
             direct_channel_mode: false,
-            use_dmabuf,
+            use_dmabuf: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(use_dmabuf)),
         })
     }
 
@@ -803,7 +803,7 @@ impl LamcoDisplayHandler {
             fps_state: Arc::new(RwLock::new(None)),
             stream_active_flag: parking_lot::RwLock::new(None),
             direct_channel_mode: true,
-            use_dmabuf: false, // direct channel is always CPU-resident
+            use_dmabuf: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), // direct channel always CPU-resident
         })
     }
 
@@ -970,7 +970,7 @@ impl LamcoDisplayHandler {
             width,
             height,
             framerate: 60,
-            use_dmabuf: self.use_dmabuf,
+            use_dmabuf: self.use_dmabuf.load(std::sync::atomic::Ordering::Acquire),
             buffer_count: 5,
             preferred_format: Some(lamco_pipewire::PixelFormat::BGRx),
             dmabuf_passthrough: false,
@@ -1752,7 +1752,9 @@ impl LamcoDisplayHandler {
 
                             if destroy_ok {
                                 // 2. Create new stream at requested resolution
-                                let use_dmabuf_for_resize = self.use_dmabuf;
+                                let use_dmabuf_for_resize = self
+            .use_dmabuf
+            .load(std::sync::atomic::Ordering::Acquire);
                                 let stream_config = lamco_pipewire::StreamConfig {
                                     name: "monitor-0".to_string(),
                                     width: req.width as u32,
@@ -2047,6 +2049,40 @@ impl LamcoDisplayHandler {
                                     elapsed_ms = since_start.as_millis() as u64,
                                     "No video frames received since session start"
                                 );
+
+                                // One-shot DmaBuf→MemFd fallback: some virtual
+                                // GPUs (observed: hyperv_drm + kms_swrast)
+                                // negotiate DmaBuf buffers cleanly but never
+                                // deliver a single frame. Flip the capture to
+                                // MemFd and rebuild the stream on the same
+                                // node — measurement-driven, so no driver-name
+                                // allowlist is needed. Fires once per session
+                                // and only when DmaBuf is active.
+                                let was_dmabuf = handler
+                                    .use_dmabuf
+                                    .swap(false, std::sync::atomic::Ordering::AcqRel);
+                                if was_dmabuf {
+                                    let node = handler
+                                        .capture_node
+                                        .load(std::sync::atomic::Ordering::Relaxed);
+                                    let size = handler.size.read().await.clone();
+                                    tracing::warn!(
+                                        node,
+                                        width = size.width,
+                                        height = size.height,
+                                        "Capture negotiated DmaBuf but delivered no frames — \
+                                         falling back to MemFd and rebinding stream"
+                                    );
+                                    handler
+                                        .rebind_capture_node(
+                                            node,
+                                            node,
+                                            u32::from(size.width),
+                                            u32::from(size.height),
+                                        )
+                                        .await;
+                                }
+
                                 if let Some(ref reporter) = *handler.health_reporter.read().await {
                                     reporter.report(
                                         crate::health::HealthEvent::VideoFrameNeverStarted {
@@ -3715,7 +3751,7 @@ impl Clone for LamcoDisplayHandler {
             fps_state: Arc::clone(&self.fps_state),
             stream_active_flag: parking_lot::RwLock::new(self.stream_active_flag.read().clone()),
             direct_channel_mode: self.direct_channel_mode,
-            use_dmabuf: self.use_dmabuf,
+            use_dmabuf: Arc::clone(&self.use_dmabuf),
         }
     }
 }
