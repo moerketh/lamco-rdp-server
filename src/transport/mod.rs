@@ -161,13 +161,23 @@ impl AcceptDispatcher {
                                 .await
                         }
                         crate::transport::listener::AcceptorMode::EnhancedSession => {
-                            // Hyper-V Enhanced Session: PCB → TLS → CredSSP → X.224 → RDP.
-                            // The IronRDP fork's run_connection_enhanced handles the
-                            // full enhanced handshake (read PCB, TLS, CredSSP before X.224).
+                            // Hyper-V Enhanced Session guest backend. vmms terminated
+                            // TLS and authenticated the user against vmconnect.exe on
+                            // the host, and relays plaintext RDP to us, so IronRDP runs
+                            // the X.224 exchange and skips both TLS and CredSSP.
+                            //
+                            // HostRelayed authenticates nobody and cannot: vmms sends
+                            // an empty Client Info credential (measured 2026-08-27).
+                            // The vsock transport is the only boundary, and it does not
+                            // yet enforce one — the listener accepts any peer CID, so a
+                            // local process can reach this arm via loopback CID 1.
+                            // Needs a peer-CID allowlist. Never widen to TCP.
                             rdp_server
-                                .run_connection_enhanced(stream)
+                                .run_connection_with(
+                                    stream,
+                                    ironrdp_server::TransportTls::HostRelayed,
+                                )
                                 .await
-                                .map(|_| ())
                         }
                     };
                     let duration = start.elapsed();

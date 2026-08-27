@@ -74,8 +74,9 @@ use std::{
 use anyhow::Result;
 use bytes::Bytes;
 use ironrdp_server::{
-    BitmapUpdate as IronBitmapUpdate, DesktopSize, DisplayUpdate, GfxServerHandle,
-    PixelFormat as IronPixelFormat, RdpServerDisplay, RdpServerDisplayUpdates, ServerEvent,
+    BitmapUpdate as IronBitmapUpdate, ColorPointer, DesktopSize, DisplayUpdate, GfxServerHandle,
+    PixelFormat as IronPixelFormat, PointerUpdate, RdpServerDisplay, RdpServerDisplayUpdates,
+    ServerEvent,
 };
 use tokio::sync::{Mutex, RwLock, mpsc};
 use tracing::{debug, error, info, trace, warn};
@@ -900,12 +901,26 @@ impl LamcoDisplayHandler {
         };
         match crate::server::cursor_pdu::load_default_pointer() {
             Ok(pointer) => {
-                let payload = crate::server::cursor_pdu::encode_color_pointer(&pointer);
-                let sent = sender.send(ServerEvent::Pointer(payload));
+                // Hand IronRDP the typed pointer rather than pre-encoded bytes: it
+                // owns the TS_COLORPOINTERATTRIBUTE encoding, tags the fast-path
+                // update with the right update code, fragments payloads over the
+                // 16374-byte ceiling, and rejects masks whose scanlines are not
+                // 16-bit aligned ([MS-RDPBCGR] 2.2.9.1.1.4.4).
+                let (width, height) = (pointer.width, pointer.height);
+                let update = PointerUpdate::Color(ColorPointer {
+                    cache_index: pointer.cache_index,
+                    width: pointer.width,
+                    height: pointer.height,
+                    hot_x: pointer.hot_spot.0,
+                    hot_y: pointer.hot_spot.1,
+                    and_mask: pointer.and_mask,
+                    xor_mask: pointer.xor_mask,
+                });
+                let sent = sender.send(ServerEvent::Pointer(update));
                 match sent {
                     Ok(()) => info!(
-                        width = pointer.width,
-                        height = pointer.height,
+                        width,
+                        height,
                         "cursor PDU sent: guest pointer shape pushed to client (xrdp parity)"
                     ),
                     Err(e) => warn!("cursor PDU send failed: {e}"),

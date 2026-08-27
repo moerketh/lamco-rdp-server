@@ -106,12 +106,28 @@ pub enum AcceptorMode {
     /// speak a proxy protocol (RDCleanPath) that informs it of the
     /// lower-layer TLS; vanilla mstsc/xfreerdp will not work via this mode.
     PreAuthenticated,
-    /// Hyper-V Enhanced Session mode: read the Preconnection Blob (PCB V2)
-    /// from the stream before TLS, then perform TLS + CredSSP (before X.224),
-    /// then hand off to the IronRDP acceptor for the standard RDP flow.
+    /// Use `rdp_server.run_connection_with(stream, TransportTls::HostRelayed)`
+    /// — Hyper-V Enhanced Session guest backend.
     ///
-    /// This mode is used by the vsock listener when Hyper-V Enhanced Session
-    /// is active (vmconnect.exe connects via HvSocket/vsock).
+    /// vmconnect.exe talks to the host's vmms service (PCB, TLS, CredSSP, then
+    /// X.224); vmms terminates all of that and relays a **plaintext** RDP stream
+    /// into the guest over HvSocket/vsock. So IronRDP performs the X.224
+    /// exchange and then skips both the TLS upgrade and CredSSP — there is no
+    /// TLS record layer here and no second CredSSP exchange to have.
+    ///
+    /// # Security
+    ///
+    /// This mode authenticates nobody, and cannot: vmms sends a Client Info PDU
+    /// with empty username and password (measured, 2026-08-27), because the user
+    /// was already authenticated against the *host*. No server configuration can
+    /// put a credential check on this transport — in particular `auth_method =
+    /// "pam"` would hand PAM a zero-length password and deny every connection.
+    ///
+    /// The transport is therefore the only security boundary, and it is
+    /// currently **not enforced**: the listener binds `VMADDR_CID_ANY` and
+    /// accepts any peer CID, so an unprivileged process inside this guest can
+    /// reach this mode over the vsock loopback CID (1) and obtain the desktop.
+    /// A peer-CID allowlist is required before this is fit to ship.
     EnhancedSession,
 }
 
@@ -421,7 +437,7 @@ impl Listener for VsockListenerImpl {
     async fn accept(&mut self) -> Result<Option<AcceptedConnection>, TransportError> {
         let (stream, peer_addr) = self.listener.accept().await.map_err(TransportError::Io)?;
         let _ = self.port; // suppress dead-code lint in case port isn't otherwise read
-        Ok(Some(AcceptedConnection::standard(
+        Ok(Some(AcceptedConnection::enhanced_session(
             PeerAddr::Vsock {
                 cid: peer_addr.cid(),
                 port: peer_addr.port(),

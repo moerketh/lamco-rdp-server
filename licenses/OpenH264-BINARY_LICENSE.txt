@@ -1,0 +1,17 @@
+PLACEHOLDER - NOT THE REAL LICENSE TEXT - DO NOT SHIP
+
+This file exists only so `src/third_party.rs` compiles. The real content must
+be the verbatim Cisco OpenH264 Video Codec BINARY_LICENSE.txt (v1.0), which
+`third_party.rs` reproduces in the `--licenses` output to satisfy condition 4
+of that license.
+
+Replace this file with the verbatim text from:
+
+    https://github.com/cisco/openh264/blob/master/BINARY_LICENSE.txt
+
+Until then, the `--licenses` output does NOT satisfy the OpenH264 binary
+license and this build must not be distributed.
+
+Background: the path referenced by `src/third_party.rs:21` has never been
+tracked in this repository, so the tree has not built from a clean clone since
+`src/third_party.rs` landed in Release v1.4.4.
