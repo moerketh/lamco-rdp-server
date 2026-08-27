@@ -386,18 +386,79 @@ impl Listener for UnixListenerImpl {
 pub struct VsockListenerImpl {
     listener: tokio_vsock::VsockListener,
     port: u32,
+    /// Peer context IDs permitted to reach [`AcceptorMode::EnhancedSession`].
+    /// See [`VsockListenerImpl::bind`] for why this is not optional.
+    allowed_cids: Vec<u32>,
+}
+
+/// Default peer allowlist: the hypervisor only.
+///
+/// A Hyper-V Enhanced Session is relayed by vmms, which presents
+/// `VMADDR_CID_HOST` (2). Nothing else has a legitimate reason to speak this
+/// protocol to us.
+#[cfg(feature = "vsock")]
+pub fn default_allowed_cids() -> Vec<u32> {
+    vec![tokio_vsock::VMADDR_CID_HOST]
+}
+
+/// Peer-CID admission policy for the Enhanced Session transport.
+///
+/// Split out from [`VsockListenerImpl`] so it can be exercised without binding
+/// a socket — the kernel vsock transport is unavailable in most CI images.
+#[cfg(feature = "vsock")]
+fn cid_allowed(cid: u32, allowed: &[u32]) -> bool {
+    // Refused even if an operator lists it explicitly. An Enhanced Session is
+    // relayed inward by the hypervisor, so a peer presenting the in-guest
+    // loopback CID is by definition not one — and that is exactly the vector
+    // measured on 2026-08-27.
+    if cid == tokio_vsock::VMADDR_CID_LOCAL {
+        return false;
+    }
+    allowed.contains(&cid)
 }
 
 #[cfg(feature = "vsock")]
 impl VsockListenerImpl {
-    /// Bind a vsock listener on the given port. Accepts from any peer
-    /// (`VMADDR_CID_ANY`). Operator-side firewall or hypervisor policy
-    /// handles access control; the server does not maintain a CID allowlist.
-    pub fn bind(port: u32) -> Result<Self, TransportError> {
+    /// Bind a vsock listener on `port`, accepting only from `allowed_cids`.
+    ///
+    /// The socket is bound to `VMADDR_CID_ANY`, which per `vsock(7)` is the
+    /// *local* address wildcard — it places no restriction whatsoever on the
+    /// remote CID. Peer filtering therefore has to happen at accept time; see
+    /// [`Self::accept`].
+    ///
+    /// # Security
+    ///
+    /// This listener hands every accepted connection to
+    /// [`AcceptorMode::EnhancedSession`], which performs no TLS, no CredSSP and
+    /// no credential check — and *cannot*: vmms relays a Client Info PDU with
+    /// empty username and password, because the user was already authenticated
+    /// against the host. The peer allowlist is consequently not defence in
+    /// depth, it is the entire access control for this transport.
+    ///
+    /// An earlier revision bound `VMADDR_CID_ANY` with no filtering, on the
+    /// reasoning that "operator-side firewall or hypervisor policy handles
+    /// access control". Neither does: netfilter does not filter AF_VSOCK, and
+    /// hypervisor policy has no say over a connection made *inside* the guest.
+    /// Measured 2026-08-27, an unprivileged local process reached the desktop
+    /// via loopback CID 1.
+    pub fn bind(port: u32, allowed_cids: Vec<u32>) -> Result<Self, TransportError> {
         let addr = tokio_vsock::VsockAddr::new(tokio_vsock::VMADDR_CID_ANY, port);
         let listener = tokio_vsock::VsockListener::bind(addr).map_err(TransportError::Io)?;
-        info!(port, "vsock listener bound on VMADDR_CID_ANY");
-        Ok(Self { listener, port })
+        info!(
+            port,
+            allowed_cids = ?allowed_cids,
+            "vsock listener bound; peers outside the allowlist will be refused"
+        );
+        Ok(Self {
+            listener,
+            port,
+            allowed_cids,
+        })
+    }
+
+    /// Whether `cid` may open an Enhanced Session.
+    fn is_allowed(&self, cid: u32) -> bool {
+        cid_allowed(cid, &self.allowed_cids)
     }
 
     /// Construct from a systemd-passed `OwnedFd` of kind `SOCK_STREAM AF_VSOCK`.
@@ -414,16 +475,27 @@ impl VsockListenerImpl {
         unsafe_code,
         reason = "tokio_vsock::VsockListener::from_raw_fd is unsafe; safety justified inline"
     )]
-    pub fn from_owned_fd(fd: std::os::fd::OwnedFd) -> Result<Self, TransportError> {
+    pub fn from_owned_fd(
+        fd: std::os::fd::OwnedFd,
+        allowed_cids: Vec<u32>,
+    ) -> Result<Self, TransportError> {
         use std::os::fd::{FromRawFd, IntoRawFd};
 
         let raw = fd.into_raw_fd();
         // SAFETY: raw came from a valid OwnedFd that systemd guarantees is a
         // listening AF_VSOCK socket. tokio-vsock's FromRawFd takes ownership.
         let listener = unsafe { tokio_vsock::VsockListener::from_raw_fd(raw) };
-        let port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
-        info!(port, "vsock listener wrapped from systemd-passed fd");
-        Ok(Self { listener, port })
+        let port = listener.local_addr().map_or(0, |a| a.port());
+        info!(
+            port,
+            allowed_cids = ?allowed_cids,
+            "vsock listener wrapped from systemd-passed fd"
+        );
+        Ok(Self {
+            listener,
+            port,
+            allowed_cids,
+        })
     }
 }
 
@@ -435,15 +507,34 @@ impl Listener for VsockListenerImpl {
     }
 
     async fn accept(&mut self) -> Result<Option<AcceptedConnection>, TransportError> {
-        let (stream, peer_addr) = self.listener.accept().await.map_err(TransportError::Io)?;
         let _ = self.port; // suppress dead-code lint in case port isn't otherwise read
-        Ok(Some(AcceptedConnection::enhanced_session(
-            PeerAddr::Vsock {
-                cid: peer_addr.cid(),
-                port: peer_addr.port(),
-            },
-            Box::new(stream),
-        )))
+
+        // Refusals loop rather than return. `Ok(None)` means "listener closed"
+        // to AcceptDispatcher, which stops the accept loop for every transport —
+        // so returning it here would turn one rejected peer into a full outage.
+        loop {
+            let (stream, peer_addr) = self.listener.accept().await.map_err(TransportError::Io)?;
+            let cid = peer_addr.cid();
+
+            if !self.is_allowed(cid) {
+                warn!(
+                    cid,
+                    port = peer_addr.port(),
+                    allowed_cids = ?self.allowed_cids,
+                    "vsock: refused connection from a peer outside the allowlist                      (Enhanced Session performs no authentication, so this is the                      only access control on this transport)"
+                );
+                drop(stream);
+                continue;
+            }
+
+            return Ok(Some(AcceptedConnection::enhanced_session(
+                PeerAddr::Vsock {
+                    cid,
+                    port: peer_addr.port(),
+                },
+                Box::new(stream),
+            )));
+        }
     }
 }
 
@@ -629,6 +720,58 @@ mod tests {
         assert_eq!(peer.ip(), None);
     }
 
+    /// The default allowlist admits the hypervisor and nothing else.
+    #[cfg(feature = "vsock")]
+    #[test]
+    fn cid_policy_admits_only_the_host_by_default() {
+        let allowed = default_allowed_cids();
+        assert_eq!(allowed, vec![tokio_vsock::VMADDR_CID_HOST]);
+        assert!(cid_allowed(tokio_vsock::VMADDR_CID_HOST, &allowed));
+
+        for rejected in [
+            tokio_vsock::VMADDR_CID_LOCAL,
+            tokio_vsock::VMADDR_CID_HYPERVISOR,
+            3,
+            42,
+            tokio_vsock::VMADDR_CID_ANY,
+        ] {
+            assert!(
+                !cid_allowed(rejected, &allowed),
+                "CID {rejected} must not reach the Enhanced Session path"
+            );
+        }
+    }
+
+    /// REGRESSION (measured 2026-08-27): an unprivileged in-guest process
+    /// connected to loopback CID 1 and was handed `AcceptorMode::EnhancedSession`
+    /// — a path with no TLS, no CredSSP and no credential check. The loopback CID
+    /// must stay refused even when an operator widens the allowlist, because an
+    /// Enhanced Session never originates inside the guest.
+    #[cfg(feature = "vsock")]
+    #[test]
+    fn cid_policy_never_admits_loopback_even_if_configured() {
+        let over_permissive = vec![
+            tokio_vsock::VMADDR_CID_LOCAL,
+            tokio_vsock::VMADDR_CID_HOST,
+            7,
+        ];
+        assert!(
+            !cid_allowed(tokio_vsock::VMADDR_CID_LOCAL, &over_permissive),
+            "loopback CID must be refused unconditionally"
+        );
+        // The rest of an operator's list is still honoured.
+        assert!(cid_allowed(7, &over_permissive));
+        assert!(cid_allowed(tokio_vsock::VMADDR_CID_HOST, &over_permissive));
+    }
+
+    /// An empty allowlist refuses everything rather than falling open.
+    #[cfg(feature = "vsock")]
+    #[test]
+    fn cid_policy_empty_allowlist_refuses_all() {
+        assert!(!cid_allowed(tokio_vsock::VMADDR_CID_HOST, &[]));
+        assert!(!cid_allowed(tokio_vsock::VMADDR_CID_LOCAL, &[]));
+    }
+
     #[test]
     fn detect_hyperv_does_not_panic_on_any_system() {
         // The function is best-effort and must never panic regardless of
@@ -654,7 +797,7 @@ mod tests {
         // Verify bind either succeeds (CI with vsock kernel support) or fails
         // with an expected I/O error kind.
         // Use a high port number to avoid colliding with anything else.
-        match VsockListenerImpl::bind(54321) {
+        match VsockListenerImpl::bind(54321, default_allowed_cids()) {
             Ok(_) => {} // CI/dev with vsock kernel support
             Err(TransportError::Io(e)) => match e.kind() {
                 std::io::ErrorKind::PermissionDenied

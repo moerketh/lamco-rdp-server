@@ -111,6 +111,15 @@ pub struct VsockTransportConfig {
     /// AF_VSOCK port to listen on. Defaults to 3389 (parallel to TCP).
     #[serde(default = "default_vsock_port")]
     pub port: u32,
+    /// Peer context IDs allowed to open an Enhanced Session. Absent means
+    /// `[2]` (`VMADDR_CID_HOST`), which is correct for Hyper-V.
+    ///
+    /// Only widen this for a hypervisor that presents a different CID. The
+    /// Enhanced Session path performs no authentication at all, so this list
+    /// *is* the access control for the transport; the in-guest loopback CID
+    /// (1) is refused regardless of what is configured here.
+    #[serde(default)]
+    pub allowed_cids: Option<Vec<u32>>,
 }
 
 impl Default for VsockTransportConfig {
@@ -118,6 +127,7 @@ impl Default for VsockTransportConfig {
         Self {
             enabled: None,
             port: default_vsock_port(),
+            allowed_cids: None,
         }
     }
 }
@@ -128,6 +138,17 @@ fn default_true() -> bool {
 
 fn default_vsock_port() -> u32 {
     3389
+}
+
+/// Resolve the configured peer allowlist, falling back to the hypervisor-only
+/// default. An explicitly empty list is treated as unset rather than as "refuse
+/// everything", which would silently disable the transport.
+#[cfg(feature = "vsock")]
+fn resolve_allowed_cids(configured: Option<&[u32]>) -> Vec<u32> {
+    match configured {
+        Some(cids) if !cids.is_empty() => cids.to_vec(),
+        _ => super::listener::default_allowed_cids(),
+    }
 }
 
 impl TransportsConfig {
@@ -163,7 +184,10 @@ impl TransportsConfig {
             Some(cfg) => match cfg.enabled {
                 Some(true) => {
                     info!(port = cfg.port, "vsock listener: explicitly enabled");
-                    Some(ResolvedVsockTransport { port: cfg.port })
+                    Some(ResolvedVsockTransport {
+                        port: cfg.port,
+                        allowed_cids: resolve_allowed_cids(cfg.allowed_cids.as_deref()),
+                    })
                 }
                 Some(false) => {
                     info!("vsock listener: explicitly disabled");
@@ -175,7 +199,10 @@ impl TransportsConfig {
                             port = cfg.port,
                             "vsock listener: Hyper-V detected, auto-enabling"
                         );
-                        Some(ResolvedVsockTransport { port: cfg.port })
+                        Some(ResolvedVsockTransport {
+                            port: cfg.port,
+                            allowed_cids: resolve_allowed_cids(cfg.allowed_cids.as_deref()),
+                        })
                     } else {
                         info!("vsock listener: not Hyper-V, leaving disabled");
                         None
@@ -189,7 +216,10 @@ impl TransportsConfig {
                         port,
                         "vsock listener: Hyper-V detected, auto-enabling with defaults"
                     );
-                    Some(ResolvedVsockTransport { port })
+                    Some(ResolvedVsockTransport {
+                        port,
+                        allowed_cids: super::listener::default_allowed_cids(),
+                    })
                 } else {
                     None
                 }
@@ -258,6 +288,8 @@ pub struct ResolvedTcpTransport {
 #[derive(Debug, Clone)]
 pub struct ResolvedVsockTransport {
     pub port: u32,
+    /// Resolved peer allowlist; never empty. See [`VsockTransportConfig::allowed_cids`].
+    pub allowed_cids: Vec<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -292,8 +324,11 @@ impl ResolvedTransports {
         }
         #[cfg(feature = "vsock")]
         if let Some(vsock) = &self.vsock {
-            let l = super::listener::VsockListenerImpl::bind(vsock.port)
-                .with_context(|| format!("failed to bind vsock listener on port {}", vsock.port))?;
+            let l =
+                super::listener::VsockListenerImpl::bind(vsock.port, vsock.allowed_cids.clone())
+                    .with_context(|| {
+                        format!("failed to bind vsock listener on port {}", vsock.port)
+                    })?;
             out.push(Box::new(l));
         }
         #[cfg(not(feature = "vsock"))]
