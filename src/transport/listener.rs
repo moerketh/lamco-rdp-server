@@ -720,6 +720,35 @@ mod tests {
         assert_eq!(peer.ip(), None);
     }
 
+    /// `EnhancedSession` means no TLS, no CredSSP and no credential check, so
+    /// which constructor yields it is load-bearing: every security comment in this
+    /// repo and in ironrdp-vmconnect assumes only the vsock listener does.
+    ///
+    /// This pins the constructors — the only two places `mode` is set. The
+    /// remaining half of the invariant ("only `VsockListenerImpl::accept` calls
+    /// `enhanced_session`") is not expressible as a unit test; it is a grep, and
+    /// changing it should require justifying a wider unauthenticated surface.
+    #[test]
+    fn acceptor_mode_constructors_do_not_leak_the_unauthenticated_mode() {
+        let peer = || PeerAddr::Vsock { cid: 2, port: 3389 };
+        let stream = || -> Box<dyn AsyncRdpStream> { Box::new(tokio::io::duplex(1).0) };
+
+        assert_eq!(
+            AcceptedConnection::standard(peer(), stream()).mode,
+            AcceptorMode::Standard,
+            "the general-purpose constructor must never yield EnhancedSession"
+        );
+        assert_eq!(
+            AcceptedConnection::enhanced_session(peer(), stream()).mode,
+            AcceptorMode::EnhancedSession
+        );
+        assert_eq!(
+            AcceptorMode::default(),
+            AcceptorMode::Standard,
+            "a listener that forgets to set a mode must fail closed"
+        );
+    }
+
     /// The default allowlist admits the hypervisor and nothing else.
     #[cfg(feature = "vsock")]
     #[test]
