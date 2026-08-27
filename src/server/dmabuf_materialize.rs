@@ -49,9 +49,8 @@ pub fn materialize_dmabuf_frame(mut frame: VideoFrame) -> VideoFrame {
 
             // Buffer is now CPU-resident — clear the DMABUF flag so
             // downstream agents stop treating it as a GPU buffer.
-            frame.flags = lamco_pipewire::FrameFlags::from_bits(
-                frame.flags.bits() & !FRAME_FLAG_DMABUF_BIT,
-            );
+            frame.flags =
+                lamco_pipewire::FrameFlags::from_bits(frame.flags.bits() & !FRAME_FLAG_DMABUF_BIT);
             frame.buffer = FrameBuffer::Memory(std::sync::Arc::new(data));
             frame
         }
@@ -69,10 +68,7 @@ pub fn materialize_dmabuf_frame(mut frame: VideoFrame) -> VideoFrame {
     }
 }
 
-#[expect(
-    unsafe_code,
-    reason = "mmap/munmap required for DMA-BUF CPU access"
-)]
+#[expect(unsafe_code, reason = "mmap/munmap required for DMA-BUF CPU access")]
 fn read_dmabuf_to_vec(desc: &DmaBufDescriptor) -> Result<Vec<u8>, String> {
     use nix::sys::mman::{MapFlags, ProtFlags, mmap, munmap};
     use std::num::NonZeroUsize;

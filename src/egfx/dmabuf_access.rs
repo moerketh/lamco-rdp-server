@@ -135,7 +135,10 @@ impl NonZeroFrameStats {
         if nonzero {
             self.frames_nonzero += 1;
         } else {
-            debug!("dmabuf frame appears all-zero (frame #{})", self.frames_total);
+            debug!(
+                "dmabuf frame appears all-zero (frame #{})",
+                self.frames_total
+            );
         }
         nonzero
     }

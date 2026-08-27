@@ -77,9 +77,24 @@ pub fn convert(bgra: &[u8], width: usize, height: usize, yuv: &mut [u8], range: 
                     let p01 = &r0[col * 8 + 4..col * 8 + 8];
                     let p10 = &r1[col * 8..col * 8 + 4];
                     let p11 = &r1[col * 8 + 4..col * 8 + 8];
-                    let b = (i16::from(p00[0]) + i16::from(p01[0]) + i16::from(p10[0]) + i16::from(p11[0]) + 2) / 4;
-                    let g = (i16::from(p00[1]) + i16::from(p01[1]) + i16::from(p10[1]) + i16::from(p11[1]) + 2) / 4;
-                    let r = (i16::from(p00[2]) + i16::from(p01[2]) + i16::from(p10[2]) + i16::from(p11[2]) + 2) / 4;
+                    let b = (i16::from(p00[0])
+                        + i16::from(p01[0])
+                        + i16::from(p10[0])
+                        + i16::from(p11[0])
+                        + 2)
+                        / 4;
+                    let g = (i16::from(p00[1])
+                        + i16::from(p01[1])
+                        + i16::from(p10[1])
+                        + i16::from(p11[1])
+                        + 2)
+                        / 4;
+                    let r = (i16::from(p00[2])
+                        + i16::from(p01[2])
+                        + i16::from(p10[2])
+                        + i16::from(p11[2])
+                        + 2)
+                        / 4;
                     u_row[col] = (((-38 * r + 112 * b - 74 * g) >> 8) + 128) as u8;
                     v_row[col] = (((112 * r - 18 * b - 94 * g) >> 8) + 128) as u8;
                 }
@@ -109,9 +124,24 @@ pub fn convert(bgra: &[u8], width: usize, height: usize, yuv: &mut [u8], range: 
                     let p01 = &r0[col * 8 + 4..col * 8 + 8];
                     let p10 = &r1[col * 8..col * 8 + 4];
                     let p11 = &r1[col * 8 + 4..col * 8 + 8];
-                    let b = (i16::from(p00[0]) + i16::from(p01[0]) + i16::from(p10[0]) + i16::from(p11[0]) + 2) / 4;
-                    let g = (i16::from(p00[1]) + i16::from(p01[1]) + i16::from(p10[1]) + i16::from(p11[1]) + 2) / 4;
-                    let r = (i16::from(p00[2]) + i16::from(p01[2]) + i16::from(p10[2]) + i16::from(p11[2]) + 2) / 4;
+                    let b = (i16::from(p00[0])
+                        + i16::from(p01[0])
+                        + i16::from(p10[0])
+                        + i16::from(p11[0])
+                        + 2)
+                        / 4;
+                    let g = (i16::from(p00[1])
+                        + i16::from(p01[1])
+                        + i16::from(p10[1])
+                        + i16::from(p11[1])
+                        + 2)
+                        / 4;
+                    let r = (i16::from(p00[2])
+                        + i16::from(p01[2])
+                        + i16::from(p10[2])
+                        + i16::from(p11[2])
+                        + 2)
+                        / 4;
                     // Full-range chroma (JPEG/BT.601 full):
                     //   Cb = 128 + (−0.168736R − 0.331264G + 0.5B)
                     //   Cr = 128 + ( 0.5R − 0.418688G − 0.081312B)
@@ -157,11 +187,7 @@ mod tests {
         // from_rgb_source uses per-pixel f32 averaging; we use integer
         // averaging. Allow ±1 LSB difference (same tolerance the openh264
         // crate uses when asserting its two paths match).
-        let (ty, tu, tv) = (
-            reference.y(),
-            reference.u(),
-            reference.v(),
-        );
+        let (ty, tu, tv) = (reference.y(), reference.u(), reference.v());
         let y_size = width * height;
         let uv_size = (width / 2) * (height / 2);
         let (my, rest) = ours.split_at(y_size);
@@ -218,8 +244,16 @@ mod tests {
         let mut yuv = vec![0u8; width * height * 3 / 2];
         convert(&bgra, width, height, &mut yuv, Range::Full);
         let y = &yuv[..width * height];
-        assert!(y[..8].iter().all(|&v| v == 255), "white half Y=255, got {:?}", &y[..8]);
-        assert!(y[8..].iter().all(|&v| v == 0), "black half Y=0 (grey-blacks fix), got {:?}", &y[8..]);
+        assert!(
+            y[..8].iter().all(|&v| v == 255),
+            "white half Y=255, got {:?}",
+            &y[..8]
+        );
+        assert!(
+            y[8..].iter().all(|&v| v == 0),
+            "black half Y=0 (grey-blacks fix), got {:?}",
+            &y[8..]
+        );
         let mid_uv = &yuv[width * height..];
         assert!(
             mid_uv.iter().all(|&v| (126..=130).contains(&v)),
@@ -240,4 +274,5 @@ mod tests {
         let mid = y[0];
         assert!((126..=130).contains(&mid), "mid-gray Y near 128, got {mid}");
         assert!(y.iter().all(|&v| v == mid), "uniform input ⇒ uniform luma");
-    }}
+    }
+}

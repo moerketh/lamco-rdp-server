@@ -99,7 +99,14 @@ fn parse_xcursor(data: &[u8]) -> Result<ImageChunk, CursorError> {
             .ok_or(CursorError::Malformed("truncated pixels"))?
             .to_vec();
 
-        let chunk = ImageChunk { nominal, width, height, xhot, yhot, pixels };
+        let chunk = ImageChunk {
+            nominal,
+            width,
+            height,
+            xhot,
+            yhot,
+            pixels,
+        };
         let better = match &best {
             None => true,
             Some(b) => (chunk.nominal as i32 - 24).abs() < (b.nominal as i32 - 24).abs(),
@@ -172,10 +179,7 @@ fn to_rdp(img: &ImageChunk, cache_index: u16) -> RdpPointer {
 
     RdpPointer {
         cache_index,
-        hot_spot: (
-            img.xhot.min(96) as u16,
-            img.yhot.min(96) as u16,
-        ),
+        hot_spot: (img.xhot.min(96) as u16, img.yhot.min(96) as u16),
         width: w as u16,
         height: h as u16,
         and_mask,
@@ -291,7 +295,11 @@ mod tests {
         let data = minimal_xcursor(5, 4);
         let img = parse_xcursor(&data).expect("parse");
         let p = to_rdp(&img, 0);
-        assert_eq!(p.xor_mask.len(), 16 * 4, "w=5 → 15 data bytes + 1 pad per row");
+        assert_eq!(
+            p.xor_mask.len(),
+            16 * 4,
+            "w=5 → 15 data bytes + 1 pad per row"
+        );
     }
 
     #[test]
@@ -333,7 +341,11 @@ mod tests {
         // cursor at 24bpp: offset = (h-1) * 6 = 6 bytes). to_rdp writes
         // [B, G, R] in the xor mask, so expect 200,100,50:
         let xo = (p.height as usize - 1) * 6;
-        assert_eq!(&p.xor_mask[xo..xo + 3], &[200, 100, 50], "BGR color preserved");
+        assert_eq!(
+            &p.xor_mask[xo..xo + 3],
+            &[200, 100, 50],
+            "BGR color preserved"
+        );
         // x=1 (transparent) still punched:
         assert_eq!(byte >> 6 & 1, 1, "a=0 pixel stays transparent");
     }
@@ -368,11 +380,9 @@ mod tests {
         let wire = encode_color_pointer(&p);
         let mut cursor = ReadCursor::new(&wire);
         let attr = ColorPointerAttribute::decode(&mut cursor).expect("decode PDU body");
-        let decoded = DecodedPointer::decode_color_pointer_attribute(
-            &attr,
-            PointerBitmapTarget::Accelerated,
-        )
-        .expect("client-side decode");
+        let decoded =
+            DecodedPointer::decode_color_pointer_attribute(&attr, PointerBitmapTarget::Accelerated)
+                .expect("client-side decode");
 
         assert_eq!((decoded.width, decoded.height), (5, 4));
         assert_eq!((decoded.hotspot_x, decoded.hotspot_y), (1, 2));
@@ -392,7 +402,10 @@ mod tests {
         assert_eq!(px(0, 1), [0, 0, 255, 255], "source blue on second row");
         // Also the very last source row (h-1) must land in decoded row 3.
         let last_row = &decoded.bitmap_data[3 * 5 * 4..];
-        assert!(last_row.iter().all(|&b| b == 0), "all-transparent bottom row");
+        assert!(
+            last_row.iter().all(|&b| b == 0),
+            "all-transparent bottom row"
+        );
     }
 
     /// REGRESSION GUARD (2026-08-21): the hand-rolled wire encoder in

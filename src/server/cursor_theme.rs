@@ -236,9 +236,7 @@ impl<R: CmdRunner> CursorThemeManager<R> {
             return false;
         }
 
-        if target == self.themes.transparent
-            && !self.runner.persist_theme(&self.themes.visible)
-        {
+        if target == self.themes.transparent && !self.runner.persist_theme(&self.themes.visible) {
             warn!(
                 "Could not restore kcminputrc to visible theme (non-fatal; live session unaffected)"
             );

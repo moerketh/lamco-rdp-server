@@ -6,13 +6,13 @@
 
 #![expect(unsafe_code, reason = "FFI calls to the x264 C shim")]
 
+use super::encoder::{EncoderConfig, EncoderError, EncoderResult, H264Frame};
 #[cfg(feature = "h264")]
 use openh264::formats::BgraSliceU8;
 #[cfg(test)]
 use openh264::formats::{YUVBuffer, YUVSource};
 use std::os::raw::{c_int, c_void};
 use tracing::{debug, info};
-use super::encoder::{EncoderConfig, EncoderError, EncoderResult, H264Frame};
 
 const X264_TYPE_AUTO: c_int = 0;
 const X264_TYPE_IDR: c_int = 1;
@@ -196,7 +196,9 @@ impl X264Encoder {
         let expected = (width * height * 4) as usize;
         if bgra_data.len() < expected {
             return Err(EncoderError::EncodeFailed(format!(
-                "BGRA buffer too small: {} < {}", bgra_data.len(), expected
+                "BGRA buffer too small: {} < {}",
+                bgra_data.len(),
+                expected
             )));
         }
         self.ensure_encoder(width, height)?;
@@ -343,12 +345,21 @@ impl X264Encoder {
     }
     pub fn force_keyframe(&mut self) {}
     pub fn stats(&self) -> super::encoder::EncoderStats {
-        super::encoder::EncoderStats { frames_encoded: 0, bitrate_kbps: 0 }
+        super::encoder::EncoderStats {
+            frames_encoded: 0,
+            bitrate_kbps: 0,
+        }
     }
 }
 
 #[cfg(feature = "h264")]
-fn copy_plane(destination: &mut [u8], source: &[u8], source_stride: usize, width: usize, height: usize) {
+fn copy_plane(
+    destination: &mut [u8],
+    source: &[u8],
+    source_stride: usize,
+    width: usize,
+    height: usize,
+) {
     for row in 0..height {
         let source_start = row * source_stride;
         let destination_start = row * width;

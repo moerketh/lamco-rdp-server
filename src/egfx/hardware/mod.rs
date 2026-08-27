@@ -222,12 +222,10 @@ pub trait HardwareEncoder {
 
         // The flat copy below is only correct for linear layouts.
         if desc.modifier != 0 {
-            return Err(HardwareEncoderError::EncodeFailed(
-                format!(
-                    "non-linear DMA-BUF modifier {:#x} not supported by CPU read path",
-                    desc.modifier
-                ),
-            ));
+            return Err(HardwareEncoderError::EncodeFailed(format!(
+                "non-linear DMA-BUF modifier {:#x} not supported by CPU read path",
+                desc.modifier
+            )));
         }
 
         let plane = &desc.planes[0];
@@ -273,7 +271,9 @@ pub trait HardwareEncoder {
         if !nonzero {
             tracing::warn!(
                 "encode_dmabuf(hw): mapped frame is all-zero ({}x{} mod={:#x}) — sync/mapping issue suspected",
-                desc.width, desc.height, desc.modifier
+                desc.width,
+                desc.height,
+                desc.modifier
             );
         }
 

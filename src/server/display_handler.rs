@@ -114,8 +114,7 @@ use crate::{
 fn change_compositor_resolution(width: u16, height: u16) -> (u16, u16) {
     // Only attempt on KDE (check env vars and kscreen-doctor availability)
     let xdg_current_desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
-    let is_kde = xdg_current_desktop.contains("KDE")
-        || std::env::var("KDE_FULL_SESSION").is_ok();
+    let is_kde = xdg_current_desktop.contains("KDE") || std::env::var("KDE_FULL_SESSION").is_ok();
 
     if !is_kde {
         return (width, height);
@@ -199,7 +198,11 @@ fn change_compositor_resolution(width: u16, height: u16) -> (u16, u16) {
 fn build_cursor_theme_manager(
     config: &crate::config::Config,
 ) -> Option<
-    Arc<crate::server::cursor_theme::CursorThemeManager<crate::server::cursor_theme::SessionCmdRunner>>,
+    Arc<
+        crate::server::cursor_theme::CursorThemeManager<
+            crate::server::cursor_theme::SessionCmdRunner,
+        >,
+    >,
 > {
     let cc = &config.cursor;
     if !cc.session_scoped_cursor_theme {
@@ -253,8 +256,12 @@ fn find_best_mode(kscreen_output: &str, req_w: u32, req_h: u32) -> (u32, u32) {
             let Some((w_str, h_str)) = size_part.0.split_once('x') else {
                 continue;
             };
-            let Ok(w) = w_str.parse::<u32>() else { continue };
-            let Ok(h) = h_str.parse::<u32>() else { continue };
+            let Ok(w) = w_str.parse::<u32>() else {
+                continue;
+            };
+            let Ok(h) = h_str.parse::<u32>() else {
+                continue;
+            };
 
             let mode_pixels = w as u64 * h as u64;
             let diff = mode_pixels.abs_diff(req_pixels);
@@ -553,7 +560,11 @@ pub struct LamcoDisplayHandler {
     /// restored. Arc<Option<..>> so the manager can be absent (non-Plasma
     /// desktops / feature off) and clones share one instance.
     cursor_theme: Option<
-        Arc<crate::server::cursor_theme::CursorThemeManager<crate::server::cursor_theme::SessionCmdRunner>>,
+        Arc<
+            crate::server::cursor_theme::CursorThemeManager<
+                crate::server::cursor_theme::SessionCmdRunner,
+            >,
+        >,
     >,
 
     /// Health reporter for forwarding PipeWire stream state to health monitor
@@ -927,7 +938,9 @@ impl LamcoDisplayHandler {
                 }
             }
             Err(e) => {
-                warn!("cursor PDU: could not load guest pointer ({e}) — client keeps default arrow");
+                warn!(
+                    "cursor PDU: could not load guest pointer ({e}) — client keeps default arrow"
+                );
             }
         }
     }
@@ -1767,9 +1780,8 @@ impl LamcoDisplayHandler {
 
                             if destroy_ok {
                                 // 2. Create new stream at requested resolution
-                                let use_dmabuf_for_resize = self
-            .use_dmabuf
-            .load(std::sync::atomic::Ordering::Acquire);
+                                let use_dmabuf_for_resize =
+                                    self.use_dmabuf.load(std::sync::atomic::Ordering::Acquire);
                                 let stream_config = lamco_pipewire::StreamConfig {
                                     name: "monitor-0".to_string(),
                                     width: req.width as u32,
@@ -2653,12 +2665,16 @@ impl LamcoDisplayHandler {
                                     // Try x264 first if configured, fall back to OpenH264
                                     #[cfg(feature = "x264")]
                                     {
-                                        let backend = self.config.egfx.encoder_backend.to_lowercase();
+                                        let backend =
+                                            self.config.egfx.encoder_backend.to_lowercase();
                                         if backend == "x264" || backend == "auto" {
                                             match X264Encoder::new(config.clone()) {
                                                 Ok(mut encoder) => {
-                                                    encoder.set_diagnostics(encoder_diagnostics.clone());
-                                                    video_encoder = Some(VideoEncoder::X264(encoder));
+                                                    encoder.set_diagnostics(
+                                                        encoder_diagnostics.clone(),
+                                                    );
+                                                    video_encoder =
+                                                        Some(VideoEncoder::X264(encoder));
                                                     info!(
                                                         "✅ x264 AVC420 encoder initialized for {}×{} (4:2:0 fallback from AVC444)",
                                                         aligned_width, aligned_height
@@ -2678,7 +2694,8 @@ impl LamcoDisplayHandler {
                                     if video_encoder.is_none() {
                                         match Avc420Encoder::new(config) {
                                             Ok(mut encoder) => {
-                                                encoder.set_diagnostics(encoder_diagnostics.clone());
+                                                encoder
+                                                    .set_diagnostics(encoder_diagnostics.clone());
                                                 video_encoder = Some(VideoEncoder::Avc420(encoder));
                                                 info!(
                                                     "✅ AVC420 encoder initialized for {}×{} (4:2:0 fallback)",
@@ -2996,7 +3013,8 @@ impl LamcoDisplayHandler {
                                 None
                             } else {
                                 Some(pipeline_decisions::compute_damage_ratio(
-                                    &frame.damage_regions
+                                    &frame
+                                        .damage_regions
                                         .iter()
                                         .map(|r| DamageRegion::from(*r))
                                         .collect::<Vec<_>>(),

@@ -66,8 +66,8 @@
 pub mod cursor_pdu;
 mod cursor_theme;
 mod deployment;
-mod dmabuf_materialize;
 mod display_handler;
+mod dmabuf_materialize;
 mod egfx_sender;
 #[expect(dead_code, reason = "WIP: not yet integrated into the server pipeline")]
 mod event_multiplexer;
@@ -594,7 +594,10 @@ impl LamcoRdpServer {
             // of the private Portal FD. The private FD causes DmaBuf buffer allocation
             // failures (-EIO). The shared daemon works because WirePlumber handles
             // link creation properly. The node_id from the portal is still used.
-            info!("Portal FD: {} — switching to shared PipeWire daemon", portal_fd);
+            info!(
+                "Portal FD: {} — switching to shared PipeWire daemon",
+                portal_fd
+            );
             let raw_fd = crate::mutter::connect_to_pipewire_daemon()
                 .context("Failed to connect to shared PipeWire daemon")?;
             info!("Connected to shared PipeWire daemon, FD: {}", raw_fd);
@@ -633,7 +636,10 @@ impl LamcoRdpServer {
                     // failures (-EIO) during DmaBuf negotiation. The shared daemon works
                     // because WirePlumber handles link creation properly.
                     // The node_id from the portal streams is still used for binding.
-                    info!("Using Portal-provided PipeWire node ID (ignoring private FD {})", fd);
+                    info!(
+                        "Using Portal-provided PipeWire node ID (ignoring private FD {})",
+                        fd
+                    );
                     let daemon_fd = crate::mutter::connect_to_pipewire_daemon()
                         .context("Failed to connect to PipeWire daemon for Portal strategy")?;
                     info!("Connected to shared PipeWire daemon, FD: {}", daemon_fd);
@@ -710,7 +716,9 @@ impl LamcoRdpServer {
                 compression_mode,
             );
             if !egfx_enabled {
-                warn!("EGFX disabled in config — using lossless surface commands (RemoteFx/QOI) instead of H.264");
+                warn!(
+                    "EGFX disabled in config — using lossless surface commands (RemoteFx/QOI) instead of H.264"
+                );
             }
             gfx_factory.set_monitoring(Arc::clone(&metrics), snapshot_collector.egfx_state());
             gfx_factory.set_health_reporter(health_reporter.clone());
@@ -733,8 +741,16 @@ impl LamcoRdpServer {
                 ),
             ));
 
-            let gfx_handler_state = if egfx_enabled { Some(gfx_factory.handler_state()) } else { None };
-            let gfx_server_handle = if egfx_enabled { Some(gfx_factory.server_handle()) } else { None };
+            let gfx_handler_state = if egfx_enabled {
+                Some(gfx_factory.handler_state())
+            } else {
+                None
+            };
+            let gfx_server_handle = if egfx_enabled {
+                Some(gfx_factory.server_handle())
+            } else {
+                None
+            };
 
             let display_handler = Arc::new(match pipewire_source {
                 PipeWireSource::Fd(raw_fd) => {
@@ -1008,7 +1024,11 @@ impl LamcoRdpServer {
                     .with_display_handler((*display_handler).clone())
                     .with_bitmap_codecs(codecs)
                     .with_cliprdr_factory(wlr_clipboard_factory)
-                    .with_gfx_factory(if egfx_enabled { Some(Box::new(gfx_factory)) } else { None })
+                    .with_gfx_factory(if egfx_enabled {
+                        Some(Box::new(gfx_factory))
+                    } else {
+                        None
+                    })
                     .with_sound_factory(Some(Box::new(sound_factory)))
                     .build()
             } else {
@@ -1032,7 +1052,11 @@ impl LamcoRdpServer {
                     .with_display_handler((*display_handler).clone())
                     .with_bitmap_codecs(codecs)
                     .with_cliprdr_factory(None)
-                    .with_gfx_factory(if egfx_enabled { Some(Box::new(gfx_factory)) } else { None })
+                    .with_gfx_factory(if egfx_enabled {
+                        Some(Box::new(gfx_factory))
+                    } else {
+                        None
+                    })
                     .with_sound_factory(Some(Box::new(sound_factory)))
                     .build()
             };
@@ -1519,7 +1543,9 @@ impl LamcoRdpServer {
         info!("Building IronRDP server");
         let egfx_enabled = config.egfx.enabled;
         if !egfx_enabled {
-            warn!("EGFX disabled in config — using lossless surface commands (RemoteFx/QOI) instead of H.264");
+            warn!(
+                "EGFX disabled in config — using lossless surface commands (RemoteFx/QOI) instead of H.264"
+            );
         }
         let listen_addr: SocketAddr = config
             .server
@@ -1546,7 +1572,11 @@ impl LamcoRdpServer {
             .with_display_handler((*display_handler).clone())
             .with_bitmap_codecs(codecs)
             .with_cliprdr_factory(Some(Box::new(clipboard_factory)))
-            .with_gfx_factory(if egfx_enabled { Some(Box::new(gfx_factory)) } else { None })
+            .with_gfx_factory(if egfx_enabled {
+                Some(Box::new(gfx_factory))
+            } else {
+                None
+            })
             .with_sound_factory(Some(Box::new(sound_factory)))
             .build();
 

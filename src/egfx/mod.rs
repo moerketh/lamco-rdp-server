@@ -55,9 +55,9 @@ mod color_space;
 pub(crate) mod encode_diagnostics;
 mod yuv444_packing;
 
+pub mod dmabuf_access;
 #[cfg(any(feature = "vaapi", feature = "nvenc"))]
 pub mod hardware;
-pub mod dmabuf_access;
 
 pub mod flow_controller;
 mod h264_level;
@@ -72,9 +72,9 @@ pub use color_space::{
 pub use encoder::{
     Avc420Encoder, EncoderConfig, EncoderError, EncoderResult, EncoderStats, H264Frame, align_to_16,
 };
+pub use h264_level::{ConstraintViolation, H264Level, LevelConstraints};
 #[cfg(feature = "x264")]
 pub use x264_encoder::X264Encoder;
-pub use h264_level::{ConstraintViolation, H264Level, LevelConstraints};
 // LamcoGraphicsHandler implements ironrdp_egfx::GraphicsPipelineHandler internally
 // but that trait is not part of our public API
 pub use handler::{LamcoGraphicsHandler, SharedGraphicsHandler};
