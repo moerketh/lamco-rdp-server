@@ -20,7 +20,7 @@
 //! #define DMA_BUF_BASE           'b'
 //! #define DMA_BUF_IOCTL_SYNC    _IOW(DMA_BUF_BASE, 0, struct dma_buf_sync)
 //! ```
-//! `DMA_BUF_IOCTL_SYNC` = 0x40046200 on all supported architectures
+//! `DMA_BUF_IOCTL_SYNC` = 0x40086200 on all supported architectures
 //! (dir/write=1 in bits 31..30, size=8 in bits 29..16, 'b'=0x62, nr=0).
 
 use std::os::fd::AsRawFd;
