@@ -14,6 +14,7 @@
 
 pub mod config;
 pub mod handler;
+pub mod handshake_deadline;
 pub mod listener;
 pub mod proxy_auth;
 pub mod socket_activation;
@@ -131,6 +132,19 @@ impl AcceptDispatcher {
                         "Connection accepted"
                     );
 
+                    // Dead-client wedge mitigation (2026-08-27 finding): a
+                    // silent peer parks the acceptor's first read inside this
+                    // serial loop and blacks out every listener until it goes
+                    // away. Wrap the stream so the FIRST client byte must
+                    // arrive within the deadline; once the exchange starts the
+                    // deadline is disarmed and idle sessions are unaffected.
+                    let peer_display = peer.to_display();
+                    let stream: Box<dyn AsyncRdpStream> =
+                        Box::new(handshake_deadline::HandshakeDeadlineStream::new(
+                            stream,
+                            handshake_deadline::DEFAULT_HANDSHAKE_DEADLINE,
+                        ));
+
                     // on_accept_async: PAM peer-IP setup, ClientConnected event,
                     // cache client state for matching on_disconnected.
                     let accept_ok = handler.on_accept_async(&peer).await;
@@ -168,10 +182,10 @@ impl AcceptDispatcher {
                             //
                             // HostRelayed authenticates nobody and cannot: vmms sends
                             // an empty Client Info credential (measured 2026-08-27).
-                            // The vsock transport is the only boundary, and it does not
-                            // yet enforce one — the listener accepts any peer CID, so a
-                            // local process can reach this arm via loopback CID 1.
-                            // Needs a peer-CID allowlist. Never widen to TCP.
+                            // The vsock transport is the access boundary: the listener
+                            // enforces the peer-CID allowlist (beaa24e; default
+                            // VMADDR_CID_HOST only, in-guest loopback CID 1 refused).
+                            // Never widen this arm to a TCP listener.
                             rdp_server
                                 .run_connection_with(
                                     stream,
@@ -181,6 +195,15 @@ impl AcceptDispatcher {
                         }
                     };
                     let duration = start.elapsed();
+
+                    // Surface deadline-based aborts distinctly from ordinary
+                    // handshake failures — the wedge mitigation working as
+                    // designed is worth seeing in logs at a glance.
+                    if let Err(ref e) = conn_result {
+                        if e.to_string().contains("handshake deadline elapsed") {
+                            handshake_deadline::log_deadline_rejection(&peer_display, duration);
+                        }
+                    }
 
                     // on_disconnected_async: classify error, emit ClientDisconnected,
                     // prune PAM rate limits, check Portal validity.
