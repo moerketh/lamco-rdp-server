@@ -76,7 +76,7 @@ use bytes::Bytes;
 use ironrdp_server::{
     BitmapUpdate as IronBitmapUpdate, ColorPointer, DesktopSize, DisplayUpdate, GfxServerHandle,
     PixelFormat as IronPixelFormat, PointerUpdate, RdpServerDisplay, RdpServerDisplayUpdates,
-    ServerEvent,
+    ServerEvent, ServerResult,
 };
 use tokio::sync::{Mutex, RwLock, mpsc};
 use tracing::{debug, error, info, trace, warn};
@@ -536,6 +536,17 @@ pub struct LamcoDisplayHandler {
     /// The pipeline loop checks this to avoid encoding/sending frames to nobody.
     client_active: Arc<std::sync::atomic::AtomicBool>,
 
+    /// Shared "display suppressed" flag — `true` while the connected client
+    /// sent `SuppressOutput { desktop_rect: None }` (e.g. mstsc minimized).
+    ///
+    /// Mirrors `RdpServer::display_suppressed_handle()`: the RDP server owns
+    /// the authoritative copy (set on the PDU, reset per connection) and shares
+    /// it here via `set_display_suppressed_flag` before the pipeline starts.
+    /// `None` (never shared) means the gate is inactive — the pipeline encodes
+    /// unconditionally, matching pre-existing behavior. See the gating policy
+    /// in [`pipeline_decisions::should_skip_for_suppress`].
+    display_suppressed: parking_lot::RwLock<Option<Arc<std::sync::atomic::AtomicBool>>>,
+
     /// Live PipeWire capture node id. A session re-establishment (PerConnection
     /// lifecycle) rebinds capture to a new node via `rebind_capture_node`; this
     /// tracks it so a subsequent client resize acts on the current node rather
@@ -713,6 +724,7 @@ impl LamcoDisplayHandler {
                     .unwrap_or(Instant::now()),
             ),
             client_active,
+            display_suppressed: parking_lot::RwLock::new(None),
             saw_real_disconnect: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             cursor_theme: cursor_theme_mgr,
             health_reporter: Arc::new(RwLock::new(None)),
@@ -807,6 +819,7 @@ impl LamcoDisplayHandler {
                     .unwrap_or(Instant::now()),
             ),
             client_active,
+            display_suppressed: parking_lot::RwLock::new(None),
             saw_real_disconnect: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             cursor_theme: cursor_theme_mgr,
             health_reporter: Arc::new(RwLock::new(None)),
@@ -843,6 +856,27 @@ impl LamcoDisplayHandler {
     /// preventing hundreds of futile D-Bus calls when the stream is paused.
     pub fn set_stream_active_flag(&self, flag: Arc<std::sync::atomic::AtomicBool>) {
         *self.stream_active_flag.write() = Some(flag);
+    }
+
+    /// Shared EGFX handler state (when EGFX is configured).
+    ///
+    /// Lets the server layer wire complementary signal sources — e.g. the
+    /// NetworkAutoDetect RTT handle — into the flow controller after the RDP
+    /// server is built.
+    pub fn egfx_handler_state(&self) -> Option<Arc<SharedHandlerState>> {
+        self.gfx_handler_state.clone()
+    }
+
+    /// Share the RDP server's "display suppressed" flag (`SuppressOutput {
+    /// desktop_rect: None }`, e.g. mstsc minimized).
+    ///
+    /// The RDP server owns the authoritative copy — it sets the flag on the
+    /// PDU and resets it per connection — and this installs the shared handle
+    /// so the pipeline's frame gate can stop encoding while the client cannot
+    /// present frames. Call after building the RDP server and before
+    /// `start_pipeline` (the task snapshots the flag at spawn).
+    pub fn set_display_suppressed_flag(&self, flag: Arc<std::sync::atomic::AtomicBool>) {
+        *self.display_suppressed.write() = Some(flag);
     }
 
     /// Set clipboard manager reference for disconnect cleanup
@@ -1475,6 +1509,14 @@ impl LamcoDisplayHandler {
             let mut egfx_frames_sent = 0u64;
 
             let mut loop_iterations = 0u64;
+
+            // SuppressOutput gate state: onset of the current suppress period
+            // (None while the flag is low). IronRDP resets the shared flag per
+            // connection; the onset tracker belongs to this pipeline instance.
+            // Snapshot the shared flag once — `set_display_suppressed_flag`
+            // runs before `start_pipeline` spawns this task.
+            let suppress_flag = handler.display_suppressed.read().clone();
+            let mut suppressed_since: Option<Instant> = None;
 
             // L2 stress detector: track frames_dropped + frames_sent over a
             // rolling 1-second window. When drop_rate sustains > 50% AND the
@@ -2787,6 +2829,36 @@ impl LamcoDisplayHandler {
                         }
                     }
 
+                    // SuppressOutput gate (client minimized / asked us to stop).
+                    // Skips encode+send while the client can't present frames,
+                    // after first-frame grace and a 1s debounce (mstsc raises
+                    // SuppressOutput mid-handshake and pulses it under load —
+                    // see `should_skip_for_suppress`). Damage must accumulate
+                    // so the un-suppress refresh loses nothing; the periodic
+                    // IDR cycle self-heals the P-slice chain on resume.
+                    let suppressed_now = suppress_flag
+                        .as_ref()
+                        .is_some_and(|f| f.load(std::sync::atomic::Ordering::Relaxed));
+                    if suppressed_now {
+                        if suppressed_since.is_none() {
+                            suppressed_since = Some(Instant::now());
+                            debug!(
+                                "Client SuppressOutput observed — engaging frame gate after debounce"
+                            );
+                        }
+                        if pipeline_decisions::should_skip_for_suppress(
+                            suppress_flag.as_deref(),
+                            suppressed_since,
+                            frames_sent,
+                            Instant::now(),
+                        ) {
+                            frames_paced += 1;
+                            continue;
+                        }
+                    } else {
+                        suppressed_since = None;
+                    }
+
                     // Try to send via EGFX H.264 if encoder is available
                     if let (Some(encoder), Some(sender)) = (&mut video_encoder, &egfx_sender) {
                         // CLOSED-LOOP FLOW CONTROL (Layer 4 / GrdRdpGfxFrameController equivalent)
@@ -3528,7 +3600,7 @@ impl RdpServerDisplay for LamcoDisplayHandler {
         clippy::expect_used,
         reason = "mutex poisoning is unrecoverable; receiver guaranteed after reset"
     )]
-    async fn updates(&mut self) -> Result<Box<dyn RdpServerDisplayUpdates>> {
+    async fn updates(&mut self) -> ServerResult<Box<dyn RdpServerDisplayUpdates>> {
         let mut receiver_option = self.update_receiver.lock().await;
 
         // If receiver was already taken by a previous connection, create a new channel
@@ -3632,7 +3704,6 @@ impl RdpServerDisplay for LamcoDisplayHandler {
 
         Ok(Box::new(DisplayUpdatesStream::new(receiver)))
     }
-
     fn request_layout(&mut self, layout: ironrdp_displaycontrol::pdu::DisplayControlMonitorLayout) {
         use ironrdp_displaycontrol::pdu::MonitorLayoutEntry;
 
@@ -3775,6 +3846,7 @@ impl Clone for LamcoDisplayHandler {
                     .unwrap_or(Instant::now()),
             ),
             client_active: Arc::clone(&self.client_active),
+            display_suppressed: parking_lot::RwLock::new(self.display_suppressed.read().clone()),
             capture_node: Arc::clone(&self.capture_node),
             saw_real_disconnect: Arc::clone(&self.saw_real_disconnect),
             cursor_theme: self.cursor_theme.clone(),
@@ -3802,7 +3874,7 @@ impl DisplayUpdatesStream {
 #[async_trait::async_trait]
 impl RdpServerDisplayUpdates for DisplayUpdatesStream {
     /// Cancellation-safe as required by IronRDP.
-    async fn next_update(&mut self) -> Result<Option<DisplayUpdate>> {
+    async fn next_update(&mut self) -> ServerResult<Option<DisplayUpdate>> {
         match self.receiver.recv().await {
             Some(update) => {
                 trace!("Providing display update: {:?}", update);

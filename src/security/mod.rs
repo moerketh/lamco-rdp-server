@@ -159,7 +159,7 @@ impl Security {
 
     /// Create TLS acceptor
     /// Get TLS server config for creating acceptor
-    pub fn server_config(&self) -> Arc<ironrdp_server::tokio_rustls::rustls::ServerConfig> {
+    pub fn server_config(&self) -> Arc<rustls::ServerConfig> {
         self.tls_config.server_config()
     }
 

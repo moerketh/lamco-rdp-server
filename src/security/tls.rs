@@ -2,12 +2,12 @@
 //!
 //! Provides secure TLS termination for RDP connections using rustls.
 //!
-//! Uses IronRDP's re-exported rustls (v0.23) for version compatibility.
+//! rustls (v0.23) is a direct dependency, version-matched to what
+//! ironrdp-server pins so the ServerConfig type unifies.
 
 use std::{fs::File, io::BufReader, path::Path, sync::Arc};
 
 use anyhow::{Context, Result};
-use ironrdp_server::tokio_rustls::rustls;
 use rustls::{
     ServerConfig,
     pki_types::{CertificateDer, PrivateKeyDer},

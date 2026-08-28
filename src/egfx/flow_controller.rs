@@ -38,13 +38,14 @@
 //! decode time and any client-side queue delay.
 //!
 //! NetworkAutoDetect (`[MS-RDPBCGR]` § 2.2.14) provides a complementary,
-//! pure-network RTT signal via `ironrdp-server`'s `AutoDetectManager`. The qemu
-//! console drives `ServerEvent::AutoDetectRttRequest` on a cadence and the
-//! server publishes the latest measurement through an `Arc<AtomicU32>` handle
-//! (`RdpServer::autodetect_rtt_handle`, upstream PR #1346). `effective_rtt`
-//! fuses the two (R2b, freshness-floor policy): the FrameAck-derived `avg_rtt`
-//! while a sample is fresh, otherwise the autodetect RTT so an idle gap doesn't
-//! leave the threshold on a stale average. See
+//! pure-network RTT signal via `ironrdp-server`'s `AutoDetectManager`. The
+//! server layer calls `enable_autodetect()` on `RdpServer` and wires
+//! `RdpServer::autodetect_rtt_handle()` into
+//! `FlowController::set_autodetect_rtt_handle` (see `server::mod`, both
+//! build paths). `effective_rtt` fuses the two (R2b, freshness-floor policy):
+//! the FrameAck-derived `avg_rtt` while a sample is fresh, otherwise the
+//! autodetect RTT so an idle gap doesn't leave the threshold on a stale
+//! average. See
 //! `docs/design/PROXMOX-CONSOLE-REVIVAL-PLAN-2026-05-31.md` (R2b) and
 //! `docs/analysis/spec/lamco-rdp-server/AUTODETECT-CONSUMER-AUDIT-2026-05-23.md`.
 

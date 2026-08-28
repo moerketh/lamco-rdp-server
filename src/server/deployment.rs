@@ -85,7 +85,7 @@ impl AcceptDeployment for WlrDirectDeployment {
         // (in the deployment) rather than inside ResolvedTransports::build_listeners.
         #[cfg(feature = "websocket")]
         if let Some(ws_cfg) = transports.websocket.as_ref() {
-            use ironrdp_server::tokio_rustls::TlsAcceptor;
+            use tokio_rustls::TlsAcceptor;
 
             use crate::{security::tls::TlsConfig, transport::websocket::WebSocketListenerImpl};
 

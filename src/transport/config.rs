@@ -172,6 +172,24 @@ fn resolve_allowed_cids(configured: Option<&[u32]>) -> Vec<u32> {
     }
 }
 
+/// Feature-off mirror of [`resolve_allowed_cids`].
+///
+/// The tests at the bottom of this file exercise the resolved allowlist as
+/// semantic config (round-tripping what the operator wrote) and run under the
+/// default feature set, where the `vsock`-gated variant does not exist and
+/// `listener::default_allowed_cids` (which needs `tokio-vsock`) is not
+/// compiled. Hard-coding `VMADDR_CID_HOST` (2) here duplicates the value the
+/// gated variant returns; a build with both cfg states would notice any drift
+/// via the `vsock_enabled_uses_the_host_only_allowlist_by_default` test.
+#[cfg(not(feature = "vsock"))]
+fn resolve_allowed_cids(configured: Option<&[u32]>) -> Vec<u32> {
+    match configured {
+        Some(cids) if !cids.is_empty() => cids.to_vec(),
+        // VMADDR_CID_HOST — the hypervisor-only default.
+        _ => vec![2],
+    }
+}
+
 impl TransportsConfig {
     /// Resolve the effective set of configured transports.
     ///
@@ -418,7 +436,9 @@ mod tests {
         assert_eq!(got.port, default_vsock_port());
         assert_eq!(
             got.allowed_cids,
-            super::super::listener::default_allowed_cids()
+            // VMADDR_CID_HOST — same value listener::default_allowed_cids
+            // returns when the vsock feature is compiled in.
+            vec![2]
         );
     }
 
@@ -444,7 +464,9 @@ mod tests {
         .expect("enabled");
         assert_eq!(
             empty.allowed_cids,
-            super::super::listener::default_allowed_cids()
+            // VMADDR_CID_HOST — same value listener::default_allowed_cids
+            // returns when the vsock feature is compiled in.
+            vec![2]
         );
     }
 }

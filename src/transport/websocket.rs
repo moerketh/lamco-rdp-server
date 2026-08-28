@@ -32,7 +32,6 @@ use std::{
 use anyhow::{Context as _, Result, anyhow};
 use futures::{Sink, SinkExt, Stream, StreamExt};
 use ironrdp_rdcleanpath::{RDCleanPath, RDCleanPathPdu};
-use ironrdp_server::tokio_rustls::TlsAcceptor;
 use serde::{Deserialize, Serialize};
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
@@ -40,6 +39,7 @@ use tokio::{
     sync::mpsc,
     task::JoinHandle,
 };
+use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::{WebSocketStream, tungstenite::Message};
 use tracing::{debug, info};
 

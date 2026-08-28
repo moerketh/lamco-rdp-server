@@ -89,6 +89,7 @@ use ironrdp_graphics::zgfx::CompressionMode;
 use ironrdp_pdu::rdp::capability_sets::server_codecs_capabilities;
 use ironrdp_server::RdpServer;
 use tokio::sync::Mutex;
+use tokio_rustls::TlsAcceptor as TokioTlsAcceptor;
 use tracing::{debug, error, info, warn};
 
 use crate::{
@@ -878,8 +879,7 @@ impl LamcoRdpServer {
                 config.security.require_tls_13,
             )
             .context("Failed to load TLS certificates")?;
-            let tls_acceptor =
-                ironrdp_server::tokio_rustls::TlsAcceptor::from(tls_config.server_config());
+            let tls_acceptor = TokioTlsAcceptor::from(tls_config.server_config());
             let tls_pub_key = tls_config.public_key().ok();
 
             let codecs = server_codecs_capabilities(&["remotefx"])
@@ -965,7 +965,7 @@ impl LamcoRdpServer {
                 });
             }
 
-            let rdp_server = if is_wlr_direct || is_portal_generic {
+            let mut rdp_server = if is_wlr_direct || is_portal_generic {
                 // wlr-direct/portal-generic: input via session handle (native Wayland protocols)
                 let monitors: Vec<InputMonitorInfo> = stream_info
                     .iter()
@@ -1064,6 +1064,19 @@ impl LamcoRdpServer {
             display_handler
                 .set_server_event_sender(rdp_server.event_sender().clone())
                 .await;
+
+            // NetworkAutoDetect ([MS-RDPBCGR] 2.2.14): enable the probe state
+            // machine and share its handles. The RTT handle feeds the EGFX
+            // flow controller's freshness-floor policy (see
+            // src/egfx/flow_controller.rs `effective_rtt`); the suppress handle
+            // gates the pipeline when the client minimizes (SuppressOutput).
+            rdp_server.enable_autodetect();
+            if let Some(state) = display_handler.egfx_handler_state() {
+                if let Ok(mut fc) = state.flow_controller.lock() {
+                    fc.set_autodetect_rtt_handle(rdp_server.autodetect_rtt_handle());
+                }
+            }
+            display_handler.set_display_suppressed_flag(rdp_server.display_suppressed_handle());
 
             let _ = event_tx.send(ServerEvent::SessionTypeChanged {
                 session_type: session_handle.session_type().to_string(),
@@ -1361,8 +1374,7 @@ impl LamcoRdpServer {
         )
         .context("Failed to load TLS certificates")?;
 
-        let tls_acceptor =
-            ironrdp_server::tokio_rustls::TlsAcceptor::from(tls_config.server_config());
+        let tls_acceptor = TokioTlsAcceptor::from(tls_config.server_config());
         let tls_pub_key = tls_config.public_key().ok();
 
         let codecs = server_codecs_capabilities(&["remotefx"])
@@ -1567,7 +1579,7 @@ impl LamcoRdpServer {
             addr_builder.with_tls(tls_acceptor)
         };
 
-        let rdp_server = handler_builder
+        let mut rdp_server = handler_builder
             .with_input_handler(input_handler)
             .with_display_handler((*display_handler).clone())
             .with_bitmap_codecs(codecs)
@@ -1584,6 +1596,16 @@ impl LamcoRdpServer {
             .set_server_event_sender(rdp_server.event_sender().clone())
             .await;
         info!("Server event sender configured in display handler");
+
+        // NetworkAutoDetect + SuppressOutput gating — see the identical block in
+        // the view-only/wlr path above for rationale.
+        rdp_server.enable_autodetect();
+        if let Some(state) = display_handler.egfx_handler_state() {
+            if let Ok(mut fc) = state.flow_controller.lock() {
+                fc.set_autodetect_rtt_handle(rdp_server.autodetect_rtt_handle());
+            }
+        }
+        display_handler.set_display_suppressed_flag(rdp_server.display_suppressed_handle());
 
         let _ = event_tx.send(ServerEvent::SessionTypeChanged {
             session_type: session_handle_for_clipboard.session_type().to_string(),
@@ -1835,15 +1857,40 @@ impl LamcoRdpServer {
         Arc::clone(&self.shutdown_broadcast)
     }
 
+    /// Handle for disconnecting the active client with a client-visible
+    /// reason (`ServerSetErrorInfoPdu`, MS-RDPBCGR 2.2.5.1) while `run()`
+    /// owns the server. Unlike a bare `Quit` — which tears the connection
+    /// down silently — the client decodes the PDU and can surface *why* it
+    /// was disconnected to the user before the drop.
+    ///
+    /// Use this before `run()` consumes the server (same pattern as
+    /// [`Self::shutdown_sender`]); the handle is `Clone` and the underlying
+    /// event channel is unbounded, so one early clone covers the process
+    /// lifetime.
+    #[must_use]
+    pub fn error_info_disconnect_handle(&self) -> ironrdp_server::ErrorInfoDisconnectHandle {
+        self.rdp_server.error_info_disconnect_handle()
+    }
+
     /// Signal graceful shutdown. Actual cleanup happens in cleanup_resources().
+    ///
+    /// Sends the client-visible disconnect (administrative-tool reason) rather
+    /// than a bare `Quit`: the connected client shows "disconnected by an
+    /// administrative tool" instead of a generic transport error. The send
+    /// failing is the common no-client-connected case, not an error.
     pub fn signal_shutdown(&self) {
         info!("Initiating graceful shutdown");
-        let _ = self
+        use ironrdp_pdu::rdp::server_error_info::{ErrorInfo, ProtocolIndependentCode};
+        if self
             .rdp_server
-            .event_sender()
-            .send(ironrdp_server::ServerEvent::Quit(
-                "Shutdown requested".to_string(),
-            ));
+            .error_info_disconnect_handle()
+            .disconnect(ErrorInfo::ProtocolIndependentCode(
+                ProtocolIndependentCode::RpcInitiatedDisconnect,
+            ))
+            .is_err()
+        {
+            debug!("No active client to disconnect on shutdown");
+        }
         let _ = self.shutdown_broadcast.send(());
     }
 

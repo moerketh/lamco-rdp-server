@@ -5,7 +5,7 @@
 use anyhow::Result;
 use clap::Parser;
 use lamco_rdp_server::{config::Config, server::LamcoRdpServer};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 /// Command-line arguments for lamco-rdp-server
@@ -316,13 +316,27 @@ async fn main() -> Result<()> {
         info!("PID file written: {:?}", pid_path);
     }
 
-    // Get shutdown channels BEFORE run() consumes the server.
-    // Quit event closes the active RDP connection gracefully (TLS CloseNotify).
-    // Broadcast breaks the outer accept loop and stops clipboard/PipeWire tasks.
-    let shutdown_sender = server.shutdown_sender();
+    // Get the shutdown channels BEFORE run() consumes the server.
+    // The ErrorInfo disconnect closes the active RDP connection gracefully
+    // (ServerSetErrorInfoPdu then TLS CloseNotify) with a client-visible
+    // reason. Broadcast breaks the outer accept loop and stops
+    // clipboard/PipeWire tasks.
     let shutdown_broadcast = server.shutdown_broadcast();
+    let disconnect_handle = server.error_info_disconnect_handle();
 
     tokio::spawn(async move {
+        // Operator-initiated stop: "disconnection initiated by an
+        // administrative tool on the server" (MS-RDPBCGR 2.2.5.1 code 0x1).
+        // A failed send means no client is connected — the common case.
+        use ironrdp_pdu::rdp::server_error_info::{ErrorInfo, ProtocolIndependentCode};
+        let admin_disconnect = || {
+            disconnect_handle
+                .disconnect(ErrorInfo::ProtocolIndependentCode(
+                    ProtocolIndependentCode::RpcInitiatedDisconnect,
+                ))
+                .is_err()
+        };
+
         // Listen for both SIGINT (Ctrl-C) and SIGTERM (systemd, GUI stop button, kill)
         #[cfg(unix)]
         {
@@ -341,9 +355,9 @@ async fn main() -> Result<()> {
             warn!("═══════════════════════════════════════════════════════════");
             warn!("  {signal_name} received - Initiating graceful shutdown");
             warn!("═══════════════════════════════════════════════════════════");
-            let _ = shutdown_sender.send(ironrdp_server::ServerEvent::Quit(format!(
-                "{signal_name} received"
-            )));
+            if admin_disconnect() {
+                debug!("No active client to disconnect on {signal_name}");
+            }
             let _ = shutdown_broadcast.send(());
         }
 
@@ -351,9 +365,9 @@ async fn main() -> Result<()> {
         {
             if let Ok(()) = tokio::signal::ctrl_c().await {
                 warn!("Ctrl-C received - Initiating graceful shutdown");
-                let _ = shutdown_sender.send(ironrdp_server::ServerEvent::Quit(
-                    "Ctrl-C received".to_string(),
-                ));
+                if admin_disconnect() {
+                    debug!("No active client to disconnect on Ctrl-C");
+                }
                 let _ = shutdown_broadcast.send(());
             }
         }

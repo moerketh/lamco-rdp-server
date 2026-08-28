@@ -138,7 +138,7 @@ impl LamcoConnectionHandler {
         &mut self,
         peer: &PeerAddr,
         duration: Duration,
-        error: Option<&anyhow::Error>,
+        error: Option<&ironrdp_server::ServerError>,
     ) -> PostConnectionAction {
         let peer_display = peer.to_display();
         let state = self.current_client.lock().await.take();
@@ -232,7 +232,7 @@ impl ConnectionHandler for LamcoConnectionHandler {
         &mut self,
         _peer: std::net::SocketAddr,
         _duration: Duration,
-        _error: Option<&anyhow::Error>,
+        _error: Option<&ironrdp_server::ServerError>,
     ) -> PostConnectionAction {
         unreachable!(
             "LamcoConnectionHandler sync on_disconnected invoked; Phase 1 uses on_disconnected_async via AcceptDispatcher"
@@ -364,7 +364,10 @@ mod tests {
         let peer = test_peer();
 
         let _ = handler.on_accept_async(&peer).await;
-        let err = anyhow::anyhow!("Connection reset by peer (os error 104)");
+        let err = ironrdp_server::ServerErrorExt::reason(
+            "test",
+            "Connection reset by peer (os error 104)",
+        );
         let action = handler
             .on_disconnected_async(&peer, Duration::from_millis(50), Some(&err))
             .await;

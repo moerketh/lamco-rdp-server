@@ -6,6 +6,8 @@
 //! H4/M2 findings). The closure now calls these and keeps only the orchestration
 //! (channel sends, encoder construction, logging) at the call sites.
 
+use std::time::{Duration, Instant};
+
 use crate::damage::DamageRegion;
 
 /// Per-frame presentation timestamp for the H.264 encode path.
@@ -35,6 +37,122 @@ pub(crate) fn compute_damage_ratio(regions: &[DamageRegion], width: u32, height:
     }
     let damage_area: u64 = regions.iter().map(DamageRegion::area).sum();
     damage_area as f32 / frame_area as f32
+}
+
+/// Decide whether the pipeline should skip encoding this frame because the
+/// client asked us to stop (`SuppressOutput { desktop_rect: None }`, e.g.
+/// mstsc minimized).
+///
+/// Policy (matching IronRDP's documented guidance for this handle):
+/// - Never gate before the client has received its first frame: some clients
+///   (notably mstsc) raise SuppressOutput during the connect handshake, before
+///   their display surface exists — gating there leaves a half-initialized
+///   surface that doesn't recover on un-suppress (visible as a frozen desktop
+///   on first connect).
+/// - Debounce transient flaps: engage only once the flag has been steady
+///   `true` for `ENGAGE_AFTER` (some clients pulse the PDU under wire
+///   pressure), and release immediately when it clears — a returning client
+///   must get frames at once, not after another delay.
+/// - `None` (no shared flag) never skips: gate inactive, matching the
+///   pre-existing unconditional-encode behavior.
+pub(crate) fn should_skip_for_suppress(
+    suppressed: Option<&std::sync::atomic::AtomicBool>,
+    suppressed_since: Option<Instant>,
+    frames_sent: u64,
+    now: Instant,
+) -> bool {
+    const ENGAGE_AFTER: Duration = Duration::from_millis(1000);
+    const FIRST_FRAME_GRACE: u64 = 1;
+
+    let Some(flag) = suppressed else {
+        return false;
+    };
+    // First-frame grace: the client hasn't presented anything yet, so there is
+    // no backlog to avoid and gating can only break handshake-time suppress.
+    if frames_sent < FIRST_FRAME_GRACE {
+        return false;
+    }
+    match (
+        flag.load(std::sync::atomic::Ordering::Relaxed),
+        suppressed_since,
+    ) {
+        (false, _) => false,
+        // Engaged already; stay gated until the flag clears (no re-delay).
+        (true, Some(since)) => now.duration_since(since) >= ENGAGE_AFTER,
+        // Flag just observed high with no recorded onset — record happens in
+        // the caller; treat as not-yet-engaged so the debounce interval runs.
+        (true, None) => false,
+    }
+}
+
+#[cfg(test)]
+mod suppress_tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    fn now_after(secs: u64) -> Instant {
+        Instant::now()
+            .checked_add(Duration::from_secs(secs))
+            .expect("representable")
+    }
+
+    #[test]
+    fn no_flag_never_skips() {
+        assert!(!should_skip_for_suppress(None, None, 100, Instant::now()));
+    }
+
+    #[test]
+    fn first_frame_grace_beats_suppress_during_handshake() {
+        let flag = AtomicBool::new(true);
+        let t0 = Instant::now();
+        // Zero frames sent: even a steady suppress must not gate.
+        assert!(!should_skip_for_suppress(
+            Some(&flag),
+            Some(t0),
+            0,
+            now_after(10)
+        ));
+    }
+
+    #[test]
+    fn engages_only_after_steady_interval() {
+        let flag = AtomicBool::new(true);
+        let t0 = Instant::now();
+        // 0.5s in: below the 1s debounce → no skip.
+        let half = t0
+            .checked_add(Duration::from_millis(500))
+            .expect("representable");
+        assert!(!should_skip_for_suppress(Some(&flag), Some(t0), 5, half));
+        // 1s in: engaged.
+        let full = t0
+            .checked_add(Duration::from_millis(1000))
+            .expect("representable");
+        assert!(should_skip_for_suppress(Some(&flag), Some(t0), 5, full));
+    }
+
+    #[test]
+    fn releases_immediately_when_flag_clears() {
+        let flag = AtomicBool::new(false);
+        let t0 = Instant::now();
+        assert!(!should_skip_for_suppress(
+            Some(&flag),
+            Some(t0),
+            5,
+            now_after(10)
+        ));
+    }
+
+    #[test]
+    fn unrecorded_onset_does_not_engage() {
+        let flag = AtomicBool::new(true);
+        // High flag but the caller hasn't recorded an onset yet → not engaged.
+        assert!(!should_skip_for_suppress(
+            Some(&flag),
+            None,
+            5,
+            Instant::now()
+        ));
+    }
 }
 
 /// Resolve the AVC444-vs-AVC420 codec decision from the configured preference,
