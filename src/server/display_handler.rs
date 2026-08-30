@@ -2106,8 +2106,15 @@ impl LamcoDisplayHandler {
                             let actual_h = f.height as u16;
 
                             {
+                                // Resolution support: the BitmapConverter serves
+                                // the RDP desktop (bitmap fallback path), so it
+                                // must be sized to the DESKTOP, not the capture
+                                // frame. The converter's dirty-region hashing
+                                // runs on what we hand it — after the scaler
+                                // that is desktop-space data.
+                                let desktop = *handler.size.read().await;
                                 let mut converter = handler.bitmap_converter.lock().await;
-                                *converter = BitmapConverter::new(actual_w, actual_h);
+                                *converter = BitmapConverter::new(desktop.width, desktop.height);
                             }
                             handler
                                 .egfx_needs_init
@@ -2687,10 +2694,33 @@ impl LamcoDisplayHandler {
                             "🎬 EGFX channel ready - initializing H.264 encoder (needs_init=true)"
                         );
 
+                        // 2026-08-30 (resolution-support fix): ALL EGFX geometry —
+                        // encoder, surface, ResetGraphics output dims — must be
+                        // DESKTOP-sized, because the pipeline scales capture->desktop
+                        // (frame_scaler) before encoding. Sizing these from
+                        // frame.width/height (capture) fed desktop-sized bitmaps
+                        // into capture-sized encoders/surfaces: 1920x1200 desktops
+                        // showed as a zoomed-in partial (capture 1920x1080 surface).
+                        // Compute the same scaled geometry the pipeline block below
+                        // uses, so init and send agree.
+                        let egfx_scale = { *handler.scale_factors.read() };
+                        let (egfx_fw, egfx_fh): (u32, u32) = if egfx_scale.is_identity() {
+                            (frame.width, frame.height)
+                        } else {
+                            (
+                                (frame.width as u64 * egfx_scale.x.0 as u64
+                                    / egfx_scale.x.1.max(1) as u64)
+                                    as u32,
+                                (frame.height as u64 * egfx_scale.y.0 as u64
+                                    / egfx_scale.y.1.max(1) as u64)
+                                    as u32,
+                            )
+                        };
+
                         // Calculate aligned dimensions first (needed for encoder and surface)
                         use crate::egfx::align_to_16;
-                        let aligned_width = align_to_16(frame.width as u32) as u16;
-                        let aligned_height = align_to_16(frame.height as u32) as u16;
+                        let aligned_width = align_to_16(egfx_fw) as u16;
+                        let aligned_height = align_to_16(egfx_fh) as u16;
 
                         // Create H.264 encoder with resolution-appropriate level
                         // Use config values for quality settings and color space
@@ -2915,8 +2945,11 @@ impl LamcoDisplayHandler {
                         }
                         if let Some(sender) = handler
                             .setup_egfx_surface(
-                                frame.width,
-                                frame.height,
+                                // Resolution support: surface + ResetGraphics
+                                // output dims in DESKTOP space (see the
+                                // egfx_scale computation above).
+                                egfx_fw,
+                                egfx_fh,
                                 aligned_width,
                                 aligned_height,
                             )
@@ -3360,8 +3393,18 @@ impl LamcoDisplayHandler {
                                                 &data,
                                                 aligned_width as u16,
                                                 aligned_height as u16,
-                                                frame.width as u16,
-                                                frame.height as u16,
+                                                // 2026-08-30 (resolution-support fix): the
+                                                // EGFX SURFACE geometry must be DESKTOP
+                                                // space (what the client negotiated),
+                                                // not the capture size. Passing the
+                                                // capture dims here created a
+                                                // capture-sized surface and blitted the
+                                                // scaled (taller/wider) bitmap into it:
+                                                // a 1920x1200 desktop on a 1920x1080
+                                                // surface showed only the top-left
+                                                // portion ("zoomed-in partial desktop").
+                                                frame_width as u16,
+                                                frame_height as u16,
                                                 &damage_regions,
                                                 timestamp_ms as u32,
                                             )
@@ -3374,8 +3417,11 @@ impl LamcoDisplayHandler {
                                                 aux.as_deref(), // Option<Vec<u8>> → Option<&[u8]>
                                                 aligned_width as u16,
                                                 aligned_height as u16,
-                                                frame.width as u16,
-                                                frame.height as u16,
+                                                // Same resolution-support fix as the
+                                                // Single arm: surface geometry in
+                                                // desktop space.
+                                                frame_width as u16,
+                                                frame_height as u16,
                                                 &damage_regions,
                                                 timestamp_ms as u32,
                                             )
@@ -3477,13 +3523,37 @@ impl LamcoDisplayHandler {
                         // little-endian: the 32-bit value 0xXXRRGGBB stores as [BB,GG,RR,XX].
                         // No pixel format conversion needed.
                         let timestamp_ms = (frame.pts / 1_000_000) as u32;
-                        match sender
-                            .send_uncompressed_frame(
+                        // Resolution-support fix: uncompressed WireToSurface1 must
+                        // also carry DESKTOP geometry (scaled), never the capture
+                        // size — the surface lives in desktop space. Re-reading the
+                        // shared factors here is impossible (this arm runs before
+                        // the scaling block only when EGFX is on but no H.264
+                        // encoder exists), so scale explicitly.
+                        let unc_scale = { *handler.scale_factors.read() };
+                        let (unc_w, unc_h): (u16, u16) = if unc_scale.is_identity() {
+                            (frame.width as u16, frame.height as u16)
+                        } else {
+                            let dw = (frame.width as u64 * unc_scale.x.0 as u64
+                                / unc_scale.x.1.max(1) as u64)
+                                as u32;
+                            let dh = (frame.height as u64 * unc_scale.y.0 as u64
+                                / unc_scale.y.1.max(1) as u64)
+                                as u32;
+                            (dw as u16, dh as u16)
+                        };
+                        let unc_scaled: std::sync::Arc<Vec<u8>> = if unc_scale.is_identity() {
+                            std::sync::Arc::clone(pixel_bytes)
+                        } else {
+                            std::sync::Arc::new(crate::server::frame_scaler::scale_bgra(
                                 pixel_bytes,
-                                frame.width as u16,
-                                frame.height as u16,
-                                timestamp_ms,
-                            )
+                                frame.width,
+                                frame.height,
+                                unc_w as u32,
+                                unc_h as u32,
+                            ))
+                        };
+                        match sender
+                            .send_uncompressed_frame(&unc_scaled, unc_w, unc_h, timestamp_ms)
                             .await
                         {
                             Ok(frame_id) => {
@@ -3496,7 +3566,7 @@ impl LamcoDisplayHandler {
                                 if egfx_frames_sent <= 3 || egfx_frames_sent.is_multiple_of(30) {
                                     info!(
                                         "EGFX uncompressed: sent frame {} ({}x{})",
-                                        frame_id, frame.width, frame.height
+                                        frame_id, unc_w, unc_h
                                     );
                                 }
                             }
@@ -3513,15 +3583,25 @@ impl LamcoDisplayHandler {
                     // AVC420 support (e.g., rdpdo, ironrdp-web, minimal clients).
                     if needs_init {
                         use crate::egfx::align_to_16;
-                        let aligned_width = align_to_16(frame.width) as u16;
-                        let aligned_height = align_to_16(frame.height) as u16;
-                        if let Some(sender) = handler
-                            .setup_egfx_surface(
-                                frame.width,
-                                frame.height,
-                                aligned_width,
-                                aligned_height,
+                        // Resolution support: V8 surface also in DESKTOP space —
+                        // the uncompressed arm below scales before sending.
+                        let v8_scale = { *handler.scale_factors.read() };
+                        let (v8_fw, v8_fh): (u32, u32) = if v8_scale.is_identity() {
+                            (frame.width, frame.height)
+                        } else {
+                            (
+                                (frame.width as u64 * v8_scale.x.0 as u64
+                                    / v8_scale.x.1.max(1) as u64)
+                                    as u32,
+                                (frame.height as u64 * v8_scale.y.0 as u64
+                                    / v8_scale.y.1.max(1) as u64)
+                                    as u32,
                             )
+                        };
+                        let aligned_width = align_to_16(v8_fw) as u16;
+                        let aligned_height = align_to_16(v8_fh) as u16;
+                        if let Some(sender) = handler
+                            .setup_egfx_surface(v8_fw, v8_fh, aligned_width, aligned_height)
                             .await
                         {
                             egfx_sender = Some(sender);
@@ -3545,13 +3625,33 @@ impl LamcoDisplayHandler {
 
                         // PipeWire BGRx = RDP XRGB_8888 on little-endian. No conversion needed.
                         let timestamp_ms = (frame.pts / 1_000_000) as u32;
-                        match sender
-                            .send_uncompressed_frame(
-                                pixel_bytes,
-                                frame.width as u16,
-                                frame.height as u16,
-                                timestamp_ms,
+                        // Resolution support: V8 WireToSurface1 in DESKTOP space —
+                        // scale explicitly (this arm runs before the main
+                        // scaling block).
+                        let v8s = { *handler.scale_factors.read() };
+                        let (v8s_w, v8s_h): (u16, u16) = if v8s.is_identity() {
+                            (frame.width as u16, frame.height as u16)
+                        } else {
+                            (
+                                ((frame.width as u64 * v8s.x.0 as u64) / v8s.x.1.max(1) as u64)
+                                    as u16,
+                                ((frame.height as u64 * v8s.y.0 as u64) / v8s.y.1.max(1) as u64)
+                                    as u16,
                             )
+                        };
+                        let v8s_scaled: std::sync::Arc<Vec<u8>> = if v8s.is_identity() {
+                            std::sync::Arc::clone(pixel_bytes)
+                        } else {
+                            std::sync::Arc::new(crate::server::frame_scaler::scale_bgra(
+                                pixel_bytes,
+                                frame.width,
+                                frame.height,
+                                v8s_w as u32,
+                                v8s_h as u32,
+                            ))
+                        };
+                        match sender
+                            .send_uncompressed_frame(&v8s_scaled, v8s_w, v8s_h, timestamp_ms)
                             .await
                         {
                             Ok(frame_id) => {
@@ -3564,7 +3664,7 @@ impl LamcoDisplayHandler {
                                 if egfx_frames_sent <= 3 || egfx_frames_sent.is_multiple_of(30) {
                                     info!(
                                         "EGFX V8 uncompressed: sent frame {} ({}x{})",
-                                        frame_id, frame.width, frame.height
+                                        frame_id, v8s_w, v8s_h
                                     );
                                 }
                             }
@@ -3578,6 +3678,59 @@ impl LamcoDisplayHandler {
                 }
 
                 let convert_start = std::time::Instant::now();
+                // Resolution support: the bitmap (RemoteFX) fallback path goes
+                // through BitmapConverter::convert_frame, which reads the
+                // VIDEO FRAME's own dimensions. Hand it a DESKTOP-sized frame:
+                // identity is a zero-cost move; otherwise scale the pixels and
+                // rewrite geometry + damage regions into desktop space.
+                let bmp_scale = { *handler.scale_factors.read() };
+                let frame = if bmp_scale.is_identity() {
+                    frame
+                } else {
+                    let pixel_bytes = match &frame.buffer {
+                        lamco_pipewire::FrameBuffer::Memory(data) => std::sync::Arc::clone(data),
+                        lamco_pipewire::FrameBuffer::DmaBuf(_) => {
+                            // The bitmap path cannot read DMA-BUF; drop rather
+                            // than send geometry-mismatched data.
+                            frames_dropped += 1;
+                            continue;
+                        }
+                    };
+                    let dw = (frame.width as u64 * bmp_scale.x.0 as u64
+                        / bmp_scale.x.1.max(1) as u64) as u32;
+                    let dh = (frame.height as u64 * bmp_scale.y.0 as u64
+                        / bmp_scale.y.1.max(1) as u64) as u32;
+                    let scaled = crate::server::frame_scaler::scale_bgra(
+                        &pixel_bytes,
+                        frame.width,
+                        frame.height,
+                        dw,
+                        dh,
+                    );
+                    let mut f = frame.clone();
+                    f.buffer = lamco_pipewire::FrameBuffer::Memory(std::sync::Arc::new(scaled));
+                    f.width = dw;
+                    f.height = dh;
+                    f.damage_regions = frame
+                        .damage_regions
+                        .iter()
+                        .map(|r| {
+                            let m = bmp_scale.map_rect_out((
+                                r.x.max(0) as u32,
+                                r.y.max(0) as u32,
+                                (r.x.max(0) as u32).saturating_add(r.width.max(0) as u32),
+                                (r.y.max(0) as u32).saturating_add(r.height.max(0) as u32),
+                            ));
+                            lamco_pipewire::FfiDamageRegion {
+                                x: m.0 as i32,
+                                y: m.1 as i32,
+                                width: m.2.saturating_sub(m.0),
+                                height: m.3.saturating_sub(m.1),
+                            }
+                        })
+                        .collect();
+                    f
+                };
                 let bitmap_update = match handler.convert_to_bitmap(frame).await {
                     Ok(bitmap) => bitmap,
                     Err(e) => {
