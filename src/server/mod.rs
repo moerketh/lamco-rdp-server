@@ -71,6 +71,7 @@ mod dmabuf_materialize;
 mod egfx_sender;
 #[expect(dead_code, reason = "WIP: not yet integrated into the server pipeline")]
 mod event_multiplexer;
+mod frame_scaler;
 mod gfx_factory;
 mod graphics_drain;
 mod input_handler;
@@ -995,6 +996,7 @@ impl LamcoRdpServer {
                     input_tx,
                     input_rx,
                     shutdown_broadcast.subscribe(),
+                    display_handler.scale_factors_handle(), // Desktop->capture pointer mapping
                 )
                 .context("Failed to create wlr-direct input handler")?;
 
@@ -1030,6 +1032,14 @@ impl LamcoRdpServer {
                         None
                     })
                     .with_sound_factory(Some(Box::new(sound_factory)))
+                    // Resolution support: honor the client's requested desktop
+                    // size (dialog choice), clamped to 3840x2160. The display
+                    // handler bridges compositor mismatch via the scaler.
+                    // BuilderDone-phase method (same phase as sound factory).
+                    .with_honor_client_desktop_size(Some(ironrdp_server::DesktopSize {
+                        width: 3840,
+                        height: 2160,
+                    }))
                     .build()
             } else {
                 // ScreenCast-only: view-only, no input
@@ -1058,6 +1068,11 @@ impl LamcoRdpServer {
                         None
                     })
                     .with_sound_factory(Some(Box::new(sound_factory)))
+                    // Resolution support (view-only too): same honor flag.
+                    .with_honor_client_desktop_size(Some(ironrdp_server::DesktopSize {
+                        width: 3840,
+                        height: 2160,
+                    }))
                     .build()
             };
 
@@ -1349,6 +1364,7 @@ impl LamcoRdpServer {
             input_tx.clone(), // Multiplexer input queue sender (for handler callbacks)
             input_rx,         // Multiplexer input queue receiver (for batching task)
             shutdown_broadcast.subscribe(), // Shutdown signal for batching task
+            display_handler.scale_factors_handle(), // Desktop->capture pointer mapping
         )
         .context("Failed to create input handler")?;
 
@@ -1590,6 +1606,13 @@ impl LamcoRdpServer {
                 None
             })
             .with_sound_factory(Some(Box::new(sound_factory)))
+            // Resolution support: honor the client's requested desktop size
+            // (dialog choice), clamped to 3840x2160. The display handler
+            // bridges any compositor mismatch via the scaler.
+            .with_honor_client_desktop_size(Some(ironrdp_server::DesktopSize {
+                width: 3840,
+                height: 2160,
+            }))
             .build();
 
         display_handler

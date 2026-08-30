@@ -232,6 +232,12 @@ fn build_cursor_theme_manager(
 /// requested resolution. Modes are listed as "N:WxH@rate" on the Modes: line.
 /// Returns the (width, height) of the best matching mode, or the requested
 /// size if no modes are found.
+///
+/// 2026-08-29 (resolution-support work): exact matches are now preferred
+/// BEFORE the pixel-diff heuristic. hyperv_drm lists 18 modes including
+/// 1280x1024; the old pure pixel-count match turned a 1280x1024 request into
+/// 1024x768 (0.52 Mpx diff) — a wrong-aspect 4:3 snap. Exact match first,
+/// then closest by pixel count.
 fn find_best_mode(kscreen_output: &str, req_w: u32, req_h: u32) -> (u32, u32) {
     let req_pixels = req_w as u64 * req_h as u64;
     let mut best: Option<(u32, u32, u64)> = None; // (w, h, pixel_diff)
@@ -262,6 +268,12 @@ fn find_best_mode(kscreen_output: &str, req_w: u32, req_h: u32) -> (u32, u32) {
             let Ok(h) = h_str.parse::<u32>() else {
                 continue;
             };
+
+            // Exact match wins immediately — the compositor can serve the
+            // requested size natively with no scaling.
+            if (w, h) == (req_w, req_h) {
+                return (w, h);
+            }
 
             let mode_pixels = w as u64 * h as u64;
             let diff = mode_pixels.abs_diff(req_pixels);
@@ -463,8 +475,24 @@ impl FrameRateRegulator {
 /// through the EGFX channel for better quality and compression. Falls back
 /// to RemoteFX when H.264 is not available.
 pub struct LamcoDisplayHandler {
-    /// Current desktop size
+    /// Current desktop size — the RDP-visible geometry.
+    ///
+    /// 2026-08-30 (resolution support): the RDP desktop size is DECOUPLED from
+    /// the compositor capture size. hyperv_drm exposes a fixed mode list
+    /// (max 1920x1080), so a client requesting 2560x1440 gets that desktop by
+    /// upscaling captured frames (see `frame_scaler`); a client requesting
+    /// 1280x1024 gets it either from an exact mode switch (when listed) or by
+    /// downscaling. `capture_size` tracks what the compositor actually delivers.
     size: Arc<RwLock<DesktopSize>>,
+
+    /// Current compositor capture size (what PipeWire delivers). May differ
+    /// from `size` whenever no exact DRM mode matches the client's request.
+    capture_size: Arc<RwLock<(u32, u32)>>,
+
+    /// Active capture->desktop scale factors. Identity when sizes match.
+    /// Written whenever either size changes; read by the pipeline per frame
+    /// and by the input handler for the inverse mapping.
+    scale_factors: Arc<parking_lot::RwLock<crate::server::frame_scaler::ScaleFactors>>,
 
     /// PipeWire thread manager
     pipewire_thread: Arc<Mutex<PipeWireThreadManager>>,
@@ -699,6 +727,15 @@ impl LamcoDisplayHandler {
 
         Ok(Self {
             size,
+            capture_size: Arc::new(RwLock::new((initial_width as u32, initial_height as u32))),
+            scale_factors: Arc::new(parking_lot::RwLock::new(
+                crate::server::frame_scaler::ScaleFactors::new(
+                    initial_width as u32,
+                    initial_height as u32,
+                    initial_width as u32,
+                    initial_height as u32,
+                ),
+            )),
             pipewire_thread,
             bitmap_converter,
             update_sender,
@@ -794,6 +831,15 @@ impl LamcoDisplayHandler {
 
         Ok(Self {
             size,
+            capture_size: Arc::new(RwLock::new((initial_width as u32, initial_height as u32))),
+            scale_factors: Arc::new(parking_lot::RwLock::new(
+                crate::server::frame_scaler::ScaleFactors::new(
+                    initial_width as u32,
+                    initial_height as u32,
+                    initial_width as u32,
+                    initial_height as u32,
+                ),
+            )),
             pipewire_thread,
             bitmap_converter,
             update_sender,
@@ -1343,15 +1389,61 @@ impl LamcoDisplayHandler {
     ///
     /// Called when monitor configuration changes or client requests resize.
     pub async fn update_size(&self, width: u16, height: u16) {
-        let mut size = self.size.write().await;
-        size.width = width;
-        size.height = height;
+        {
+            let mut size = self.size.write().await;
+            size.width = width;
+            size.height = height;
+            self.recompute_scale_factors(&size).await;
+        }
         debug!("Updated display size to {}x{}", width, height);
 
         let update = DisplayUpdate::Resize(DesktopSize { width, height });
         if let Err(e) = self.update_sender.lock().await.send(update).await {
             warn!("Failed to send resize update: {}", e);
         }
+    }
+
+    /// Recompute capture->desktop scale factors from the two current sizes.
+    ///
+    /// Callers must hold the `size` write lock (or otherwise guarantee
+    /// exclusivity); `capture_size` is read under its own lock.
+    async fn recompute_scale_factors(&self, desktop: &DesktopSize) {
+        let (cw, ch) = *self.capture_size.read().await;
+        let factors = crate::server::frame_scaler::ScaleFactors::new(
+            cw,
+            ch,
+            desktop.width as u32,
+            desktop.height as u32,
+        );
+        *self.scale_factors.write() = factors;
+        if !factors.is_identity() {
+            info!(
+                "Scaling enabled: capture {}x{} -> desktop {}x{} (video scaled, input inverse-mapped)",
+                cw, ch, desktop.width, desktop.height
+            );
+        }
+    }
+
+    /// Record a new CAPTURE (compositor/PipeWire) size and refresh the scale
+    /// factors. Called when the compositor's actual output changes (exact
+    /// mode match during resize, or first-frame truth after stream recreation).
+    pub async fn update_capture_size(&self, width: u32, height: u32) {
+        {
+            let mut cap = self.capture_size.write().await;
+            if (cap.0, cap.1) == (width, height) {
+                return;
+            }
+            (cap.0, cap.1) = (width, height);
+        }
+        let desktop = *self.size.read().await;
+        self.recompute_scale_factors(&desktop).await;
+    }
+
+    /// Shared scale factors for the input handler's inverse mapping.
+    pub fn scale_factors_handle(
+        &self,
+    ) -> Arc<parking_lot::RwLock<crate::server::frame_scaler::ScaleFactors>> {
+        Arc::clone(&self.scale_factors)
     }
 
     /// Get a shared reference to the update sender for graphics drain task
@@ -2020,10 +2112,20 @@ impl LamcoDisplayHandler {
                             handler
                                 .egfx_needs_init
                                 .store(true, std::sync::atomic::Ordering::SeqCst);
-                            handler.update_size(actual_w, actual_h).await;
+                            // 2026-08-30 (resolution support): the frame reveals
+                            // the CAPTURE size the compositor actually negotiated.
+                            // The RDP DESKTOP stays at the size the client asked
+                            // for (set when the resize was requested); only the
+                            // capture size and scale factors update here. The
+                            // pre-scaler existing work updated `size` — which
+                            // forced the desktop back to the compositor mode and
+                            // defeated honoring the client's request.
+                            handler
+                                .update_capture_size(actual_w as u32, actual_h as u32)
+                                .await;
 
                             info!(
-                                "Resize finalized from first frame: {}x{} (compositor negotiated)",
+                                "Resize finalized from first frame: capture {}x{} (compositor negotiated), desktop stays client-requested",
                                 actual_w, actual_h
                             );
                         }
@@ -2932,6 +3034,44 @@ impl LamcoDisplayHandler {
                             continue;
                         }
 
+                        // === CAPTURE -> DESKTOP SCALING (resolution support) ===
+                        // When the client's desktop size differs from the
+                        // compositor capture (hyperv_drm's fixed mode list),
+                        // scale the frame and map damage regions into desktop
+                        // space. Identity fast path: two lock reads and no copy.
+                        let scale = { *handler.scale_factors.read() };
+                        let (pixel_data, frame_width, frame_height): (
+                            std::sync::Arc<Vec<u8>>,
+                            u32,
+                            u32,
+                        ) = if scale.is_identity() {
+                            (pixel_data, frame.width, frame.height)
+                        } else {
+                            let dw = (frame.width as u64 * scale.x.0 as u64
+                                / scale.x.1.max(1) as u64)
+                                as u32;
+                            let dh = (frame.height as u64 * scale.y.0 as u64
+                                / scale.y.1.max(1) as u64)
+                                as u32;
+                            let scaled = crate::server::frame_scaler::scale_bgra(
+                                &pixel_data,
+                                frame.width,
+                                frame.height,
+                                dw,
+                                dh,
+                            );
+                            debug!(
+                                "Scaled frame {}x{} -> {}x{} ({}B -> {}B)",
+                                frame.width,
+                                frame.height,
+                                dw,
+                                dh,
+                                pixel_data.len(),
+                                scaled.len()
+                            );
+                            (std::sync::Arc::new(scaled), dw, dh)
+                        };
+
                         // === DAMAGE DETECTION (Config-controlled) ===
                         // Detect which regions changed since the last frame
                         // Skip encoding entirely if nothing changed (huge bandwidth savings)
@@ -2968,7 +3108,7 @@ impl LamcoDisplayHandler {
                                     "Forcing full frame for periodic IDR (bypassing damage detection)"
                                 );
                             }
-                            vec![DamageRegion::full_frame(frame.width, frame.height)]
+                            vec![DamageRegion::full_frame(frame_width, frame_height)]
                         } else if let Some(ref mut detector) = damage_detector_opt {
                             // Pixel-diff damage detection (SIMD, ~1.9ms at 1080p).
                             //
@@ -2980,21 +3120,38 @@ impl LamcoDisplayHandler {
                             // over". Over-reporting (hints larger than diff) is common
                             // and harmless; under-reporting is user-visible breakage.
                             // detect() also keeps the reference frame synchronized.
+                            // NOTE: detection runs on the SCALED buffer, so regions
+                            // arrive in desktop space and need no further mapping.
                             damage_source = "pixel-diff";
-                            detector.detect(&pixel_data, frame.width, frame.height)
+                            detector.detect(&pixel_data, frame_width, frame_height)
                         } else if !frame.damage_regions.is_empty() {
                             // No detector available — fall back to compositor hints
                             // (zero CPU cost, but susceptible to under-reporting).
+                            // Hints arrive in CAPTURE space — map into desktop
+                            // space with rect-round-out so nothing is dropped.
                             damage_source = "compositor-hint";
                             frame
                                 .damage_regions
                                 .iter()
-                                .map(|r| DamageRegion::from(*r))
+                                .map(|r| {
+                                    let mapped = scale.map_rect_out((
+                                        r.x.max(0) as u32,
+                                        r.y.max(0) as u32,
+                                        (r.x.max(0) as u32).saturating_add(r.width.max(0) as u32),
+                                        (r.y.max(0) as u32).saturating_add(r.height.max(0) as u32),
+                                    ));
+                                    DamageRegion::new(
+                                        mapped.0,
+                                        mapped.1,
+                                        mapped.2.saturating_sub(mapped.0),
+                                        mapped.3.saturating_sub(mapped.1),
+                                    )
+                                })
                                 .collect()
                         } else {
                             // Damage tracking disabled - use full frame
                             damage_source = "disabled";
-                            vec![DamageRegion::full_frame(frame.width, frame.height)]
+                            vec![DamageRegion::full_frame(frame_width, frame_height)]
                         };
 
                         // Prepend damage from previously consumed-but-unsent
@@ -3011,8 +3168,8 @@ impl LamcoDisplayHandler {
 
                         let damage_ratio = pipeline_decisions::compute_damage_ratio(
                             &damage_regions,
-                            frame.width,
-                            frame.height,
+                            frame_width,
+                            frame_height,
                         );
 
                         if adaptive_fps_enabled {
@@ -3131,15 +3288,15 @@ impl LamcoDisplayHandler {
                         // Frame from PipeWire may not be aligned (e.g., 800×600)
                         // Must align dimensions AND pad frame data
                         // (Transform already applied above, before the EGFX/bitmap fork)
-                        let aligned_width = align_to_16(frame.width);
-                        let aligned_height = align_to_16(frame.height);
+                        let aligned_width = align_to_16(frame_width);
+                        let aligned_height = align_to_16(frame_height);
 
                         let frame_data =
-                            if aligned_width != frame.width || aligned_height != frame.height {
+                            if aligned_width != frame_width || aligned_height != frame_height {
                                 Self::pad_frame_to_aligned(
                                     &pixel_data,
-                                    frame.width,
-                                    frame.height,
+                                    frame_width,
+                                    frame_height,
                                     aligned_width,
                                     aligned_height,
                                 )
@@ -3569,28 +3726,52 @@ impl RdpServerDisplay for LamcoDisplayHandler {
 
     /// Called by IronRDP during capability set processing.
     ///
-    /// The server passes the client's requested desktop size (from the Bitmap
-    /// capability set). We return the current compositor size unchanged — the
-    /// RDP desktop must match the compositor's actual resolution to avoid
-    /// coordinate mismatches and cropping.
+    /// 2026-08-30 (resolution support, Phase 1): ADOPT the client's requested
+    /// desktop size instead of echoing the compositor size. The client's
+    /// dialog choice (mstsc 2560x1440, vmconnect 1920x1200, ...) becomes the
+    /// RDP desktop; the compositor is separately switched to the closest
+    /// listed DRM mode (exact match preferred), and any remaining mismatch is
+    /// bridged by scaling frames capture->desktop (`frame_scaler`).
     ///
-    /// Dynamic resolution changes happen later via `request_layout()` when the
-    /// RDP client resizes its window (Display Control channel).
+    /// This replaces the Aug-19 approach ("keep compositor size to avoid
+    /// mismatch") — that worked only because nothing bridged the mismatch;
+    /// the scaler now does.
     async fn request_initial_size(&mut self, client_size: DesktopSize) -> DesktopSize {
         let current = {
             let s = self.size.read().await;
             *s
         };
 
+        if client_size == current {
+            info!(
+                "request_initial_size: client requested {}x{} — matches current desktop",
+                client_size.width, client_size.height
+            );
+            return current;
+        }
+
+        // Best-effort compositor pre-switch: try to make the capture match the
+        // requested desktop natively (exact listed mode first). On KDE this
+        // snaps hyperv_drm to e.g. 1280x1024 when listed; on GNOME it's a
+        // no-op (mutter captures at the requested size regardless).
+        let (mode_w, mode_h) = change_compositor_resolution(client_size.width, client_size.height);
+
+        // Record what the compositor will actually deliver. The first frame
+        // after this may still report the old size (mode switch latency); the
+        // deferred first-frame truth in the pipeline corrects it then.
+        self.update_capture_size(mode_w as u32, mode_h as u32).await;
+
+        // The desktop becomes what the client asked for — NOT the compositor
+        // mode: bridging happens in the scaler.
+        self.update_size(client_size.width, client_size.height)
+            .await;
+
         info!(
-            "request_initial_size: client requested {}x{}, keeping compositor size {}x{}",
-            client_size.width, client_size.height, current.width, current.height
+            "request_initial_size: adopted client desktop {}x{} (compositor mode {}x{})",
+            client_size.width, client_size.height, mode_w, mode_h
         );
 
-        // Return the current compositor size — do NOT change the compositor
-        // here, as the RDP desktop was already negotiated at size() and
-        // changing it would cause a mismatch.
-        current
+        client_size
     }
 
     /// Called once per connection to establish the update stream.
@@ -3857,6 +4038,8 @@ impl Clone for LamcoDisplayHandler {
             stream_active_flag: parking_lot::RwLock::new(self.stream_active_flag.read().clone()),
             direct_channel_mode: self.direct_channel_mode,
             use_dmabuf: Arc::clone(&self.use_dmabuf),
+            capture_size: Arc::clone(&self.capture_size),
+            scale_factors: Arc::clone(&self.scale_factors),
         }
     }
 }

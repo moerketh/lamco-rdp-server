@@ -369,6 +369,14 @@ pub struct LamcoInputHandler {
 
     /// Input event queue sender (for multiplexer - bounded with drop policy)
     input_tx: mpsc::Sender<InputEvent>,
+    /// Capture->desktop scale factors (resolution support).
+    ///
+    /// RDP pointer coordinates arrive in DESKTOP space; input injection
+    /// targets the compositor in CAPTURE space. When the client's chosen
+    /// desktop differs from the capture (hyperv_drm fixed modes), events are
+    /// inverse-mapped here. Shared with the display handler so the factors
+    /// track live resizes.
+    scale_factors: Arc<parking_lot::RwLock<crate::server::frame_scaler::ScaleFactors>>,
 }
 
 impl LamcoInputHandler {
@@ -379,6 +387,7 @@ impl LamcoInputHandler {
         input_tx: mpsc::Sender<InputEvent>,
         mut input_rx: mpsc::Receiver<InputEvent>,
         mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
+        scale_factors: Arc<parking_lot::RwLock<crate::server::frame_scaler::ScaleFactors>>,
     ) -> Result<Self, InputError> {
         let keyboard_handler = Arc::new(Mutex::new(KeyboardHandler::new()));
         let mouse_handler = Arc::new(Mutex::new(MouseHandler::new()));
@@ -396,6 +405,7 @@ impl LamcoInputHandler {
         let keyboard_clone = Arc::clone(&keyboard_handler);
         let mouse_clone = Arc::clone(&mouse_handler);
         let coord_clone = Arc::clone(&coordinate_transformer);
+        let scale_clone = Arc::clone(&scale_factors);
 
         tokio::spawn(async move {
             let mut keyboard_batch = Vec::with_capacity(16);
@@ -464,6 +474,7 @@ impl LamcoInputHandler {
                                 &session_handle_clone,
                                 &mouse_clone,
                                 &coord_clone,
+                                &scale_clone,
                                 mouse_event,
                                 primary_stream_id
                             ).await {
@@ -511,6 +522,7 @@ impl LamcoInputHandler {
             coordinate_transformer,
             primary_stream_id,
             input_tx,
+            scale_factors,
         })
     }
 
@@ -730,16 +742,38 @@ impl LamcoInputHandler {
         session_handle: &Arc<dyn crate::session::SessionHandle>,
         mouse_handler: &Arc<Mutex<MouseHandler>>,
         coordinate_transformer: &Arc<Mutex<CoordinateTransformer>>,
+        scale_factors: &Arc<parking_lot::RwLock<crate::server::frame_scaler::ScaleFactors>>,
         event: IronMouseEvent,
         stream_id: u32,
     ) -> Result<(), InputError> {
         let mut mouse = mouse_handler.lock().await;
         let mut transformer = coordinate_transformer.lock().await;
 
+        // Resolution support: RDP pointer coordinates arrive in DESKTOP
+        // space. Inverse-map them into CAPTURE (compositor) space before the
+        // monitor transformer sees them, so final injection matches what the
+        // client is pointing at on its (possibly scaled) desktop. Identity
+        // fast path is exact — no arithmetic when factors are (1,1).
+        let inv = {
+            let f = scale_factors.read();
+            (f.x, f.y)
+        };
+        let map_event = |x: u16, y: u16| -> (u16, u16) {
+            if inv == ((1, 1), (1, 1)) {
+                return (x, y);
+            }
+            // desktop -> capture: multiply by den/num per axis (the inverse
+            // of the video direction's num/den), clamped to pointer range.
+            let fx = ((x as u64 * inv.0.1 as u64) / inv.0.0.max(1) as u64).min(u16::MAX as u64);
+            let fy = ((y as u64 * inv.1.1 as u64) / inv.1.0.max(1) as u64).min(u16::MAX as u64);
+            (fx as u16, fy as u16)
+        };
+
         match event {
             IronMouseEvent::Move { x, y } => {
                 trace!("Mouse move: x={}, y={}", x, y);
 
+                let (x, y) = map_event(x, y);
                 let mouse_event =
                     mouse.handle_absolute_move(x as u32, y as u32, &mut transformer)?;
 
@@ -928,6 +962,7 @@ impl Clone for LamcoInputHandler {
             coordinate_transformer: Arc::clone(&self.coordinate_transformer),
             primary_stream_id: self.primary_stream_id,
             input_tx: self.input_tx.clone(),
+            scale_factors: Arc::clone(&self.scale_factors),
         }
     }
 }
