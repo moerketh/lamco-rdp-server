@@ -517,15 +517,6 @@ pub struct LamcoDisplayHandler {
     /// and by the input handler for the inverse mapping.
     scale_factors: Arc<parking_lot::RwLock<crate::server::frame_scaler::ScaleFactors>>,
 
-    /// Connect-time capture-size transition pending (resolution support).
-    ///
-    /// Set by `request_initial_size` when it changes the desktop (and possibly
-    /// pre-switches the compositor mode); cleared by the pipeline's first-frame
-    /// truth, which records the capture size the PipeWire stream ACTUALLY
-    /// negotiated. Mirrors `pending_resize` in the pipeline loop, but for the
-    /// connect path where no local stream recreation happens.
-    connect_transition_pending: Arc<std::sync::atomic::AtomicBool>,
-
     /// PipeWire thread manager
     pipewire_thread: Arc<Mutex<PipeWireThreadManager>>,
 
@@ -768,7 +759,6 @@ impl LamcoDisplayHandler {
                     initial_height as u32,
                 ),
             )),
-            connect_transition_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             pipewire_thread,
             bitmap_converter,
             update_sender,
@@ -873,7 +863,6 @@ impl LamcoDisplayHandler {
                     initial_height as u32,
                 ),
             )),
-            connect_transition_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             pipewire_thread,
             bitmap_converter,
             update_sender,
@@ -2218,25 +2207,33 @@ impl LamcoDisplayHandler {
                             );
                         }
 
-                        // Connect-time transition truth (resolution support):
-                        // request_initial_size deferred the capture-size record
-                        // until the stream actually delivers a frame, because
-                        // the pre-switch's claimed mode may never land (KWin
-                        // ignored it) or land late (stream renegotiated at the
-                        // old size first). This frame IS the truth: record it.
-                        // The desktop stays at the adopted client size; only
-                        // capture_size and the scale factors are set.
-                        if handler
-                            .connect_transition_pending
-                            .swap(false, std::sync::atomic::Ordering::AcqRel)
+                        // Continuous capture-size tracking (resolution support).
+                        //
+                        // The PipeWire stream can (re)negotiate its size at ANY
+                        // time — whenever KWin's output mode changes (a connect-
+                        // or resize-time mode switch), the stream keeps serving
+                        // the OLD size for a while and then flaps to the new
+                        // one. One-shot "first frame is truth" logic (both the
+                        // old resize finalize and the connect-transition flag
+                        // it replaced) records the PRE-renegotiation size and
+                        // then misses the real one: on TEST_20260830230908 the
+                        // 1366x768 mode switch made the stream serve 1920x1080
+                        // first, then renegotiate to 1366x768 a minute later —
+                        // stale factors double-scaled every frame afterwards
+                        // (surface 976x560!) and the mouse inverse-mapped into
+                        // a size that no longer existed. Tracking per frame is
+                        // one comparison and self-heals every transition.
                         {
-                            handler
-                                .update_capture_size(f.width as u32, f.height as u32)
-                                .await;
-                            info!(
-                                "Connect transition finalized from first frame: capture {}x{} (stream-negotiated truth)",
-                                f.width, f.height
-                            );
+                            let (cw, ch) = *handler.capture_size.read().await;
+                            if (f.width, f.height) != (cw, ch) {
+                                info!(
+                                    "Capture size changed: {}x{} -> {}x{} (stream renegotiated)",
+                                    cw, ch, f.width, f.height
+                                );
+                                handler
+                                    .update_capture_size(f.width as u32, f.height as u32)
+                                    .await;
+                            }
                         }
 
                         // Report recovery if we previously flagged a stall
@@ -2797,26 +2794,17 @@ impl LamcoDisplayHandler {
                         );
 
                         // 2026-08-30 (resolution-support fix): ALL EGFX geometry —
-                        // encoder, surface, ResetGraphics output dims — must be
-                        // DESKTOP-sized, because the pipeline scales capture->desktop
-                        // (frame_scaler) before encoding. Sizing these from
-                        // frame.width/height (capture) fed desktop-sized bitmaps
-                        // into capture-sized encoders/surfaces: 1920x1200 desktops
-                        // showed as a zoomed-in partial (capture 1920x1080 surface).
-                        // Compute the same scaled geometry the pipeline block below
-                        // uses, so init and send agree.
-                        let egfx_scale = { *handler.scale_factors.read() };
-                        let (egfx_fw, egfx_fh): (u32, u32) = if egfx_scale.is_identity() {
-                            (frame.width, frame.height)
-                        } else {
-                            (
-                                (frame.width as u64 * egfx_scale.x.0 as u64
-                                    / egfx_scale.x.1.max(1) as u64)
-                                    as u32,
-                                (frame.height as u64 * egfx_scale.y.0 as u64
-                                    / egfx_scale.y.1.max(1) as u64)
-                                    as u32,
-                            )
+                        // encoder, surface, ResetGraphics output dims — comes
+                        // from the DESKTOP size (self.size), never from
+                        // frame.width/height (capture) nor recomputed
+                        // frame×factors (stale during stream renegotiation
+                        // windows — a renegotiated capture with old factors
+                        // produced a 976x560 surface on TEST_20260830230908).
+                        // The desktop size is the negotiated truth; the
+                        // scaler adapts capture frames to it per frame.
+                        let (egfx_fw, egfx_fh): (u32, u32) = {
+                            let s = handler.size.read().await;
+                            (s.width as u32, s.height as u32)
                         };
 
                         // Calculate aligned dimensions first (needed for encoder and surface)
@@ -3685,20 +3673,13 @@ impl LamcoDisplayHandler {
                     // AVC420 support (e.g., rdpdo, ironrdp-web, minimal clients).
                     if needs_init {
                         use crate::egfx::align_to_16;
-                        // Resolution support: V8 surface also in DESKTOP space —
-                        // the uncompressed arm below scales before sending.
-                        let v8_scale = { *handler.scale_factors.read() };
-                        let (v8_fw, v8_fh): (u32, u32) = if v8_scale.is_identity() {
-                            (frame.width, frame.height)
-                        } else {
-                            (
-                                (frame.width as u64 * v8_scale.x.0 as u64
-                                    / v8_scale.x.1.max(1) as u64)
-                                    as u32,
-                                (frame.height as u64 * v8_scale.y.0 as u64
-                                    / v8_scale.y.1.max(1) as u64)
-                                    as u32,
-                            )
+                        // Resolution support: V8 surface in DESKTOP space — the
+                        // uncompressed arm below scales before sending. Read
+                        // desktop size directly (immune to stale factors during
+                        // stream renegotiation windows).
+                        let (v8_fw, v8_fh): (u32, u32) = {
+                            let s = handler.size.read().await;
+                            (s.width as u32, s.height as u32)
                         };
                         let aligned_width = align_to_16(v8_fw) as u16;
                         let aligned_height = align_to_16(v8_fh) as u16;
@@ -4012,23 +3993,12 @@ impl RdpServerDisplay for LamcoDisplayHandler {
         let (mode_w, mode_h) = change_compositor_resolution(client_size.width, client_size.height);
 
         // 2026-08-30 (follow-up fix): do NOT record the pre-switch's CLAIMED
-        // mode as capture_size. Two observed failure modes when we did:
-        // (1) the claimed mode never lands (KWin ignored it) and the first
-        //     frame reports a different size — factors were computed against
-        //     fiction and the second connection inherited stale state;
-        // (2) the mode lands AFTER the PipeWire stream negotiated at the old
-        //     size — the stream flaps (Paused→Streaming at a new size) and
-        //     the EGFX init never completes (black screen).
-        // Instead: mark a connect-transition so the PIPELINE's first-frame
-        // truth records the actually-negotiated capture size, exactly like
-        // the Display-Control resize path. The initial scale factors are
-        // computed from the CURRENT capture size as a best guess and
-        // self-correct on the first frame.
-        self.connect_transition_pending
-            .store(true, std::sync::atomic::Ordering::Release);
-
-        // The desktop becomes what the client asked for — NOT the compositor
-        // mode: bridging happens in the scaler.
+        // mode as capture_size — the claim may never land (KWin ignores it)
+        // or land LATE, making the PipeWire stream renegotiate after the
+        // first frame. The pipeline now tracks capture size CONTINUOUSLY per
+        // frame ("Capture size changed: ..."), so every transition — early,
+        // late, or repeated — self-heals. No one-shot flag to set; nothing to
+        // trust here.
         self.update_size(client_size.width, client_size.height)
             .await;
 
@@ -4306,7 +4276,6 @@ impl Clone for LamcoDisplayHandler {
             use_dmabuf: Arc::clone(&self.use_dmabuf),
             capture_size: Arc::clone(&self.capture_size),
             scale_factors: Arc::clone(&self.scale_factors),
-            connect_transition_pending: Arc::clone(&self.connect_transition_pending),
         }
     }
 }
