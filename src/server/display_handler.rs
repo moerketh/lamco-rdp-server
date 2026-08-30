@@ -105,18 +105,30 @@ use crate::{
 /// output's current resolution, so without this step the recreated stream would
 /// still negotiate the old dimensions.
 ///
-/// If the exact requested resolution is not available (e.g., the client asks for
-/// 2560x1440 but the DRM driver only supports up to 1920x1080), the closest
-/// available mode is selected by total pixel count.
+/// 2026-08-30 (resolution-support follow-up): this now switches ONLY on an
+/// EXACT mode match. The old closest-by-pixel-count fallback snapped a
+/// 1920x1200 request to 1600x1200 (0.38 Mpx diff beat 1920x1080's 0.62) —
+/// a wrong-aspect mode whose mid-connect switch made the PipeWire stream
+/// renegotiate twice (1920x1080 → 1600x1200), which wedged the EGFX surface
+/// setup and produced a black screen (observed on TEST_20260830204326).
+/// When no exact mode exists, the current mode is KEPT: the scaler bridges
+/// the mismatch cleanly per-axis, and a stable capture beats an aspect-foreign
+/// mode swap every time.
 ///
 /// On GNOME/mutter this is a no-op — mutter's ScreenCast API creates a stream
 /// at the requested resolution regardless of the output mode.
+///
+/// Returns the mode the compositor will ACTUALLY deliver. With no exact match
+/// this is the CURRENT mode (queried from the `*` marker), so callers can
+/// record reality without a switch.
 fn change_compositor_resolution(width: u16, height: u16) -> (u16, u16) {
     // Only attempt on KDE (check env vars and kscreen-doctor availability)
     let xdg_current_desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
     let is_kde = xdg_current_desktop.contains("KDE") || std::env::var("KDE_FULL_SESSION").is_ok();
 
     if !is_kde {
+        // Non-KDE: mutter captures at the requested size regardless of the
+        // output mode, so the "delivered" size is the request itself.
         return (width, height);
     }
 
@@ -130,26 +142,30 @@ fn change_compositor_resolution(width: u16, height: u16) -> (u16, u16) {
         .stderr(std::process::Stdio::piped())
         .output();
 
-    let (best_w, best_h) = match modes_output {
-        Ok(out) if out.status.success() => {
-            let text = String::from_utf8_lossy(&out.stdout);
-            find_best_mode(&text, width as u32, height as u32)
-        }
-        _ => {
-            // Can't query modes — try the exact resolution as a fallback
-            (width as u32, height as u32)
-        }
+    let modes_text = match &modes_output {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).into_owned(),
+        _ => String::new(),
     };
 
-    if (best_w, best_h) == (width as u32, height as u32) {
-        info!("Changing compositor output to {width}x{height} via kscreen-doctor");
+    // Resolve what to do: exact match switches; anything else keeps the
+    // current mode (the `*`-marked entry) so the capture stays stable.
+    let (target_w, target_h) = if let Some((w, h)) = find_exact_mode(&modes_text, width, height) {
+        (w, h)
     } else {
+        let current = current_mode(&modes_text).unwrap_or((width as u32, height as u32));
         info!(
-            "Requested {width}x{height} not available — using closest mode {best_w}x{best_h} via kscreen-doctor"
+            "No exact DRM mode for {width}x{height} — keeping current mode {}x{} \
+             (scaler bridges capture->desktop; aspect-foreign snaps are worse)",
+            current.0, current.1
         );
+        return (current.0 as u16, current.1 as u16);
+    };
+
+    if (target_w, target_h) == (width as u32, height as u32) {
+        info!("Changing compositor output to {width}x{height} via kscreen-doctor");
     }
 
-    let mode_arg = format!("output.1.mode.{best_w}x{best_h}@60");
+    let mode_arg = format!("output.1.mode.{target_w}x{target_h}@60");
 
     let result = std::process::Command::new("kscreen-doctor")
         .arg(&mode_arg)
@@ -168,11 +184,11 @@ fn change_compositor_resolution(width: u16, height: u16) -> (u16, u16) {
 
             if combined.contains("not found") || !output.status.success() {
                 warn!(
-                    "kscreen-doctor failed for {best_w}x{best_h}: {}",
+                    "kscreen-doctor failed for {target_w}x{target_h}: {}",
                     combined.trim()
                 );
             } else {
-                info!("Compositor resolution changed to {best_w}x{best_h}");
+                info!("Compositor resolution changed to {target_w}x{target_h}");
                 // Give the compositor a brief moment to settle the mode change
                 // before we recreate the PipeWire stream.
                 std::thread::sleep(std::time::Duration::from_millis(200));
@@ -181,13 +197,13 @@ fn change_compositor_resolution(width: u16, height: u16) -> (u16, u16) {
         Err(e) => {
             // kscreen-doctor not in PATH or exec error
             warn!(
-                "Could not execute kscreen-doctor for {best_w}x{best_h}: {e} \
+                "Could not execute kscreen-doctor for {target_w}x{target_h}: {e} \
                  — compositor output may stay at previous resolution"
             );
         }
     }
 
-    (best_w as u16, best_h as u16)
+    (target_w as u16, target_h as u16)
 }
 
 /// Build the session-scoped cursor theme manager from config.
@@ -228,34 +244,23 @@ fn build_cursor_theme_manager(
     ))
 }
 
-/// Parse kscreen-doctor --outputs text and find the mode closest to the
+/// Parse kscreen-doctor --outputs text for the mode EXACTLY matching the
 /// requested resolution. Modes are listed as "N:WxH@rate" on the Modes: line.
-/// Returns the (width, height) of the best matching mode, or the requested
-/// size if no modes are found.
 ///
-/// 2026-08-29 (resolution-support work): exact matches are now preferred
-/// BEFORE the pixel-diff heuristic. hyperv_drm lists 18 modes including
-/// 1280x1024; the old pure pixel-count match turned a 1280x1024 request into
-/// 1024x768 (0.52 Mpx diff) — a wrong-aspect 4:3 snap. Exact match first,
-/// then closest by pixel count.
-fn find_best_mode(kscreen_output: &str, req_w: u32, req_h: u32) -> (u32, u32) {
-    let req_pixels = req_w as u64 * req_h as u64;
-    let mut best: Option<(u32, u32, u64)> = None; // (w, h, pixel_diff)
-
+/// Returns None when no exact match exists — callers then keep the current
+/// mode rather than snap to a heuristic one (see
+/// `change_compositor_resolution` for why).
+fn find_exact_mode(kscreen_output: &str, req_w: u16, req_h: u16) -> Option<(u32, u32)> {
     for line in kscreen_output.lines() {
         if !line.contains("Modes:") {
             continue;
         }
-        // Parse mode entries like "1:1024x768@60*!" or "2:1920x1080@60"
         for token in line.split_whitespace() {
             // Token format: "N:WxH@rate" possibly with trailing "*" or "!"
-            // Strip leading number and colon
             let Some((_num, after_colon)) = token.split_once(':') else {
                 continue;
             };
-            // Remove trailing markers like * or !
             let mode_str = after_colon.trim_end_matches(|c| c == '*' || c == '!');
-            // Parse "WxH@rate"
             let Some(size_part) = mode_str.split_once('@') else {
                 continue;
             };
@@ -268,30 +273,48 @@ fn find_best_mode(kscreen_output: &str, req_w: u32, req_h: u32) -> (u32, u32) {
             let Ok(h) = h_str.parse::<u32>() else {
                 continue;
             };
-
-            // Exact match wins immediately — the compositor can serve the
-            // requested size natively with no scaling.
-            if (w, h) == (req_w, req_h) {
-                return (w, h);
-            }
-
-            let mode_pixels = w as u64 * h as u64;
-            let diff = mode_pixels.abs_diff(req_pixels);
-
-            // Prefer the mode with the smallest pixel difference.
-            // On ties, prefer the larger mode (better for the client).
-            if best.is_none() || diff < best.unwrap().2 {
-                best = Some((w, h, diff));
-            } else if diff == best.unwrap().2 && mode_pixels > req_pixels {
-                best = Some((w, h, diff));
+            if (w, h) == (req_w as u32, req_h as u32) {
+                return Some((w, h));
             }
         }
     }
+    None
+}
 
-    match best {
-        Some((w, h, _)) => (w, h),
-        None => (req_w, req_h),
+/// Parse the CURRENT mode (the `*`-marked entry) from kscreen-doctor output.
+///
+/// Used to report what the compositor will actually deliver when no switch
+/// happens. Falls back to None when no marker is found (callers then assume
+/// the requested size — the pre-resolution-support behavior).
+fn current_mode(kscreen_output: &str) -> Option<(u32, u32)> {
+    for line in kscreen_output.lines() {
+        if !line.contains("Modes:") {
+            continue;
+        }
+        for token in line.split_whitespace() {
+            if !token.contains('*') {
+                continue;
+            }
+            let Some((_num, after_colon)) = token.split_once(':') else {
+                continue;
+            };
+            let mode_str = after_colon.trim_end_matches(|c| c == '*' || c == '!');
+            let Some(size_part) = mode_str.split_once('@') else {
+                continue;
+            };
+            let Some((w_str, h_str)) = size_part.0.split_once('x') else {
+                continue;
+            };
+            let Ok(w) = w_str.parse::<u32>() else {
+                continue;
+            };
+            let Ok(h) = h_str.parse::<u32>() else {
+                continue;
+            };
+            return Some((w, h));
+        }
     }
+    None
 }
 
 /// Client-initiated resize request
@@ -493,6 +516,15 @@ pub struct LamcoDisplayHandler {
     /// Written whenever either size changes; read by the pipeline per frame
     /// and by the input handler for the inverse mapping.
     scale_factors: Arc<parking_lot::RwLock<crate::server::frame_scaler::ScaleFactors>>,
+
+    /// Connect-time capture-size transition pending (resolution support).
+    ///
+    /// Set by `request_initial_size` when it changes the desktop (and possibly
+    /// pre-switches the compositor mode); cleared by the pipeline's first-frame
+    /// truth, which records the capture size the PipeWire stream ACTUALLY
+    /// negotiated. Mirrors `pending_resize` in the pipeline loop, but for the
+    /// connect path where no local stream recreation happens.
+    connect_transition_pending: Arc<std::sync::atomic::AtomicBool>,
 
     /// PipeWire thread manager
     pipewire_thread: Arc<Mutex<PipeWireThreadManager>>,
@@ -736,6 +768,7 @@ impl LamcoDisplayHandler {
                     initial_height as u32,
                 ),
             )),
+            connect_transition_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             pipewire_thread,
             bitmap_converter,
             update_sender,
@@ -840,6 +873,7 @@ impl LamcoDisplayHandler {
                     initial_height as u32,
                 ),
             )),
+            connect_transition_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             pipewire_thread,
             bitmap_converter,
             update_sender,
@@ -1437,6 +1471,53 @@ impl LamcoDisplayHandler {
         }
         let desktop = *self.size.read().await;
         self.recompute_scale_factors(&desktop).await;
+
+        // 2026-08-30 (resolution-support fix): re-sync the input transformer's
+        // monitor geometry to the new capture size. The transformer maps
+        // (already inverse-scaled) capture-space coordinates into per-stream
+        // space using the monitor list built at construction from the ORIGINAL
+        // stream_info. After a capture-size change the stale geometry made
+        // clicks land offset by the old/new size ratio (observed on
+        // TEST_20260830204326: 1600x1200-era transformer with a 1920x1080
+        // desktop — mouse "sync off", nothing clickable).
+        if let Some(ref ih) = *self.input_handler.read().await {
+            let monitors: Vec<crate::input::MonitorInfo> = self
+                .stream_info
+                .iter()
+                .map(|s| {
+                    // Primary monitor carries the CURRENT capture size;
+                    // positioned streams keep their own geometry.
+                    let (w, h) = if s.node_id
+                        == self.capture_node.load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        (width, height)
+                    } else {
+                        (s.size.0, s.size.1)
+                    };
+                    crate::input::MonitorInfo {
+                        id: s.node_id,
+                        name: format!("Stream {}", s.node_id),
+                        x: s.position.0,
+                        y: s.position.1,
+                        width: w,
+                        height: h,
+                        dpi: 96.0,
+                        scale_factor: 1.0,
+                        stream_x: s.position.0.max(0) as u32,
+                        stream_y: s.position.1.max(0) as u32,
+                        stream_width: w,
+                        stream_height: h,
+                        is_primary: s.node_id
+                            == self.capture_node.load(std::sync::atomic::Ordering::Relaxed),
+                    }
+                })
+                .collect();
+            if let Err(e) = ih.update_monitors(monitors).await {
+                warn!("Failed to re-sync input monitors after capture resize: {e}");
+            } else {
+                info!("Input monitors re-synced to capture {}x{}", width, height);
+            }
+        }
     }
 
     /// Shared scale factors for the input handler's inverse mapping.
@@ -2134,6 +2215,27 @@ impl LamcoDisplayHandler {
                             info!(
                                 "Resize finalized from first frame: capture {}x{} (compositor negotiated), desktop stays client-requested",
                                 actual_w, actual_h
+                            );
+                        }
+
+                        // Connect-time transition truth (resolution support):
+                        // request_initial_size deferred the capture-size record
+                        // until the stream actually delivers a frame, because
+                        // the pre-switch's claimed mode may never land (KWin
+                        // ignored it) or land late (stream renegotiated at the
+                        // old size first). This frame IS the truth: record it.
+                        // The desktop stays at the adopted client size; only
+                        // capture_size and the scale factors are set.
+                        if handler
+                            .connect_transition_pending
+                            .swap(false, std::sync::atomic::Ordering::AcqRel)
+                        {
+                            handler
+                                .update_capture_size(f.width as u32, f.height as u32)
+                                .await;
+                            info!(
+                                "Connect transition finalized from first frame: capture {}x{} (stream-negotiated truth)",
+                                f.width, f.height
                             );
                         }
 
@@ -3903,16 +4005,27 @@ impl RdpServerDisplay for LamcoDisplayHandler {
             return current;
         }
 
-        // Best-effort compositor pre-switch: try to make the capture match the
-        // requested desktop natively (exact listed mode first). On KDE this
-        // snaps hyperv_drm to e.g. 1280x1024 when listed; on GNOME it's a
-        // no-op (mutter captures at the requested size regardless).
+        // Best-effort compositor pre-switch: EXACT mode match only (see
+        // change_compositor_resolution — no heuristic snaps; a stable capture
+        // beats an aspect-foreign mode whose mid-connect switch wedged the
+        // stream into a double renegotiation and a black screen).
         let (mode_w, mode_h) = change_compositor_resolution(client_size.width, client_size.height);
 
-        // Record what the compositor will actually deliver. The first frame
-        // after this may still report the old size (mode switch latency); the
-        // deferred first-frame truth in the pipeline corrects it then.
-        self.update_capture_size(mode_w as u32, mode_h as u32).await;
+        // 2026-08-30 (follow-up fix): do NOT record the pre-switch's CLAIMED
+        // mode as capture_size. Two observed failure modes when we did:
+        // (1) the claimed mode never lands (KWin ignored it) and the first
+        //     frame reports a different size — factors were computed against
+        //     fiction and the second connection inherited stale state;
+        // (2) the mode lands AFTER the PipeWire stream negotiated at the old
+        //     size — the stream flaps (Paused→Streaming at a new size) and
+        //     the EGFX init never completes (black screen).
+        // Instead: mark a connect-transition so the PIPELINE's first-frame
+        // truth records the actually-negotiated capture size, exactly like
+        // the Display-Control resize path. The initial scale factors are
+        // computed from the CURRENT capture size as a best guess and
+        // self-correct on the first frame.
+        self.connect_transition_pending
+            .store(true, std::sync::atomic::Ordering::Release);
 
         // The desktop becomes what the client asked for — NOT the compositor
         // mode: bridging happens in the scaler.
@@ -3920,7 +4033,7 @@ impl RdpServerDisplay for LamcoDisplayHandler {
             .await;
 
         info!(
-            "request_initial_size: adopted client desktop {}x{} (compositor mode {}x{})",
+            "request_initial_size: adopted client desktop {}x{} (compositor mode {}x{}, capture truth deferred to first frame)",
             client_size.width, client_size.height, mode_w, mode_h
         );
 
@@ -4193,6 +4306,7 @@ impl Clone for LamcoDisplayHandler {
             use_dmabuf: Arc::clone(&self.use_dmabuf),
             capture_size: Arc::clone(&self.capture_size),
             scale_factors: Arc::clone(&self.scale_factors),
+            connect_transition_pending: Arc::clone(&self.connect_transition_pending),
         }
     }
 }
@@ -4412,6 +4526,38 @@ fn transpose(data: &[u8], width: u32, height: u32, stride: u32, bpp: u32) -> (Ve
 mod tests {
     use super::*;
     use crate::video::{BitmapData, Rectangle};
+
+    // === kscreen-doctor mode parsing (resolution support) ===
+
+    const KSCREEN_SAMPLE: &str = "Output: 1 Virtual-1\n        Modes:  1:1024x768@60*!  2:1920x1080@60  3:1600x1200@60  9:1280x1024@60\n";
+
+    #[test]
+    fn test_find_exact_mode_matches_listed_size() {
+        assert_eq!(
+            find_exact_mode(KSCREEN_SAMPLE, 1920, 1080),
+            Some((1920, 1080))
+        );
+        assert_eq!(
+            find_exact_mode(KSCREEN_SAMPLE, 1280, 1024),
+            Some((1280, 1024))
+        );
+    }
+
+    #[test]
+    fn test_find_exact_mode_rejects_unlisted_size() {
+        // The 1920x1200 request that previously snapped to 1600x1200 must
+        // now find NOTHING — the caller keeps the current mode instead.
+        assert_eq!(find_exact_mode(KSCREEN_SAMPLE, 1920, 1200), None);
+        assert_eq!(find_exact_mode(KSCREEN_SAMPLE, 2560, 1440), None);
+    }
+
+    #[test]
+    fn test_current_mode_reads_star_marker() {
+        // `1:1024x768@60*!` — the * marks the active mode.
+        assert_eq!(current_mode(KSCREEN_SAMPLE), Some((1024, 768)));
+        // No marker anywhere → None (caller falls back).
+        assert_eq!(current_mode("Modes: 1:640x480@60 2:800x600@60\n"), None);
+    }
 
     #[tokio::test]
     async fn test_pixel_format_conversion() {
