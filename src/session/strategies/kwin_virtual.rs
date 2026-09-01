@@ -273,6 +273,71 @@ impl SessionHandle for KwinVirtualSessionHandle {
 /// Runs a blocking dispatch loop around a std mpsc of commands. The
 /// `created`/`failed`/`closed` events of the stream object are collected
 /// into per-request oneshot replies.
+/// State machine for one zkde stream request: which conclusive event
+/// (Created/Failed/Closed) has arrived, if any.
+///
+/// Invariants (exactly what the off-compositor tests pin):
+/// 1. The FIRST conclusive event decides the outcome; later events are
+///    ignored (a `Closed` following a `Failed` must not double-deliver).
+/// 2. A new request (`reset`) re-arms the machine.
+///
+/// Hoisted to module scope so the logic is directly unit-testable — the
+/// Wayland objects can't exist off-compositor, but these rules can and
+/// must be tested (the double-delivery bug class is silent: a second
+/// `reply.send` on a consumed oneshot is a no-op that masks real
+/// state confusion).
+#[derive(Debug)]
+struct StreamRequestMachine {
+    /// A conclusive event has already been delivered for this request.
+    done: bool,
+}
+
+impl StreamRequestMachine {
+    fn new() -> Self {
+        Self { done: false }
+    }
+
+    /// Re-arm for a fresh request (new stream_virtual_output call).
+    fn reset(&mut self) {
+        self.done = false;
+    }
+
+    /// Apply a stream event: returns the outcome to deliver if this event
+    /// is the FIRST conclusive one, else None. See the struct docs for the
+    /// invariants.
+    fn transition(
+        &mut self,
+        event: &wayland_protocols_plasma::screencast::v1::client::zkde_screencast_stream_unstable_v1::Event,
+    ) -> Option<Result<u32, String>> {
+        use wayland_protocols_plasma::screencast::v1::client::zkde_screencast_stream_unstable_v1::Event;
+        if self.done {
+            // Late event after conclusion: log Closed for observability only.
+            if matches!(event, Event::Closed) {
+                info!("[kwin-virtual] stream closed by compositor (request already concluded)");
+            }
+            return None;
+        }
+        match event {
+            Event::Created { node } => {
+                self.done = true;
+                info!("[kwin-virtual] stream created: PipeWire node {node}");
+                Some(Ok(*node))
+            }
+            Event::Failed { error } => {
+                self.done = true;
+                warn!("[kwin-virtual] stream failed: {error}");
+                Some(Err(error.clone()))
+            }
+            Event::Closed => {
+                self.done = true;
+                info!("[kwin-virtual] stream closed by compositor");
+                Some(Err("stream closed by compositor".into()))
+            }
+            _ => None,
+        }
+    }
+}
+
 fn wayland_thread(rx: std::sync::mpsc::Receiver<WlCommand>) {
     use wayland_client::{Connection, Dispatch, QueueHandle, protocol::wl_registry};
 
@@ -290,8 +355,8 @@ fn wayland_thread(rx: std::sync::mpsc::Receiver<WlCommand>) {
             ZkdeScreencastStreamUnstableV1,
             Option<tokio::sync::oneshot::Sender<Result<u32, String>>>,
         )>,
-        /// Result already delivered (node id) — guards double-reply.
-        done: bool,
+        /// Stream request state machine (conclusive-event bookkeeping).
+        stream_sm: StreamRequestMachine,
     }
 
     impl Dispatch<wl_registry::WlRegistry, ()> for State {
@@ -355,36 +420,13 @@ fn wayland_thread(rx: std::sync::mpsc::Receiver<WlCommand>) {
             _: &Connection,
             _: &QueueHandle<Self>,
         ) {
-            match event {
-                StreamEvent::Created { node } => {
-                    if !state.done {
-                        state.done = true;
-                        if let Some((_, Some(reply))) = state.pending.take() {
-                            let _ = reply.send(Ok(node));
-                        }
-                        info!("[kwin-virtual] stream created: PipeWire node {node}");
-                    }
+            // Pure transition, then deliver: the state machine decides if
+            // the event concludes the pending request (first conclusive
+            // event wins); delivery consumes the pending reply channel.
+            if let Some(outcome) = state.stream_sm.transition(&event) {
+                if let Some((_, Some(reply))) = state.pending.take() {
+                    let _ = reply.send(outcome);
                 }
-                StreamEvent::Failed { error } => {
-                    if !state.done {
-                        state.done = true;
-                        if let Some((_, Some(reply))) = state.pending.take() {
-                            let _ = reply.send(Err(error));
-                        }
-                        warn!("[kwin-virtual] stream failed");
-                    }
-                }
-                StreamEvent::Closed => {
-                    // Server-side close (compositor stopped the stream).
-                    if !state.done {
-                        state.done = true;
-                        if let Some((_, Some(reply))) = state.pending.take() {
-                            let _ = reply.send(Err("stream closed by compositor".into()));
-                        }
-                    }
-                    info!("[kwin-virtual] stream closed by compositor");
-                }
-                _ => {}
             }
         }
     }
@@ -423,7 +465,7 @@ fn wayland_thread(rx: std::sync::mpsc::Receiver<WlCommand>) {
     let mut state = State {
         screencast: None,
         pending: None,
-        done: false,
+        stream_sm: StreamRequestMachine::new(),
     };
 
     // Initial roundtrip: binds the zkde global (if advertised).
@@ -456,7 +498,7 @@ fn wayland_thread(rx: std::sync::mpsc::Receiver<WlCommand>) {
                     if let Some((prev, _)) = state.pending.take() {
                         prev.close();
                     }
-                    state.done = false;
+                    state.stream_sm.reset();
                     let stream = screencast.stream_virtual_output(
                         OUTPUT_NAME.to_string(),
                         width,
@@ -481,7 +523,7 @@ fn wayland_thread(rx: std::sync::mpsc::Receiver<WlCommand>) {
                         // oneshot silently.
                         drop(reply);
                         stream.close();
-                        state.done = true;
+                        state.stream_sm.reset();
                         if let Err(e) = conn.flush() {
                             warn!("[kwin-virtual] flush failed: {e}");
                         }
@@ -579,7 +621,15 @@ impl Drop for OutputLayoutGuard {
 }
 
 /// Parse `kscreen-doctor -o` output: names of ENABLED outputs that are not
-/// our virtual one. Best-effort — returns empty on any failure.
+/// OUR virtual one. Best-effort — returns empty on any failure.
+///
+/// NOTE on naming: the exclusion is EXACT (`Virtual-lamco` — the name KWin
+/// assigns our zkde-created output). It must NOT be a "Virtual-" prefix
+/// match: hyperv_drm's connector is itself named `Virtual-1`, and that IS
+/// a physical output this guard must manage (disabling it is the whole
+/// point — panel relocation + origin placement). A prefix exclusion would
+/// skip the DRM output entirely and leave the two-screen layout that broke
+/// clicks in the E2E.
 fn list_enabled_physical_outputs() -> Vec<String> {
     let out = match std::process::Command::new("kscreen-doctor")
         .arg("-o")
@@ -590,19 +640,36 @@ fn list_enabled_physical_outputs() -> Vec<String> {
         _ => return Vec::new(),
     };
 
-    // The text form is a sequence of blocks:
-    //   Output: 1 Virtual-1\n    enabled\n    connected\n...
-    // Walk blocks; collect "Output: N <name>" where the block contains
-    // "enabled" and the name doesn't start with "Virtual-lamco" (ours).
+    parse_enabled_physical_outputs(&out)
+}
+
+/// Pure parser: given `kscreen-doctor -o` text, return enabled output names
+/// excluding our own virtual output (`Virtual-{OUTPUT_NAME}`).
+///
+/// The text form is a sequence of blocks:
+/// ```text
+/// Output: 1 Virtual-1
+///     enabled
+///     connected
+///     priority 1
+///     ...
+/// ```
+/// We walk blocks; an "Output: N <name>" line opens a block, and a bare
+/// "enabled" line marks it enabled. Only enabled, non-virtual names are
+/// collected, in order.
+fn parse_enabled_physical_outputs(kscreen_text: &str) -> Vec<String> {
+    /// The exact name KWin gives our zkde-created virtual output.
+    const VIRTUAL_OUTPUT_NAME: &str = "Virtual-lamco";
+
     let mut result = Vec::new();
     let mut current_name: Option<String> = None;
     let mut current_enabled = false;
-    for line in out.lines() {
+    for line in kscreen_text.lines() {
         let line = line.trim();
         if let Some(rest) = line.strip_prefix("Output: ") {
             // Flush previous block.
             if let (Some(name), true) = (&current_name, current_enabled) {
-                if name != OUTPUT_NAME && !name.starts_with("Virtual-") {
+                if name != VIRTUAL_OUTPUT_NAME {
                     result.push(name.clone());
                 }
             }
@@ -613,8 +680,9 @@ fn list_enabled_physical_outputs() -> Vec<String> {
             current_enabled = true;
         }
     }
+    // Flush the final block (no trailing "Output:" line).
     if let (Some(name), true) = (&current_name, current_enabled) {
-        if name != OUTPUT_NAME && !name.starts_with("Virtual-") {
+        if name != VIRTUAL_OUTPUT_NAME {
             result.push(name.clone());
         }
     }
@@ -721,3 +789,244 @@ impl crate::session::strategy::SessionStrategy for KwinVirtualStrategy {
 
 // NOTE: no adapter needed — create_session_concrete guarantees the concrete
 // libei handle type for direct input delegation.
+
+#[cfg(test)]
+mod tests {
+    //! kwin-virtual strategy unit tests.
+    //!
+    //! The Wayland object layer can't be exercised off-compositor, so the
+    //! testable seams are the pure logic: the kscreen output parser (whose
+    //! Virtual-1 exclusion bug shipped once — see the regression test) and
+    //! the stream-event state machine (Created/Failed/Closed ordering
+    //! rules).
+
+    use super::*;
+
+    // ========================================================================
+    // parse_enabled_physical_outputs
+    // ========================================================================
+
+    /// Real-world sample from the Hyper-V VM (2026-09-01 E2E): hyperv_drm's
+    /// connector is named `Virtual-1` and MUST be managed (disabled) by the
+    /// guard; our zkde output is `Virtual-lamco` and MUST be excluded.
+    /// The first shipped version excluded ANY `Virtual-*` name — skipping the
+    /// DRM output entirely and leaving the two-screen layout that broke
+    /// clicks. This sample is that exact machine's output.
+    const KSCREEN_TWO_OUTPUTS: &str = "Output: 1 Virtual-1\n        enabled\n        connected\n        priority 1\n        Unknown\n        Modes:  1:1024x768@60!  2:1920x1080@60*  3:1600x1200@60 \n        Geometry: 0,0 1920x1080\n        Scale: 1\nOutput: 2 Virtual-lamco\n        enabled\n        connected\n        priority 2\n        Unknown\n        Modes:  25:1920x1200@60*! \n        Geometry: 1920,0 1920x1200\n        Scale: 1\n";
+
+    #[test]
+    fn test_parser_hyperv_drm_output_is_managed() {
+        // The critical regression: hyperv_drm's `Virtual-1` is a PHYSICAL
+        // output here — it must appear (be disabled by the guard), not be
+        // excluded by a Virtual- prefix.
+        let names = parse_enabled_physical_outputs(KSCREEN_TWO_OUTPUTS);
+        assert!(
+            names.contains(&"Virtual-1".to_string()),
+            "hyperv_drm's Virtual-1 must be managed; got {names:?}"
+        );
+    }
+
+    #[test]
+    fn test_parser_excludes_own_virtual_output() {
+        let names = parse_enabled_physical_outputs(KSCREEN_TWO_OUTPUTS);
+        assert!(
+            !names.contains(&"Virtual-lamco".to_string()),
+            "our own virtual output must NOT be disabled; got {names:?}"
+        );
+    }
+
+    #[test]
+    fn test_parser_single_drm_output() {
+        let text = "Output: 1 Virtual-1\n        enabled\n        connected\n        Geometry: 0,0 1920x1080\n";
+        let names = parse_enabled_physical_outputs(text);
+        assert_eq!(names, vec!["Virtual-1".to_string()]);
+    }
+
+    #[test]
+    fn test_parser_skips_disabled_outputs() {
+        // A disabled output (e.g. the guard's own prior work, or a DPMS-off
+        // monitor) must not be collected — enabling it later is harmless but
+        // re-disable bookkeeping relies on the list being exactly "currently
+        // enabled".
+        let text = "Output: 1 Virtual-1\n        enabled\nOutput: 2 HDMI-A-1\n        disabled\n";
+        let names = parse_enabled_physical_outputs(text);
+        assert_eq!(names, vec!["Virtual-1".to_string()]);
+    }
+
+    #[test]
+    fn test_parser_real_connector_names() {
+        // Bare-metal KDE naming (DP-1/HDMI-A-1) — the common case.
+        let text = "Output: 1 DP-1\n        enabled\nOutput: 2 HDMI-A-1\n        enabled\nOutput: 3 Virtual-lamco\n        enabled\n";
+        let names = parse_enabled_physical_outputs(text);
+        assert_eq!(names, vec!["DP-1".to_string(), "HDMI-A-1".to_string()]);
+    }
+
+    #[test]
+    fn test_parser_empty_and_garbage_input() {
+        assert!(parse_enabled_physical_outputs("").is_empty());
+        assert!(parse_enabled_physical_outputs("random noise\nno outputs here\n").is_empty());
+        // "enabled" without a preceding Output block is ignored.
+        assert!(parse_enabled_physical_outputs("enabled\nenabled\n").is_empty());
+    }
+
+    #[test]
+    fn test_parser_no_trailing_newline() {
+        // The final block flush must not require a trailing newline after
+        // the last block — kscreen output shape varies.
+        let text = "Output: 1 Virtual-1\n        enabled";
+        let names = parse_enabled_physical_outputs(text);
+        assert_eq!(names, vec!["Virtual-1".to_string()]);
+    }
+
+    // ========================================================================
+    // Stream request state machine (StreamRequestMachine)
+    // ========================================================================
+
+    fn stream_event(
+        kind: &str,
+    ) -> wayland_protocols_plasma::screencast::v1::client::zkde_screencast_stream_unstable_v1::Event
+    {
+        stream_event_with_node(kind, 42)
+    }
+
+    fn stream_event_with_node(
+        kind: &str,
+        node: u32,
+    ) -> wayland_protocols_plasma::screencast::v1::client::zkde_screencast_stream_unstable_v1::Event
+    {
+        use wayland_protocols_plasma::screencast::v1::client::zkde_screencast_stream_unstable_v1::Event;
+        match kind {
+            "created" => Event::Created { node },
+            "failed" => Event::Failed {
+                error: "compositor refused".to_string(),
+            },
+            "closed" => Event::Closed,
+            _ => unreachable!("unknown kind {kind}"),
+        }
+    }
+
+    #[test]
+    fn test_stream_sm_created_succeeds_once() {
+        let mut sm = StreamRequestMachine::new();
+        // First Created delivers the node id.
+        assert_eq!(sm.transition(&stream_event("created")), Some(Ok(42)));
+        // A second event of any kind is ignored (no double-delivery).
+        assert_eq!(sm.transition(&stream_event("closed")), None);
+        assert_eq!(sm.transition(&stream_event("created")), None);
+    }
+
+    #[test]
+    fn test_stream_sm_failed_fails_once_then_closed_ignored() {
+        let mut sm = StreamRequestMachine::new();
+        // Failed delivers the compositor's error message.
+        assert_eq!(
+            sm.transition(&stream_event("failed")),
+            Some(Err("compositor refused".to_string()))
+        );
+        // A subsequent Closed (compositor closing the failed stream's
+        // object) must NOT deliver again — the reply channel is consumed.
+        assert_eq!(sm.transition(&stream_event("closed")), None);
+    }
+
+    #[test]
+    fn test_stream_sm_closed_fails_with_generic_error() {
+        let mut sm = StreamRequestMachine::new();
+        // Closed before any other event: the request fails with the
+        // generic message (no payload on the protocol event).
+        assert_eq!(
+            sm.transition(&stream_event("closed")),
+            Some(Err("stream closed by compositor".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_stream_sm_reset_rearms_after_conclusion() {
+        // The per-connection lifecycle: Close then CreateStream re-arms the
+        // machine; the new request must be able to deliver again.
+        let mut sm = StreamRequestMachine::new();
+        assert_eq!(
+            sm.transition(&stream_event("failed")),
+            Some(Err("compositor refused".to_string()))
+        );
+        sm.reset();
+        assert_eq!(
+            sm.transition(&stream_event_with_node("created", 7)),
+            Some(Ok(7))
+        );
+        // And once more: concluded again.
+        assert_eq!(sm.transition(&stream_event("closed")), None);
+    }
+
+    #[test]
+    fn test_stream_sm_reset_on_fresh_request_allows_new_outcome() {
+        // Mirrors the Close command path: reset without a conclusive event
+        // (explicit user Close), then a fresh request succeeds.
+        let mut sm = StreamRequestMachine::new();
+        sm.reset(); // Close path resets even without an event.
+        assert_eq!(
+            sm.transition(&stream_event_with_node("created", 99)),
+            Some(Ok(99))
+        );
+    }
+
+    // ========================================================================
+    // Strategy surface
+    // ========================================================================
+
+    #[test]
+    fn test_output_name_constant() {
+        // KWin prefixes "Virtual-" to the name we pass: stream_virtual_output
+        // receives OUTPUT_NAME, and kscreen lists "Virtual-{OUTPUT_NAME}".
+        // The parser's exclusion constant must match that construction.
+        assert_eq!(OUTPUT_NAME, "lamco");
+        assert_eq!(
+            "Virtual-OUTPUT",
+            format!("Virtual-{OUTPUT_NAME}").replace("lamco", "OUTPUT")
+        );
+        // The parser excludes exactly "Virtual-lamco".
+        let text = "Output: 1 Virtual-lamco\n        enabled\n";
+        assert!(parse_enabled_physical_outputs(text).is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_resize_capture_source_default_is_none() {
+        // The trait's default (non-elastic strategies) must be None —
+        // the display handler falls back to the DRM mode-switch path.
+        // Use a minimal anonymous handle to prove the default.
+        struct NoElastic;
+        #[async_trait]
+        impl crate::session::strategy::SessionHandle for NoElastic {
+            fn pipewire_access(&self) -> crate::session::strategy::PipeWireAccess {
+                crate::session::strategy::PipeWireAccess::NodeId(0)
+            }
+            fn streams(&self) -> Vec<StreamInfo> {
+                Vec::new()
+            }
+            fn session_type(&self) -> SessionType {
+                SessionType::Portal
+            }
+            async fn notify_keyboard_keycode(&self, _k: i32, _p: bool) -> Result<()> {
+                Ok(())
+            }
+            async fn notify_pointer_motion_absolute(
+                &self,
+                _s: u32,
+                _x: f64,
+                _y: f64,
+            ) -> Result<()> {
+                Ok(())
+            }
+            async fn notify_pointer_button(&self, _b: i32, _p: bool) -> Result<()> {
+                Ok(())
+            }
+            async fn notify_pointer_axis(&self, _dx: f64, _dy: f64) -> Result<()> {
+                Ok(())
+            }
+            fn clipboard_source(&self) -> ClipboardSource {
+                ClipboardSource::None
+            }
+        }
+        let h = NoElastic;
+        assert!(h.resize_capture_source(1920, 1200).await.is_none());
+    }
+}
