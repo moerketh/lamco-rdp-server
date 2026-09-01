@@ -666,15 +666,28 @@ impl LamcoRdpServer {
         // Self-sufficient strategies: skip Portal RemoteDesktop entirely.
         // ScreenCast-only = view-only (no input). WlrDirect = input via native Wayland protocols.
         // PortalGeneric = embedded wlroots video + input + clipboard (no Portal daemon needed).
+        // KwinVirtual = KDE zkde-screencast virtual output (video) + libei (input).
         // All bypass the full-featured Portal RemoteDesktop path.
         if matches!(
             session_handle.session_type(),
-            SessionType::ScreenCastOnly | SessionType::WlrDirect | SessionType::PortalGeneric
+            SessionType::ScreenCastOnly
+                | SessionType::WlrDirect
+                | SessionType::PortalGeneric
+                | SessionType::KwinVirtual
         ) {
             let is_wlr_direct = session_handle.session_type() == SessionType::WlrDirect;
             let is_portal_generic = session_handle.session_type() == SessionType::PortalGeneric;
+            let is_kwin_virtual = session_handle.session_type() == SessionType::KwinVirtual;
 
-            if is_portal_generic {
+            if is_kwin_virtual {
+                info!("═════════════════════════════════════════════════════════");
+                info!("  KWIN-VIRTUAL MODE (zkde-screencast + EIS input)");
+                info!("═════════════════════════════════════════════════════════");
+                info!("Video: native virtual output at the client's requested size.");
+                info!("No scaling, no DRM mode list, no video consent dialog.");
+                info!("Input: Portal RemoteDesktop + EIS (one-time consent).");
+                info!("═════════════════════════════════════════════════════════");
+            } else if is_portal_generic {
                 info!("═══════════════════════════════════════════════════════════");
                 info!("  PORTAL-GENERIC MODE (embedded wlroots backend)");
                 info!("═══════════════════════════════════════════════════════════");
@@ -817,6 +830,12 @@ impl LamcoRdpServer {
             display_handler
                 .set_health_reporter(health_reporter.clone())
                 .await;
+
+            // Elastic capture (kwin-virtual): route resize requests to the
+            // session's virtual-output recreation instead of DRM mode switches.
+            if is_kwin_virtual {
+                display_handler.set_elastic_capture(session_handle.clone());
+            }
 
             // Wire PipeWire sensor for version-adaptive health monitoring
             let pw_version = crate::runtime::diagnostics::get_pipewire_version()
@@ -1865,17 +1884,12 @@ impl LamcoRdpServer {
         self.event_rx.take()
     }
 
-    /// Useful for signal handlers that need to trigger shutdown after `run()` consumes self.
-    pub fn shutdown_sender(
-        &self,
-    ) -> tokio::sync::mpsc::UnboundedSender<ironrdp_server::ServerEvent> {
-        self.rdp_server.event_sender().clone()
-    }
-
     /// Broadcast sender for coordinating shutdown across all async tasks.
-    /// Signal handlers should send on this AND on `shutdown_sender()` —
-    /// IronRDP needs the Quit event to close the TLS connection gracefully,
-    /// while the broadcast breaks our outer select loop and stops clipboard/PipeWire tasks.
+    /// Signal handlers should send on this (and disconnect the active client
+    /// via [`Self::error_info_disconnect_handle`]) — the graceful disconnect
+    /// closes the RDP connection with a client-visible reason, while the
+    /// broadcast breaks our outer select loop and stops clipboard/PipeWire
+    /// tasks.
     pub fn shutdown_broadcast(&self) -> Arc<tokio::sync::broadcast::Sender<()>> {
         Arc::clone(&self.shutdown_broadcast)
     }
@@ -1887,7 +1901,7 @@ impl LamcoRdpServer {
     /// was disconnected to the user before the drop.
     ///
     /// Use this before `run()` consumes the server (same pattern as
-    /// [`Self::shutdown_sender`]); the handle is `Clone` and the underlying
+    /// [`Self::shutdown_broadcast`]); the handle is `Clone` and the underlying
     /// event channel is unbounded, so one early clone covers the process
     /// lifetime.
     #[must_use]

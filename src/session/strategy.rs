@@ -207,6 +207,20 @@ pub trait SessionHandle: Send + Sync {
     /// half-idle session and the next client is handed a fresh one.
     async fn release_after_client(&self) {}
 
+    /// Resize the strategy's capture source to the client's requested desktop
+    /// size, returning the size the source will actually deliver.
+    ///
+    /// Only strategies whose capture size is elastic implement this — today
+    /// that is the KWin virtual-output strategy (zkde-screencast can recreate
+    /// the virtual output at ANY resolution, so it always returns the request
+    /// unchanged). The display handler calls this from `request_initial_size`
+    /// INSTEAD of the kscreen-doctor mode-switching path when the active
+    /// session is elastic. Default: None (capture size is fixed by the
+    /// compositor; the scaler bridges, as before).
+    async fn resize_capture_source(&self, _width: u16, _height: u16) -> Option<(u16, u16)> {
+        None
+    }
+
     // === Clipboard Support ===
 
     /// Describes how this strategy provides clipboard functionality.
@@ -338,6 +352,8 @@ pub enum SessionType {
     Libei,
     /// Embedded portal-generic backend (wlroots native video + input + clipboard)
     PortalGeneric,
+    /// KWin zkde-screencast virtual output (KDE native video, libei input)
+    KwinVirtual,
     /// ScreenCast-only (view-only, no input injection)
     /// Used when view-only mode is configured, or as fallback when no input strategy is available
     ScreenCastOnly,
@@ -352,6 +368,7 @@ impl std::fmt::Display for SessionType {
             SessionType::Libei => write!(f, "libei/EIS"),
             SessionType::PortalGeneric => write!(f, "portal-generic (embedded)"),
             SessionType::ScreenCastOnly => write!(f, "ScreenCast-only (view-only)"),
+            SessionType::KwinVirtual => write!(f, "kwin-virtual (zkde-screencast)"),
         }
     }
 }

@@ -653,6 +653,16 @@ pub struct LamcoDisplayHandler {
     /// True when using direct frame channel (portal-generic) instead of PipeWire.
     /// Resize via PipeWire DestroyStream/CreateStream is not available in this mode.
     direct_channel_mode: bool,
+
+    /// Elastic capture resize hook (kwin-virtual strategy): when set, client
+    /// resize requests are routed to the session handle's
+    /// `resize_capture_source` — which recreates the compositor-side virtual
+    /// output at ANY resolution — instead of the kscreen-doctor DRM mode
+    /// switching path (whose mode list caps at what the kernel exposes).
+    /// After the source resizes, `rebind_capture_node` reconnects the
+    /// PipeWire stream to the new node. None for all other strategies.
+    /// parking_lot RwLock so the hand-written (sync) Clone impl can copy it.
+    elastic_capture: parking_lot::RwLock<Option<Arc<dyn crate::session::strategy::SessionHandle>>>,
 }
 
 impl LamcoDisplayHandler {
@@ -794,6 +804,7 @@ impl LamcoDisplayHandler {
             stream_active_flag: parking_lot::RwLock::new(None),
             direct_channel_mode: false,
             use_dmabuf: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(use_dmabuf)),
+            elastic_capture: parking_lot::RwLock::new(None),
         })
     }
 
@@ -898,6 +909,7 @@ impl LamcoDisplayHandler {
             stream_active_flag: parking_lot::RwLock::new(None),
             direct_channel_mode: true,
             use_dmabuf: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), // direct channel always CPU-resident
+            elastic_capture: parking_lot::RwLock::new(None),
         })
     }
 
@@ -916,6 +928,16 @@ impl LamcoDisplayHandler {
     /// to the session health monitor.
     pub async fn set_health_reporter(&self, reporter: crate::health::HealthReporter) {
         *self.health_reporter.write().await = Some(reporter);
+    }
+
+    /// Wire the elastic capture resize hook (kwin-virtual strategy).
+    ///
+    /// When set, resize requests recreate the compositor-side virtual output
+    /// at the requested size via the session handle instead of switching
+    /// DRM modes. Must be called BEFORE the first client connects.
+    pub fn set_elastic_capture(&self, session: Arc<dyn crate::session::strategy::SessionHandle>) {
+        *self.elastic_capture.write() = Some(session);
+        info!("Elastic capture resize hook set (native virtual output resizing)");
     }
 
     /// Set the shared stream active flag for Portal input coupling.
@@ -1933,6 +1955,54 @@ impl LamcoDisplayHandler {
                                  (compositor output resolution is fixed)",
                                 req.width, req.height
                             );
+                            continue;
+                        }
+
+                        // Elastic capture (kwin-virtual): the compositor-side virtual
+                        // output is recreated at ANY requested size; PipeWire stream
+                        // rebinds to the new node. This replaces the DRM mode-switch
+                        // path entirely — no mode list, no kscreen-doctor, identity
+                        // scaling guaranteed (capture == desktop).
+                        let elastic = {
+                            let hook = handler.elastic_capture.read();
+                            hook.clone()
+                        };
+                        if let Some(session) = elastic {
+                            info!(
+                                "Elastic capture: recreating virtual output at {}x{}",
+                                req.width, req.height
+                            );
+                            match session.resize_capture_source(req.width, req.height).await {
+                                Some((w, h)) => {
+                                    // Rebind the PipeWire stream to the new node.
+                                    // resize_capture_source already updated the
+                                    // session's stream table; fetch the fresh node.
+                                    let streams = session.streams();
+                                    if let Some(s) = streams.first() {
+                                        let old_node = handler
+                                            .capture_node
+                                            .load(std::sync::atomic::Ordering::Relaxed);
+                                        handler
+                                            .rebind_capture_node(
+                                                old_node, s.node_id, s.width, s.height,
+                                            )
+                                            .await;
+                                    }
+                                    // Record capture truth; desktop stays at the
+                                    // client's request (update_size handles that on
+                                    // the request path).
+                                    info!(
+                                        "Elastic capture resized: source now delivers {}x{}",
+                                        w, h
+                                    );
+                                }
+                                None => {
+                                    warn!(
+                                        "Elastic capture resize to {}x{} failed — keeping current stream",
+                                        req.width, req.height
+                                    );
+                                }
+                            }
                             continue;
                         }
 
@@ -4071,6 +4141,49 @@ impl RdpServerDisplay for LamcoDisplayHandler {
             return current;
         }
 
+        // Elastic capture (kwin-virtual): recreate the compositor-side virtual
+        // output at the client's EXACT requested size. No mode list, no
+        // kscreen-doctor, no scaling — capture == desktop by construction.
+        {
+            let hook = self.elastic_capture.read().clone();
+            if let Some(session) = hook {
+                info!(
+                    "request_initial_size: elastic capture — recreating virtual output at {}x{}",
+                    client_size.width, client_size.height
+                );
+                match session
+                    .resize_capture_source(client_size.width, client_size.height)
+                    .await
+                {
+                    Some((w, h)) => {
+                        // Rebind the PipeWire stream to the (new) node of the
+                        // resized virtual output before the first frame flows.
+                        let streams = session.streams();
+                        if let Some(s) = streams.first() {
+                            let old_node =
+                                self.capture_node.load(std::sync::atomic::Ordering::Relaxed);
+                            self.rebind_capture_node(old_node, s.node_id, s.width, s.height)
+                                .await;
+                        }
+                        self.update_size(client_size.width, client_size.height)
+                            .await;
+                        info!(
+                            "request_initial_size: adopted client desktop {}x{} via elastic capture (source delivers {}x{})",
+                            client_size.width, client_size.height, w, h
+                        );
+                        return client_size;
+                    }
+                    None => {
+                        warn!(
+                            "Elastic capture failed at {}x{} — falling back to compositor path",
+                            client_size.width, client_size.height
+                        );
+                        // Fall through to the mode-switch path below.
+                    }
+                }
+            }
+        }
+
         // Best-effort compositor pre-switch: EXACT mode match only (see
         // change_compositor_resolution — no heuristic snaps; a stable capture
         // beats an aspect-foreign mode whose mid-connect switch wedged the
@@ -4361,6 +4474,7 @@ impl Clone for LamcoDisplayHandler {
             use_dmabuf: Arc::clone(&self.use_dmabuf),
             capture_size: Arc::clone(&self.capture_size),
             scale_factors: Arc::clone(&self.scale_factors),
+            elastic_capture: parking_lot::RwLock::new(self.elastic_capture.read().clone()),
         }
     }
 }

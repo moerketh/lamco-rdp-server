@@ -92,29 +92,14 @@ impl LibeiStrategy {
             }
         }
     }
-}
 
-impl Default for LibeiStrategy {
-    fn default() -> Self {
-        Self::new(None, None)
-    }
-}
-
-#[async_trait]
-impl SessionStrategy for LibeiStrategy {
-    fn name(&self) -> &'static str {
-        "libei"
-    }
-
-    fn requires_initial_setup(&self) -> bool {
-        true
-    }
-
-    fn supports_unattended_restore(&self) -> bool {
-        true
-    }
-
-    async fn create_session(&self) -> Result<Arc<dyn SessionHandle>> {
+    /// Create the session returning the CONCRETE handle type.
+    ///
+    /// Composing strategies (kwin-virtual) need the concrete
+    /// `LibeiSessionHandleImpl` to delegate input calls without an extra
+    /// trait-object hop. The trait's `create_session` delegates here and
+    /// coerces the result.
+    pub async fn create_session_concrete(&self) -> Result<Arc<LibeiSessionHandleImpl>> {
         info!("libei: Creating session with Portal RemoteDesktop + EIS");
 
         let remote_desktop = RemoteDesktop::new()
@@ -126,16 +111,12 @@ impl SessionStrategy for LibeiStrategy {
             .await
             .context("Failed to create RemoteDesktop session")?;
 
-        // Tag this Portal session for log correlation across multi-session setups
-        // (KDE+libei creates 3 sessions: this libei one, ScreenCast for video,
-        // and a duplicate combined session for clipboard via server/mod.rs).
         let session_tag = format!("libei-{}", &uuid::Uuid::new_v4().to_string()[..8]);
         info!(
             session_tag = %session_tag,
             "[libei] Portal RemoteDesktop session created"
         );
 
-        // Load restore token from previous session (avoids permission dialog)
         let restore_token = if let Some(ref tm) = self.token_manager {
             match tm.load_token("libei-default").await {
                 Ok(Some(token)) => {
@@ -180,7 +161,6 @@ impl SessionStrategy for LibeiStrategy {
             .await
             .context("Failed to start RemoteDesktop session")?;
 
-        // Extract and save restore token for future sessions
         let selected = response.response()?;
         let new_token = selected.restore_token().map(ToString::to_string);
 
@@ -195,21 +175,12 @@ impl SessionStrategy for LibeiStrategy {
             debug!("[libei] No restore token in response (portal may not support persistence)");
         }
 
-        // Phase 1 complete: Portal session has permissions.
-        // EIS activation (ConnectToEIS) is deferred until the first
-        // RDP client connects, preventing compositor idle timeout.
         info!("libei: Portal session ready (EIS deferred until client connects)");
 
         let portal_session = Arc::new(RwLock::new(session));
 
-        // Subscribe to Session.Closed signal. Without this, when the portal
-        // backend (kwin/mutter/wlr) decides to kill the session, we keep using
-        // a dead handle and the cascade surfaces ~7s later as mstsc TCP RST or
-        // PipeWire stream death with no visible cause in our logs.
-        //
-        // The spawned task holds an OwnedRwLockReadGuard for the session
-        // lifetime; this is sound because portal_session is read-only after
-        // creation (verified: no .write()/.write_owned() calls on it anywhere).
+        // Session.Closed watchdog — see the original trait impl for the full
+        // rationale (dead-handle cascade ~7s later as TCP RST otherwise).
         {
             let session_for_closed = portal_session.clone();
             let task_tag = session_tag.clone();
@@ -245,8 +216,6 @@ impl SessionStrategy for LibeiStrategy {
                         );
                     }
                 }
-                // session_guard held until task ends — keeps the session alive
-                // and the signal subscription valid.
             });
         }
 
@@ -261,11 +230,35 @@ impl SessionStrategy for LibeiStrategy {
             health_reporter: std::sync::OnceLock::new(),
             eis_activated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             activating: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            // Weak self-reference for the persistent EIS event-consumer task
-            // (avoids a self-referential Arc cycle).
             weak_self: std::sync::OnceLock::from(weak.clone()),
         });
 
+        Ok(handle)
+    }
+}
+
+impl Default for LibeiStrategy {
+    fn default() -> Self {
+        Self::new(None, None)
+    }
+}
+
+#[async_trait]
+impl SessionStrategy for LibeiStrategy {
+    fn name(&self) -> &'static str {
+        "libei"
+    }
+
+    fn requires_initial_setup(&self) -> bool {
+        true
+    }
+
+    fn supports_unattended_restore(&self) -> bool {
+        true
+    }
+
+    async fn create_session(&self) -> Result<Arc<dyn SessionHandle>> {
+        let handle = self.create_session_concrete().await?;
         Ok(handle as Arc<dyn SessionHandle>)
     }
 

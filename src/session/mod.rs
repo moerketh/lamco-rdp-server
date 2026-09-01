@@ -93,6 +93,11 @@ pub mod strategies {
     #[cfg(feature = "libei")]
     pub mod libei;
 
+    #[cfg(feature = "kwin-virtual")]
+    pub mod kwin_virtual;
+
+    #[cfg(feature = "kwin-virtual")]
+    pub use kwin_virtual::KwinVirtualStrategy;
     #[cfg(feature = "libei")]
     pub use libei::{LibeiSessionHandleImpl, LibeiStrategy};
     pub use mutter_direct::MutterDirectStrategy;

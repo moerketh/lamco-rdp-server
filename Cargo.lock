@@ -3937,6 +3937,7 @@ dependencies = [
  "wayland-client",
  "wayland-protocols",
  "wayland-protocols-misc",
+ "wayland-protocols-plasma",
  "wayland-protocols-wlr",
  "wl-clipboard-rs",
  "x509-cert 0.2.5",
