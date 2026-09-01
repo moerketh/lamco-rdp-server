@@ -250,7 +250,7 @@ impl SessionStrategy for LibeiStrategy {
             });
         }
 
-        let handle = Arc::new(LibeiSessionHandleImpl {
+        let handle = Arc::new_cyclic(|weak| LibeiSessionHandleImpl {
             portal_session,
             remote_desktop: Arc::new(remote_desktop),
             context: Arc::new(RwLock::new(None)),
@@ -261,6 +261,9 @@ impl SessionStrategy for LibeiStrategy {
             health_reporter: std::sync::OnceLock::new(),
             eis_activated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             activating: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            // Weak self-reference for the persistent EIS event-consumer task
+            // (avoids a self-referential Arc cycle).
+            weak_self: std::sync::OnceLock::from(weak.clone()),
         });
 
         Ok(handle as Arc<dyn SessionHandle>)
@@ -305,6 +308,10 @@ pub struct LibeiSessionHandleImpl {
     eis_activated: Arc<std::sync::atomic::AtomicBool>,
     /// Prevent concurrent activation
     activating: Arc<std::sync::atomic::AtomicBool>,
+    /// Weak self-reference — lets the persistent EIS event-consumer task
+    /// call `handle_event` without creating an Arc cycle (the task must not
+    /// keep the handle alive if everything else drops it).
+    weak_self: std::sync::OnceLock<std::sync::Weak<LibeiSessionHandleImpl>>,
 }
 
 impl LibeiSessionHandleImpl {
@@ -430,6 +437,59 @@ impl LibeiSessionHandleImpl {
         self.eis_activated
             .store(true, std::sync::atomic::Ordering::Release);
 
+        // 2026-09-01 (TEST_20260901163732): keep consuming events AFTER setup.
+        // KWin re-creates the EIS absolute device on every output change
+        // (outputsChanged → changeDevice: remove old + add new with fresh
+        // regions). Until now the EiEventStream was dropped here, so the
+        // removal was never seen and pointer_absolute kept a DEAD device
+        // handle forever — after a mid-session resolution switch, absolute
+        // pointer injection went into the void ("mouse defective"). The
+        // persistent loop re-binds roles when the replacement device's Done
+        // event arrives and answers compositor Pings.
+        let weak_handle = self
+            .weak_self
+            .get()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("weak_self not initialized"))?;
+        tokio::spawn(async move {
+            let Some(handle) = weak_handle.upgrade() else {
+                debug!("[libei] Handle dropped before EIS event task started");
+                return;
+            };
+            loop {
+                match events.next().await {
+                    Some(Ok(PendingRequestResult::Request(event))) => {
+                        if let Err(e) = handle.handle_event(event).await {
+                            warn!("[libei] Event handling error: {}", e);
+                        }
+                    }
+                    Some(Ok(PendingRequestResult::ParseError(msg))) => {
+                        warn!("[libei] EIS parse error: {}", msg);
+                    }
+                    Some(Ok(PendingRequestResult::InvalidObject(id))) => {
+                        debug!("[libei] Invalid object: {}", id);
+                    }
+                    Some(Err(e)) => {
+                        // EOF or socket death — stop consuming; the next
+                        // activate_input() call detects the dead socket via
+                        // the flush probe and performs full recovery.
+                        warn!("[libei] EIS event stream ended: {}", e);
+                        handle
+                            .eis_activated
+                            .store(false, std::sync::atomic::Ordering::Release);
+                        break;
+                    }
+                    None => {
+                        debug!("[libei] EIS event stream EOF");
+                        handle
+                            .eis_activated
+                            .store(false, std::sync::atomic::Ordering::Release);
+                        break;
+                    }
+                }
+            }
+        });
+
         if let Some(r) = self.health_reporter.get() {
             r.report(HealthEvent::EisStreamRecovered);
         }
@@ -533,12 +593,86 @@ impl LibeiSessionHandleImpl {
                             "[libei] Device region: {}x{} at ({},{}) scale={}",
                             width, hight, offset_x, offset_y, scale
                         );
-                        data.regions.push(eis_common::DeviceRegion {
+                        // 2026-09-01: REPLACE regions instead of appending —
+                        // KWin re-creates the device on output changes, and a
+                        // re-added device may carry updated regions for the
+                        // SAME device object. Appending left stale (possibly
+                        // larger) regions that offset absolute pointer
+                        // coordinates into the void.
+                        data.regions = vec![eis_common::DeviceRegion {
                             x: offset_x,
                             y: offset_y,
                             width,
                             height: hight,
-                        });
+                        }];
+                    }
+                    ei::device::Event::Destroyed { serial } => {
+                        // 2026-09-01 (TEST_20260901163732): KWin's
+                        // outputsChanged → changeDevice removes the old
+                        // device before adding a fresh one with new regions.
+                        // Clear every role that held this device so injection
+                        // re-binds when the replacement's Done event arrives;
+                        // until then with_device_interface fails fast
+                        // ("EIS pointer_absolute not ready") instead of
+                        // injecting into a dead handle.
+                        *self.devices.last_serial.lock().await = serial;
+                        let removed = devs.remove(&device);
+                        drop(devs);
+                        if let Some(data) = removed {
+                            let was_abs = self
+                                .devices
+                                .pointer_absolute
+                                .lock()
+                                .await
+                                .as_ref()
+                                .is_some_and(|d| *d == device);
+                            if was_abs {
+                                *self.devices.pointer_absolute.lock().await = None;
+                                info!(
+                                    "[libei] Absolute pointer device removed (output change?) — awaiting replacement"
+                                );
+                            }
+                            let was_ptr = self
+                                .devices
+                                .pointer
+                                .lock()
+                                .await
+                                .as_ref()
+                                .is_some_and(|d| *d == device);
+                            if was_ptr {
+                                *self.devices.pointer.lock().await = None;
+                                info!(
+                                    "[libei] Pointer device removed (output change?) — awaiting replacement"
+                                );
+                            }
+                            let was_kbd = self
+                                .devices
+                                .keyboard
+                                .lock()
+                                .await
+                                .as_ref()
+                                .is_some_and(|d| *d == device);
+                            if was_kbd {
+                                *self.devices.keyboard.lock().await = None;
+                                info!(
+                                    "[libei] Keyboard device removed (output change?) — awaiting replacement"
+                                );
+                            }
+                            let was_touch = self
+                                .devices
+                                .touch
+                                .lock()
+                                .await
+                                .as_ref()
+                                .is_some_and(|d| *d == device);
+                            if was_touch {
+                                *self.devices.touch.lock().await = None;
+                                info!(
+                                    "[libei] Touch device removed (output change?) — awaiting replacement"
+                                );
+                            }
+                            let _ = data;
+                        }
                     }
                     ei::device::Event::Done => {
                         // Assign device roles (keyboard, pointer, touch).
