@@ -153,34 +153,26 @@ pub async fn eis_pointer_motion_absolute(
     x: f64,
     y: f64,
 ) -> Result<()> {
-    // Apply EIS device region offset if available.
-    // The EIS device may have multiple regions (one per compositor output).
-    // KDE creates a virtual output for ScreenCast — its region has a
-    // non-zero offset (e.g., 1280,0) relative to the real display.
-    // We need the region that ISN'T at (0,0) since the PipeWire stream
-    // captures the virtual output, not the primary display.
-    let (offset_x, offset_y) = {
-        let abs_device = devices.pointer_absolute.lock().await;
-        if let Some(ref dev) = *abs_device {
-            let devs = devices.all.lock().await;
-            if let Some(data) = devs.get(dev) {
-                // Prefer the region with non-zero offset (virtual output).
-                // If all regions are at (0,0), use (0,0) — the stream
-                // captures the primary display directly.
-                data.regions
-                    .iter()
-                    .find(|r| r.x > 0 || r.y > 0)
-                    .map_or((0.0, 0.0), |r| (r.x as f64, r.y as f64))
-            } else {
-                (0.0, 0.0)
-            }
-        } else {
-            (0.0, 0.0)
-        }
-    };
-
-    let abs_x = x + offset_x;
-    let abs_y = y + offset_y;
+    // 2026-09-01 (E2E Virtual-lamco test): the old "prefer the region with
+    // a non-zero offset" heuristic DOUBLE-OFFSET every pointer event in the
+    // multi-output world. The absolute pointer coordinates arriving here are
+    // already in GLOBAL compositor space: the input handler's
+    // CoordinateTransformer maps RDP desktop coords into the captured
+    // monitor's geometry INCLUDING its position (StreamInfo.position feeds
+    // the transformer's monitor layout — e.g. a virtual output at (1920,0)
+    // yields global coords in [1920, 3840)). Adding an EIS region offset on
+    // top landed clicks at x+3840 — nothing clickable, while the
+    // client-rendered cursor looked fine. KWin takes motion_absolute as
+    // global coordinates directly
+    // (PointerInputRedirection::processMotionAbsolute); no region
+    // translation is needed or correct.
+    //
+    // The historical reason for the offset hack was the KWin ScreenCast
+    // virtual-output-at-offset era (stream captured a virtual output whose
+    // region had a non-zero offset while the desktop coords were relative
+    // to the primary). With the transformer now authoritative for monitor
+    // geometry (and re-synced on every capture-size change), offsets here
+    // are always wrong.
 
     with_device_interface::<ei::PointerAbsolute>(
         context,
@@ -188,7 +180,7 @@ pub async fn eis_pointer_motion_absolute(
         devices,
         "pointer_absolute",
         |ptr| {
-            ptr.motion_absolute(abs_x as f32, abs_y as f32);
+            ptr.motion_absolute(x as f32, y as f32);
         },
     )
     .await
