@@ -2142,7 +2142,48 @@ impl LamcoDisplayHandler {
                         // - the software EGFX paths consume FrameBuffer::Memory only
                         // - cloning a DmaBuf variant yields an empty buffer (loses the FD)
                         // - a cached DmaBuf read later may hit a recycled, unstable buffer
-                        let f = super::dmabuf_materialize::materialize_dmabuf_frame(f);
+                        let mut f = super::dmabuf_materialize::materialize_dmabuf_frame(f);
+
+                        // === STRIDE NORMALIZATION (1366x768 bug) ===
+                        // Compositors negotiate row strides aligned to hardware
+                        // limits (KWin: 256 bytes). For most modes width*4 is
+                        // already aligned (1920*4=7680, 1600*4=6400, 1280*4=5120)
+                        // — but 1366*4 = 5464 pads to 5632, and EVERY downstream
+                        // CPU consumer (H.264 bgra_to_i420, scale_bgra, bitmap
+                        // convert_format, uncompressed WireToSurface1) assumes
+                        // tight width*4 rows. Result on TEST_20260831221953:
+                        // sheared H.264 (client tore down the EGFX DVC ~20s in)
+                        // and "Unsupported conversion: BGRx -> BGRx" once the
+                        // bitmap fallback kicked in — the conversion fast path
+                        // requires equal strides. Compact to tight rows ONCE
+                        // here, right after materialization, so all consumers
+                        // see the layout they assume.
+                        if let lamco_pipewire::FrameBuffer::Memory(data) = &f.buffer {
+                            let tight = (f.width as usize) * 4;
+                            if f.stride as usize > tight
+                                && data.len() >= f.stride as usize * f.height as usize
+                            {
+                                static COMPACT_LOGS: std::sync::atomic::AtomicU32 =
+                                    std::sync::atomic::AtomicU32::new(0);
+                                let n =
+                                    COMPACT_LOGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                if n < 3 {
+                                    info!(
+                                        "Compacted padded stride: {} -> {} (width {})",
+                                        f.stride, tight, f.width
+                                    );
+                                }
+                                let mut packed = Vec::with_capacity(tight * f.height as usize);
+                                for y in 0..f.height as usize {
+                                    let row = &data[y * f.stride as usize..][..tight];
+                                    packed.extend_from_slice(row);
+                                }
+                                f.buffer = lamco_pipewire::FrameBuffer::Memory(
+                                    std::sync::Arc::new(packed),
+                                );
+                                f.stride = tight as u32;
+                            }
+                        }
 
                         // Always cache the latest frame for replay on EGFX init.
                         // Clone is cheap: VideoFrame.data is Arc<Vec<u8>>.
@@ -3768,7 +3809,38 @@ impl LamcoDisplayHandler {
                 // rewrite geometry + damage regions into desktop space.
                 let bmp_scale = { *handler.scale_factors.read() };
                 let frame = if bmp_scale.is_identity() {
-                    frame
+                    // Identity: rows are already tight (stride == width*4, the
+                    // reception compaction guarantees it). But the bitmap
+                    // converter's dst_stride is 64-byte ALIGNED
+                    // (1366*4=5464 -> 5504), so same-format conversion still
+                    // can't take the fast path at odd widths. Pad to the RDP
+                    // stride so convert_format memcpy-fires.
+                    let pixel_bytes = match &frame.buffer {
+                        lamco_pipewire::FrameBuffer::Memory(data) => data,
+                        lamco_pipewire::FrameBuffer::DmaBuf(_) => {
+                            // The bitmap path cannot read DMA-BUF; drop rather
+                            // than send geometry-mismatched data.
+                            frames_dropped += 1;
+                            continue;
+                        }
+                    };
+                    let w = frame.width as usize;
+                    let h = frame.height as usize;
+                    let rdp_stride = (w * 4).div_ceil(64) * 64;
+                    if frame.stride as usize == rdp_stride && pixel_bytes.len() >= rdp_stride * h {
+                        frame
+                    } else {
+                        let mut padded = Vec::with_capacity(rdp_stride * h);
+                        for y in 0..h {
+                            let row = &pixel_bytes[y * frame.stride as usize..][..w * 4];
+                            padded.extend_from_slice(row);
+                            padded.resize(rdp_stride * (y + 1), 0);
+                        }
+                        let mut f = frame.clone();
+                        f.buffer = lamco_pipewire::FrameBuffer::Memory(std::sync::Arc::new(padded));
+                        f.stride = rdp_stride as u32;
+                        f
+                    }
                 } else {
                     let pixel_bytes = match &frame.buffer {
                         lamco_pipewire::FrameBuffer::Memory(data) => std::sync::Arc::clone(data),
@@ -3790,10 +3862,23 @@ impl LamcoDisplayHandler {
                         dw,
                         dh,
                     );
+                    // BitmapConverter's convert_format fast path requires
+                    // src_stride == dst_stride, and dst_stride is 64-byte
+                    // aligned (calculate_rdp_stride: 1366*4=5464 -> 5504).
+                    // scale_bgra emits TIGHT rows — pad them to the RDP
+                    // stride so the same-format conversion takes the
+                    // memcpy path instead of failing "BGRx -> BGRx".
+                    let rdp_stride = (dw as usize * 4).div_ceil(64) * 64;
+                    let mut padded = Vec::with_capacity(rdp_stride * dh as usize);
+                    for y in 0..dh as usize {
+                        padded.extend_from_slice(&scaled[y * dw as usize * 4..][..dw as usize * 4]);
+                        padded.resize(rdp_stride * (y + 1), 0);
+                    }
                     let mut f = frame.clone();
-                    f.buffer = lamco_pipewire::FrameBuffer::Memory(std::sync::Arc::new(scaled));
+                    f.buffer = lamco_pipewire::FrameBuffer::Memory(std::sync::Arc::new(padded));
                     f.width = dw;
                     f.height = dh;
+                    f.stride = rdp_stride as u32;
                     f.damage_regions = frame
                         .damage_regions
                         .iter()
