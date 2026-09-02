@@ -98,112 +98,14 @@ use crate::{
     video::{BitmapConverter, BitmapUpdate, RdpPixelFormat},
 };
 
-/// Change the compositor output resolution to match the requested RDP desktop size.
+/// Client-initiated resize request
 ///
-/// On KDE/KWin, this calls `kscreen-doctor` to set the DRM output mode before
-/// the PipeWire stream is recreated. KWin's ScreenCast always captures at the
-/// output's current resolution, so without this step the recreated stream would
-/// still negotiate the old dimensions.
-///
-/// 2026-08-30 (resolution-support follow-up): this now switches ONLY on an
-/// EXACT mode match. The old closest-by-pixel-count fallback snapped a
-/// 1920x1200 request to 1600x1200 (0.38 Mpx diff beat 1920x1080's 0.62) —
-/// a wrong-aspect mode whose mid-connect switch made the PipeWire stream
-/// renegotiate twice (1920x1080 → 1600x1200), which wedged the EGFX surface
-/// setup and produced a black screen (observed on TEST_20260830204326).
-/// When no exact mode exists, the current mode is KEPT: the scaler bridges
-/// the mismatch cleanly per-axis, and a stable capture beats an aspect-foreign
-/// mode swap every time.
-///
-/// On GNOME/mutter this is a no-op — mutter's ScreenCast API creates a stream
-/// at the requested resolution regardless of the output mode.
-///
-/// Returns the mode the compositor will ACTUALLY deliver. With no exact match
-/// this is the CURRENT mode (queried from the `*` marker), so callers can
-/// record reality without a switch.
-fn change_compositor_resolution(width: u16, height: u16) -> (u16, u16) {
-    // Only attempt on KDE (check env vars and kscreen-doctor availability)
-    let xdg_current_desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
-    let is_kde = xdg_current_desktop.contains("KDE") || std::env::var("KDE_FULL_SESSION").is_ok();
-
-    if !is_kde {
-        // Non-KDE: mutter captures at the requested size regardless of the
-        // output mode, so the "delivered" size is the request itself.
-        return (width, height);
-    }
-
-    // Query available modes from kscreen-doctor and find the best match.
-    // kscreen-doctor --outputs prints lines like:
-    //   Modes:  1:1024x768@60*!  2:1920x1080@60  3:1600x1200@60 ...
-    let modes_output = std::process::Command::new("kscreen-doctor")
-        .arg("--outputs")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output();
-
-    let modes_text = match &modes_output {
-        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).into_owned(),
-        _ => String::new(),
-    };
-
-    // Resolve what to do: exact match switches; anything else keeps the
-    // current mode (the `*`-marked entry) so the capture stays stable.
-    let (target_w, target_h) = if let Some((w, h)) = find_exact_mode(&modes_text, width, height) {
-        (w, h)
-    } else {
-        let current = current_mode(&modes_text).unwrap_or((width as u32, height as u32));
-        info!(
-            "No exact DRM mode for {width}x{height} — keeping current mode {}x{} \
-             (scaler bridges capture->desktop; aspect-foreign snaps are worse)",
-            current.0, current.1
-        );
-        return (current.0 as u16, current.1 as u16);
-    };
-
-    if (target_w, target_h) == (width as u32, height as u32) {
-        info!("Changing compositor output to {width}x{height} via kscreen-doctor");
-    }
-
-    let mode_arg = format!("output.1.mode.{target_w}x{target_h}@60");
-
-    let result = std::process::Command::new("kscreen-doctor")
-        .arg(&mode_arg)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output();
-
-    match result {
-        Ok(output) => {
-            // kscreen-doctor may exit 0 even on failure (mode not found).
-            // Check stderr/stdout for "not found" to detect this.
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let combined = format!("{}{}", stdout, stderr);
-
-            if combined.contains("not found") || !output.status.success() {
-                warn!(
-                    "kscreen-doctor failed for {target_w}x{target_h}: {}",
-                    combined.trim()
-                );
-            } else {
-                info!("Compositor resolution changed to {target_w}x{target_h}");
-                // Give the compositor a brief moment to settle the mode change
-                // before we recreate the PipeWire stream.
-                std::thread::sleep(std::time::Duration::from_millis(200));
-            }
-        }
-        Err(e) => {
-            // kscreen-doctor not in PATH or exec error
-            warn!(
-                "Could not execute kscreen-doctor for {target_w}x{target_h}: {e} \
-                 — compositor output may stay at previous resolution"
-            );
-        }
-    }
-
-    (target_w as u16, target_h as u16)
+/// Sent from `request_layout()` (sync context) to the pipeline loop (async)
+/// via a bounded sync channel. The pipeline coalesces multiple requests
+/// and executes the resize sequence.
+struct ResizeRequest {
+    width: u16,
+    height: u16,
 }
 
 /// Build the session-scoped cursor theme manager from config.
@@ -242,89 +144,6 @@ fn build_cursor_theme_manager(
             runner,
         ),
     ))
-}
-
-/// Parse kscreen-doctor --outputs text for the mode EXACTLY matching the
-/// requested resolution. Modes are listed as "N:WxH@rate" on the Modes: line.
-///
-/// Returns None when no exact match exists — callers then keep the current
-/// mode rather than snap to a heuristic one (see
-/// `change_compositor_resolution` for why).
-fn find_exact_mode(kscreen_output: &str, req_w: u16, req_h: u16) -> Option<(u32, u32)> {
-    for line in kscreen_output.lines() {
-        if !line.contains("Modes:") {
-            continue;
-        }
-        for token in line.split_whitespace() {
-            // Token format: "N:WxH@rate" possibly with trailing "*" or "!"
-            let Some((_num, after_colon)) = token.split_once(':') else {
-                continue;
-            };
-            let mode_str = after_colon.trim_end_matches(|c| c == '*' || c == '!');
-            let Some(size_part) = mode_str.split_once('@') else {
-                continue;
-            };
-            let Some((w_str, h_str)) = size_part.0.split_once('x') else {
-                continue;
-            };
-            let Ok(w) = w_str.parse::<u32>() else {
-                continue;
-            };
-            let Ok(h) = h_str.parse::<u32>() else {
-                continue;
-            };
-            if (w, h) == (req_w as u32, req_h as u32) {
-                return Some((w, h));
-            }
-        }
-    }
-    None
-}
-
-/// Parse the CURRENT mode (the `*`-marked entry) from kscreen-doctor output.
-///
-/// Used to report what the compositor will actually deliver when no switch
-/// happens. Falls back to None when no marker is found (callers then assume
-/// the requested size — the pre-resolution-support behavior).
-fn current_mode(kscreen_output: &str) -> Option<(u32, u32)> {
-    for line in kscreen_output.lines() {
-        if !line.contains("Modes:") {
-            continue;
-        }
-        for token in line.split_whitespace() {
-            if !token.contains('*') {
-                continue;
-            }
-            let Some((_num, after_colon)) = token.split_once(':') else {
-                continue;
-            };
-            let mode_str = after_colon.trim_end_matches(|c| c == '*' || c == '!');
-            let Some(size_part) = mode_str.split_once('@') else {
-                continue;
-            };
-            let Some((w_str, h_str)) = size_part.0.split_once('x') else {
-                continue;
-            };
-            let Ok(w) = w_str.parse::<u32>() else {
-                continue;
-            };
-            let Ok(h) = h_str.parse::<u32>() else {
-                continue;
-            };
-            return Some((w, h));
-        }
-    }
-    None
-}
-
-/// Client-initiated resize request
-///
-/// Sent from `request_layout()` (sync context) to the pipeline loop (async)
-/// via a bounded sync channel. The pipeline coalesces multiple requests
-/// and executes the resize sequence.
-struct ResizeRequest {
-    width: u16,
-    height: u16,
 }
 
 /// Video encoder abstraction for codec-agnostic frame encoding
@@ -498,24 +317,14 @@ impl FrameRateRegulator {
 /// through the EGFX channel for better quality and compression. Falls back
 /// to RemoteFX when H.264 is not available.
 pub struct LamcoDisplayHandler {
-    /// Current desktop size — the RDP-visible geometry.
-    ///
-    /// 2026-08-30 (resolution support): the RDP desktop size is DECOUPLED from
-    /// the compositor capture size. hyperv_drm exposes a fixed mode list
-    /// (max 1920x1080), so a client requesting 2560x1440 gets that desktop by
-    /// upscaling captured frames (see `frame_scaler`); a client requesting
-    /// 1280x1024 gets it either from an exact mode switch (when listed) or by
-    /// downscaling. `capture_size` tracks what the compositor actually delivers.
+    /// Current desktop size — the RDP-visible geometry. With the kwin-virtual
+    /// strategy the compositor-side virtual output is created at the client's
+    /// requested size, so the desktop size IS the capture size.
     size: Arc<RwLock<DesktopSize>>,
 
-    /// Current compositor capture size (what PipeWire delivers). May differ
-    /// from `size` whenever no exact DRM mode matches the client's request.
+    /// Current compositor capture size (what PipeWire delivers). Tracked per
+    /// frame; drives the input-transformer geometry re-sync.
     capture_size: Arc<RwLock<(u32, u32)>>,
-
-    /// Active capture->desktop scale factors. Identity when sizes match.
-    /// Written whenever either size changes; read by the pipeline per frame
-    /// and by the input handler for the inverse mapping.
-    scale_factors: Arc<parking_lot::RwLock<crate::server::frame_scaler::ScaleFactors>>,
 
     /// PipeWire thread manager
     pipewire_thread: Arc<Mutex<PipeWireThreadManager>>,
@@ -762,14 +571,6 @@ impl LamcoDisplayHandler {
         Ok(Self {
             size,
             capture_size: Arc::new(RwLock::new((initial_width as u32, initial_height as u32))),
-            scale_factors: Arc::new(parking_lot::RwLock::new(
-                crate::server::frame_scaler::ScaleFactors::new(
-                    initial_width as u32,
-                    initial_height as u32,
-                    initial_width as u32,
-                    initial_height as u32,
-                ),
-            )),
             pipewire_thread,
             bitmap_converter,
             update_sender,
@@ -867,14 +668,6 @@ impl LamcoDisplayHandler {
         Ok(Self {
             size,
             capture_size: Arc::new(RwLock::new((initial_width as u32, initial_height as u32))),
-            scale_factors: Arc::new(parking_lot::RwLock::new(
-                crate::server::frame_scaler::ScaleFactors::new(
-                    initial_width as u32,
-                    initial_height as u32,
-                    initial_width as u32,
-                    initial_height as u32,
-                ),
-            )),
             pipewire_thread,
             bitmap_converter,
             update_sender,
@@ -1452,7 +1245,6 @@ impl LamcoDisplayHandler {
             let mut size = self.size.write().await;
             size.width = width;
             size.height = height;
-            self.recompute_scale_factors(&size).await;
         }
         debug!("Updated display size to {}x{}", width, height);
 
@@ -1462,30 +1254,13 @@ impl LamcoDisplayHandler {
         }
     }
 
-    /// Recompute capture->desktop scale factors from the two current sizes.
+    /// Record a new CAPTURE (compositor/PipeWire) size.
     ///
-    /// Callers must hold the `size` write lock (or otherwise guarantee
-    /// exclusivity); `capture_size` is read under its own lock.
-    async fn recompute_scale_factors(&self, desktop: &DesktopSize) {
-        let (cw, ch) = *self.capture_size.read().await;
-        let factors = crate::server::frame_scaler::ScaleFactors::new(
-            cw,
-            ch,
-            desktop.width as u32,
-            desktop.height as u32,
-        );
-        *self.scale_factors.write() = factors;
-        if !factors.is_identity() {
-            info!(
-                "Scaling enabled: capture {}x{} -> desktop {}x{} (video scaled, input inverse-mapped)",
-                cw, ch, desktop.width, desktop.height
-            );
-        }
-    }
-
-    /// Record a new CAPTURE (compositor/PipeWire) size and refresh the scale
-    /// factors. Called when the compositor's actual output changes (exact
-    /// mode match during resize, or first-frame truth after stream recreation).
+    /// Called when the compositor's actual output changes (per-frame capture
+    /// truth tracking after stream recreation/renegotiation). With the
+    /// kwin-virtual strategy capture == desktop by construction, so this only
+    /// needs to refresh the input transformer's monitor geometry — the
+    /// capture->desktop scaling layer is gone (route B removed the scaler).
     pub async fn update_capture_size(&self, width: u32, height: u32) {
         {
             let mut cap = self.capture_size.write().await;
@@ -1494,17 +1269,13 @@ impl LamcoDisplayHandler {
             }
             (cap.0, cap.1) = (width, height);
         }
-        let desktop = *self.size.read().await;
-        self.recompute_scale_factors(&desktop).await;
 
-        // 2026-08-30 (resolution-support fix): re-sync the input transformer's
-        // monitor geometry to the new capture size. The transformer maps
-        // (already inverse-scaled) capture-space coordinates into per-stream
-        // space using the monitor list built at construction from the ORIGINAL
-        // stream_info. After a capture-size change the stale geometry made
-        // clicks land offset by the old/new size ratio (observed on
-        // TEST_20260830204326: 1600x1200-era transformer with a 1920x1080
-        // desktop — mouse "sync off", nothing clickable).
+        // Re-sync the input transformer's monitor geometry to the new
+        // capture size. The transformer maps capture-space coordinates into
+        // per-stream space using the monitor list; after a capture-size change
+        // the stale geometry made clicks land offset (observed on
+        // TEST_20260830204326 — and for kwin-virtual, per-connection streams
+        // replace the placeholder here).
         if let Some(ref ih) = *self.input_handler.read().await {
             let monitors: Vec<crate::input::MonitorInfo> = self
                 .stream_info
@@ -1545,13 +1316,6 @@ impl LamcoDisplayHandler {
                 info!("Input monitors re-synced to capture {}x{}", width, height);
             }
         }
-    }
-
-    /// Shared scale factors for the input handler's inverse mapping.
-    pub fn scale_factors_handle(
-        &self,
-    ) -> Arc<parking_lot::RwLock<crate::server::frame_scaler::ScaleFactors>> {
-        Arc::clone(&self.scale_factors)
     }
 
     /// Get a shared reference to the update sender for graphics drain task
@@ -2022,13 +1786,6 @@ impl LamcoDisplayHandler {
                             continue;
                         }
 
-                        // 0. Change the compositor output resolution to match
-                        // the requested RDP desktop size. On KDE/KWin the ScreenCast
-                        // stream always captures at the output's current mode, so we
-                        // must change the mode before recreating the stream. On
-                        // GNOME/mutter this is a no-op.
-                        change_compositor_resolution(req.width, req.height);
-
                         // 1. Destroy existing PipeWire stream. Use the live
                         // capture node — a session re-establishment may have
                         // rebound it away from the startup node in stream_info.
@@ -2235,7 +1992,7 @@ impl LamcoDisplayHandler {
                         // limits (KWin: 256 bytes). For most modes width*4 is
                         // already aligned (1920*4=7680, 1600*4=6400, 1280*4=5120)
                         // — but 1366*4 = 5464 pads to 5632, and EVERY downstream
-                        // CPU consumer (H.264 bgra_to_i420, scale_bgra, bitmap
+                        // CPU consumer (H.264 bgra_to_i420, bitmap
                         // convert_format, uncompressed WireToSurface1) assumes
                         // tight width*4 rows. Result on TEST_20260831221953:
                         // sheared H.264 (client tore down the EGFX DVC ~20s in)
@@ -3284,43 +3041,13 @@ impl LamcoDisplayHandler {
                             continue;
                         }
 
-                        // === CAPTURE -> DESKTOP SCALING (resolution support) ===
-                        // When the client's desktop size differs from the
-                        // compositor capture (hyperv_drm's fixed mode list),
-                        // scale the frame and map damage regions into desktop
-                        // space. Identity fast path: two lock reads and no copy.
-                        let scale = { *handler.scale_factors.read() };
-                        let (pixel_data, frame_width, frame_height): (
-                            std::sync::Arc<Vec<u8>>,
-                            u32,
-                            u32,
-                        ) = if scale.is_identity() {
-                            (pixel_data, frame.width, frame.height)
-                        } else {
-                            let dw = (frame.width as u64 * scale.x.0 as u64
-                                / scale.x.1.max(1) as u64)
-                                as u32;
-                            let dh = (frame.height as u64 * scale.y.0 as u64
-                                / scale.y.1.max(1) as u64)
-                                as u32;
-                            let scaled = crate::server::frame_scaler::scale_bgra(
-                                &pixel_data,
-                                frame.width,
-                                frame.height,
-                                dw,
-                                dh,
-                            );
-                            debug!(
-                                "Scaled frame {}x{} -> {}x{} ({}B -> {}B)",
-                                frame.width,
-                                frame.height,
-                                dw,
-                                dh,
-                                pixel_data.len(),
-                                scaled.len()
-                            );
-                            (std::sync::Arc::new(scaled), dw, dh)
-                        };
+                        // Capture == desktop with the kwin-virtual strategy
+                        // (the compositor-side virtual output is created at the
+                        // client's requested size), so the frame passes through
+                        // unscaled. The scaler bridge for compositor-mode
+                        // mismatches was removed with the scaling path.
+                        let frame_width = frame.width;
+                        let frame_height = frame.height;
 
                         // === DAMAGE DETECTION (Config-controlled) ===
                         // Detect which regions changed since the last frame
@@ -3377,24 +3104,18 @@ impl LamcoDisplayHandler {
                         } else if !frame.damage_regions.is_empty() {
                             // No detector available — fall back to compositor hints
                             // (zero CPU cost, but susceptible to under-reporting).
-                            // Hints arrive in CAPTURE space — map into desktop
-                            // space with rect-round-out so nothing is dropped.
+                            // Capture == desktop (kwin-virtual): hint regions are
+                            // already in the right space — pass through unmapped.
                             damage_source = "compositor-hint";
                             frame
                                 .damage_regions
                                 .iter()
                                 .map(|r| {
-                                    let mapped = scale.map_rect_out((
+                                    DamageRegion::new(
                                         r.x.max(0) as u32,
                                         r.y.max(0) as u32,
-                                        (r.x.max(0) as u32).saturating_add(r.width.max(0) as u32),
-                                        (r.y.max(0) as u32).saturating_add(r.height.max(0) as u32),
-                                    ));
-                                    DamageRegion::new(
-                                        mapped.0,
-                                        mapped.1,
-                                        mapped.2.saturating_sub(mapped.0),
-                                        mapped.3.saturating_sub(mapped.1),
+                                        r.width.max(0) as u32,
+                                        r.height.max(0) as u32,
                                     )
                                 })
                                 .collect()
@@ -3740,35 +3461,11 @@ impl LamcoDisplayHandler {
                         // little-endian: the 32-bit value 0xXXRRGGBB stores as [BB,GG,RR,XX].
                         // No pixel format conversion needed.
                         let timestamp_ms = (frame.pts / 1_000_000) as u32;
-                        // Resolution-support fix: uncompressed WireToSurface1 must
-                        // also carry DESKTOP geometry (scaled), never the capture
-                        // size — the surface lives in desktop space. Re-reading the
-                        // shared factors here is impossible (this arm runs before
-                        // the scaling block only when EGFX is on but no H.264
-                        // encoder exists), so scale explicitly.
-                        let unc_scale = { *handler.scale_factors.read() };
-                        let (unc_w, unc_h): (u16, u16) = if unc_scale.is_identity() {
-                            (frame.width as u16, frame.height as u16)
-                        } else {
-                            let dw = (frame.width as u64 * unc_scale.x.0 as u64
-                                / unc_scale.x.1.max(1) as u64)
-                                as u32;
-                            let dh = (frame.height as u64 * unc_scale.y.0 as u64
-                                / unc_scale.y.1.max(1) as u64)
-                                as u32;
-                            (dw as u16, dh as u16)
-                        };
-                        let unc_scaled: std::sync::Arc<Vec<u8>> = if unc_scale.is_identity() {
-                            std::sync::Arc::clone(pixel_bytes)
-                        } else {
-                            std::sync::Arc::new(crate::server::frame_scaler::scale_bgra(
-                                pixel_bytes,
-                                frame.width,
-                                frame.height,
-                                unc_w as u32,
-                                unc_h as u32,
-                            ))
-                        };
+                        // Capture == desktop (kwin-virtual): send the frame
+                        // unscaled at its own geometry.
+                        let (unc_w, unc_h) = (frame.width as u16, frame.height as u16);
+                        let unc_scaled: std::sync::Arc<Vec<u8>> =
+                            std::sync::Arc::clone(pixel_bytes);
                         match sender
                             .send_uncompressed_frame(&unc_scaled, unc_w, unc_h, timestamp_ms)
                             .await
@@ -3835,31 +3532,11 @@ impl LamcoDisplayHandler {
 
                         // PipeWire BGRx = RDP XRGB_8888 on little-endian. No conversion needed.
                         let timestamp_ms = (frame.pts / 1_000_000) as u32;
-                        // Resolution support: V8 WireToSurface1 in DESKTOP space —
-                        // scale explicitly (this arm runs before the main
-                        // scaling block).
-                        let v8s = { *handler.scale_factors.read() };
-                        let (v8s_w, v8s_h): (u16, u16) = if v8s.is_identity() {
-                            (frame.width as u16, frame.height as u16)
-                        } else {
-                            (
-                                ((frame.width as u64 * v8s.x.0 as u64) / v8s.x.1.max(1) as u64)
-                                    as u16,
-                                ((frame.height as u64 * v8s.y.0 as u64) / v8s.y.1.max(1) as u64)
-                                    as u16,
-                            )
-                        };
-                        let v8s_scaled: std::sync::Arc<Vec<u8>> = if v8s.is_identity() {
-                            std::sync::Arc::clone(pixel_bytes)
-                        } else {
-                            std::sync::Arc::new(crate::server::frame_scaler::scale_bgra(
-                                pixel_bytes,
-                                frame.width,
-                                frame.height,
-                                v8s_w as u32,
-                                v8s_h as u32,
-                            ))
-                        };
+                        // Capture == desktop (kwin-virtual): V8
+                        // WireToSurface1 sends the frame unscaled.
+                        let (v8s_w, v8s_h) = (frame.width as u16, frame.height as u16);
+                        let v8s_scaled: std::sync::Arc<Vec<u8>> =
+                            std::sync::Arc::clone(pixel_bytes);
                         match sender
                             .send_uncompressed_frame(&v8s_scaled, v8s_w, v8s_h, timestamp_ms)
                             .await
@@ -3888,19 +3565,14 @@ impl LamcoDisplayHandler {
                 }
 
                 let convert_start = std::time::Instant::now();
-                // Resolution support: the bitmap (RemoteFX) fallback path goes
-                // through BitmapConverter::convert_frame, which reads the
-                // VIDEO FRAME's own dimensions. Hand it a DESKTOP-sized frame:
-                // identity is a zero-cost move; otherwise scale the pixels and
-                // rewrite geometry + damage regions into desktop space.
-                let bmp_scale = { *handler.scale_factors.read() };
-                let frame = if bmp_scale.is_identity() {
-                    // Identity: rows are already tight (stride == width*4, the
-                    // reception compaction guarantees it). But the bitmap
-                    // converter's dst_stride is 64-byte ALIGNED
-                    // (1366*4=5464 -> 5504), so same-format conversion still
-                    // can't take the fast path at odd widths. Pad to the RDP
-                    // stride so convert_format memcpy-fires.
+                // Capture == desktop (kwin-virtual): the bitmap (RemoteFX)
+                // fallback path gets the frame at its own geometry. Rows are
+                // tight (stride == width*4, the reception compaction
+                // guarantees it), but the bitmap converter's dst_stride is
+                // 64-byte ALIGNED (1366*4=5464 -> 5504), so same-format
+                // conversion still can't take the fast path at odd widths.
+                // Pad to the RDP stride so convert_format memcpy-fires.
+                let frame = {
                     let pixel_bytes = match &frame.buffer {
                         lamco_pipewire::FrameBuffer::Memory(data) => data,
                         lamco_pipewire::FrameBuffer::DmaBuf(_) => {
@@ -3927,63 +3599,6 @@ impl LamcoDisplayHandler {
                         f.stride = rdp_stride as u32;
                         f
                     }
-                } else {
-                    let pixel_bytes = match &frame.buffer {
-                        lamco_pipewire::FrameBuffer::Memory(data) => std::sync::Arc::clone(data),
-                        lamco_pipewire::FrameBuffer::DmaBuf(_) => {
-                            // The bitmap path cannot read DMA-BUF; drop rather
-                            // than send geometry-mismatched data.
-                            frames_dropped += 1;
-                            continue;
-                        }
-                    };
-                    let dw = (frame.width as u64 * bmp_scale.x.0 as u64
-                        / bmp_scale.x.1.max(1) as u64) as u32;
-                    let dh = (frame.height as u64 * bmp_scale.y.0 as u64
-                        / bmp_scale.y.1.max(1) as u64) as u32;
-                    let scaled = crate::server::frame_scaler::scale_bgra(
-                        &pixel_bytes,
-                        frame.width,
-                        frame.height,
-                        dw,
-                        dh,
-                    );
-                    // BitmapConverter's convert_format fast path requires
-                    // src_stride == dst_stride, and dst_stride is 64-byte
-                    // aligned (calculate_rdp_stride: 1366*4=5464 -> 5504).
-                    // scale_bgra emits TIGHT rows — pad them to the RDP
-                    // stride so the same-format conversion takes the
-                    // memcpy path instead of failing "BGRx -> BGRx".
-                    let rdp_stride = (dw as usize * 4).div_ceil(64) * 64;
-                    let mut padded = Vec::with_capacity(rdp_stride * dh as usize);
-                    for y in 0..dh as usize {
-                        padded.extend_from_slice(&scaled[y * dw as usize * 4..][..dw as usize * 4]);
-                        padded.resize(rdp_stride * (y + 1), 0);
-                    }
-                    let mut f = frame.clone();
-                    f.buffer = lamco_pipewire::FrameBuffer::Memory(std::sync::Arc::new(padded));
-                    f.width = dw;
-                    f.height = dh;
-                    f.stride = rdp_stride as u32;
-                    f.damage_regions = frame
-                        .damage_regions
-                        .iter()
-                        .map(|r| {
-                            let m = bmp_scale.map_rect_out((
-                                r.x.max(0) as u32,
-                                r.y.max(0) as u32,
-                                (r.x.max(0) as u32).saturating_add(r.width.max(0) as u32),
-                                (r.y.max(0) as u32).saturating_add(r.height.max(0) as u32),
-                            ));
-                            lamco_pipewire::FfiDamageRegion {
-                                x: m.0 as i32,
-                                y: m.1 as i32,
-                                width: m.2.saturating_sub(m.0),
-                                height: m.3.saturating_sub(m.1),
-                            }
-                        })
-                        .collect();
-                    f
                 };
                 let bitmap_update = match handler.convert_to_bitmap(frame).await {
                     Ok(bitmap) => bitmap,
@@ -4133,16 +3748,9 @@ impl RdpServerDisplay for LamcoDisplayHandler {
 
     /// Called by IronRDP during capability set processing.
     ///
-    /// 2026-08-30 (resolution support, Phase 1): ADOPT the client's requested
-    /// desktop size instead of echoing the compositor size. The client's
-    /// dialog choice (mstsc 2560x1440, vmconnect 1920x1200, ...) becomes the
-    /// RDP desktop; the compositor is separately switched to the closest
-    /// listed DRM mode (exact match preferred), and any remaining mismatch is
-    /// bridged by scaling frames capture->desktop (`frame_scaler`).
-    ///
-    /// This replaces the Aug-19 approach ("keep compositor size to avoid
-    /// mismatch") — that worked only because nothing bridged the mismatch;
-    /// the scaler now does.
+    /// ADOPT the client's requested desktop size. With the kwin-virtual
+    /// strategy the compositor-side virtual output is recreated at exactly
+    /// this size (elastic capture), so capture == desktop by construction.
     async fn request_initial_size(&mut self, client_size: DesktopSize) -> DesktopSize {
         let current = {
             let s = self.size.read().await;
@@ -4191,34 +3799,23 @@ impl RdpServerDisplay for LamcoDisplayHandler {
                     }
                     None => {
                         warn!(
-                            "Elastic capture failed at {}x{} — falling back to compositor path",
+                            "Elastic capture failed at {}x{} — keeping current desktop size",
                             client_size.width, client_size.height
                         );
-                        // Fall through to the mode-switch path below.
+                        // Fall through: adopt the client's size as the RDP
+                        // desktop anyway. The per-frame capture-size tracking
+                        // records what the source actually delivers.
                     }
                 }
             }
         }
 
-        // Best-effort compositor pre-switch: EXACT mode match only (see
-        // change_compositor_resolution — no heuristic snaps; a stable capture
-        // beats an aspect-foreign mode whose mid-connect switch wedged the
-        // stream into a double renegotiation and a black screen).
-        let (mode_w, mode_h) = change_compositor_resolution(client_size.width, client_size.height);
-
-        // 2026-08-30 (follow-up fix): do NOT record the pre-switch's CLAIMED
-        // mode as capture_size — the claim may never land (KWin ignores it)
-        // or land LATE, making the PipeWire stream renegotiate after the
-        // first frame. The pipeline now tracks capture size CONTINUOUSLY per
-        // frame ("Capture size changed: ..."), so every transition — early,
-        // late, or repeated — self-heals. No one-shot flag to set; nothing to
-        // trust here.
         self.update_size(client_size.width, client_size.height)
             .await;
 
         info!(
-            "request_initial_size: adopted client desktop {}x{} (compositor mode {}x{}, capture truth deferred to first frame)",
-            client_size.width, client_size.height, mode_w, mode_h
+            "request_initial_size: adopted client desktop {}x{} (capture truth deferred to first frame)",
+            client_size.width, client_size.height
         );
 
         client_size
@@ -4489,7 +4086,6 @@ impl Clone for LamcoDisplayHandler {
             direct_channel_mode: self.direct_channel_mode,
             use_dmabuf: Arc::clone(&self.use_dmabuf),
             capture_size: Arc::clone(&self.capture_size),
-            scale_factors: Arc::clone(&self.scale_factors),
             elastic_capture: parking_lot::RwLock::new(self.elastic_capture.read().clone()),
         }
     }
@@ -4710,38 +4306,6 @@ fn transpose(data: &[u8], width: u32, height: u32, stride: u32, bpp: u32) -> (Ve
 mod tests {
     use super::*;
     use crate::video::{BitmapData, Rectangle};
-
-    // === kscreen-doctor mode parsing (resolution support) ===
-
-    const KSCREEN_SAMPLE: &str = "Output: 1 Virtual-1\n        Modes:  1:1024x768@60*!  2:1920x1080@60  3:1600x1200@60  9:1280x1024@60\n";
-
-    #[test]
-    fn test_find_exact_mode_matches_listed_size() {
-        assert_eq!(
-            find_exact_mode(KSCREEN_SAMPLE, 1920, 1080),
-            Some((1920, 1080))
-        );
-        assert_eq!(
-            find_exact_mode(KSCREEN_SAMPLE, 1280, 1024),
-            Some((1280, 1024))
-        );
-    }
-
-    #[test]
-    fn test_find_exact_mode_rejects_unlisted_size() {
-        // The 1920x1200 request that previously snapped to 1600x1200 must
-        // now find NOTHING — the caller keeps the current mode instead.
-        assert_eq!(find_exact_mode(KSCREEN_SAMPLE, 1920, 1200), None);
-        assert_eq!(find_exact_mode(KSCREEN_SAMPLE, 2560, 1440), None);
-    }
-
-    #[test]
-    fn test_current_mode_reads_star_marker() {
-        // `1:1024x768@60*!` — the * marks the active mode.
-        assert_eq!(current_mode(KSCREEN_SAMPLE), Some((1024, 768)));
-        // No marker anywhere → None (caller falls back).
-        assert_eq!(current_mode("Modes: 1:640x480@60 2:800x600@60\n"), None);
-    }
 
     #[tokio::test]
     async fn test_pixel_format_conversion() {

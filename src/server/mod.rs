@@ -71,7 +71,6 @@ mod dmabuf_materialize;
 mod egfx_sender;
 #[expect(dead_code, reason = "WIP: not yet integrated into the server pipeline")]
 mod event_multiplexer;
-mod frame_scaler;
 mod gfx_factory;
 mod graphics_drain;
 mod input_handler;
@@ -1047,7 +1046,6 @@ impl LamcoRdpServer {
                     input_tx,
                     input_rx,
                     shutdown_broadcast.subscribe(),
-                    display_handler.scale_factors_handle(), // Desktop->capture pointer mapping
                 )
                 .context("Failed to create wlr-direct input handler")?;
 
@@ -1415,7 +1413,6 @@ impl LamcoRdpServer {
             input_tx.clone(), // Multiplexer input queue sender (for handler callbacks)
             input_rx,         // Multiplexer input queue receiver (for batching task)
             shutdown_broadcast.subscribe(), // Shutdown signal for batching task
-            display_handler.scale_factors_handle(), // Desktop->capture pointer mapping
         )
         .context("Failed to create input handler")?;
 
