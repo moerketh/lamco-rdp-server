@@ -251,17 +251,23 @@ impl SessionHandle for KwinVirtualSessionHandle {
                 .map_or((1920, 1200), |st| (st.width as u16, st.height as u16))
         };
 
-        // Output management PER CONNECTION (not at session creation): the
-        // console must stay visible while the server idles, or the one-time
-        // input-consent dialog and any future console interaction would be
-        // blanked. The E2E recipe disabled the DRM output right before
-        // capture; recreate that ordering here.
+        // CREATE the virtual output FIRST, then disable the physical one.
+        // Order matters: kscreen-doctor refuses to disable the ONLY enabled
+        // output (a compositor can't go headless by kscreen), and KWin/kscreen
+        // silently re-enables it — the live session 2026-09-02 proved it
+        // (Virtual-1 enabled again at (0,0), desktop stayed there, the
+        // captured Virtual-lamco was an empty idle area: black). The E2E
+        // recipe that worked (krfb) created the output before disabling the
+        // DRM one. Same order here: with Virtual-lamco already live,
+        // disabling Virtual-1 makes the virtual the primary at (0,0) — the
+        // panel relocates, the coordinate chain closes.
+        let _node = self.recreate_stream(w, h).await?;
+
         if self.layout_guard.read().await.is_none() {
             let guard = OutputLayoutGuard::engage().await;
             *self.layout_guard.write().await = Some(Arc::new(guard));
         }
 
-        let _node = self.recreate_stream(w, h).await?;
         let streams = self.streams.read().await.clone();
         Ok((streams, true))
     }
@@ -688,7 +694,7 @@ struct OutputLayoutGuard {
 impl OutputLayoutGuard {
     /// Snapshot enabled non-virtual outputs, then disable them.
     async fn engage() -> Self {
-        let names = tokio::task::spawn_blocking(list_enabled_physical_outputs)
+        let mut names = tokio::task::spawn_blocking(list_enabled_physical_outputs)
             .await
             .unwrap_or_default();
         if names.is_empty() {
@@ -701,11 +707,56 @@ impl OutputLayoutGuard {
             "[kwin-virtual] disabling physical output(s) for session: [{}]",
             names.join(", ")
         );
-        for name in &names {
+        for name in names.iter() {
             let n = name.clone();
             let _ = tokio::task::spawn_blocking(move || disable_output(&n))
                 .await
                 .unwrap_or(false);
+        }
+        // VERIFY the disables stuck. KWin/kscreen can silently refuse —
+        // notably disabling the only enabled output, which is reverted
+        // immediately (live 2026-09-02: Virtual-1 came back enabled at
+        // (0,0) and the captured virtual output stayed an empty secondary:
+        // black screen). Callers of engage() must have created the virtual
+        // output FIRST so a disable here leaves a valid layout; if a
+        // disable still bounced, retry once after the compositor settles.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let still_enabled = tokio::task::spawn_blocking(list_enabled_physical_outputs)
+            .await
+            .unwrap_or_default();
+        let bounced: Vec<String> = names
+            .iter()
+            .filter(|n| still_enabled.contains(n))
+            .cloned()
+            .collect();
+        if !bounced.is_empty() {
+            warn!(
+                "[kwin-virtual] disable bounced for [{}] — retrying once after settle",
+                bounced.join(", ")
+            );
+            for name in bounced.iter() {
+                let n = name.clone();
+                let _ = tokio::task::spawn_blocking(move || disable_output(&n))
+                    .await
+                    .unwrap_or(false);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            let final_enabled = tokio::task::spawn_blocking(list_enabled_physical_outputs)
+                .await
+                .unwrap_or_default();
+            let stuck: Vec<String> = names
+                .iter()
+                .filter(|n| final_enabled.contains(n))
+                .cloned()
+                .collect();
+            if !stuck.is_empty() {
+                warn!(
+                    "[kwin-virtual] outputs still enabled after retry: [{}] — continuing (panel may be elsewhere)",
+                    stuck.join(", ")
+                );
+            }
+            // Only bookkeep the ones that actually disabled.
+            names.retain(|n| !final_enabled.contains(n));
         }
         Self { disabled: names }
     }
