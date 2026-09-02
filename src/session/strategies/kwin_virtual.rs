@@ -52,6 +52,9 @@ use crate::session::strategy::{
 /// Default output name KWin will assign/connect (`Virtual-<name>` in kscreen).
 pub const OUTPUT_NAME: &str = "lamco";
 
+/// The full kscreen connector name of our virtual output (`Virtual-{OUTPUT_NAME}`).
+const VIRTUAL_OUTPUT_KSCREEN_NAME: &str = "Virtual-lamco";
+
 /// Commands sent to the Wayland connection thread.
 enum WlCommand {
     /// Create a virtual output at the given size; replies with the PipeWire node id.
@@ -251,17 +254,30 @@ impl SessionHandle for KwinVirtualSessionHandle {
                 .map_or((1920, 1200), |st| (st.width as u16, st.height as u16))
         };
 
-        // CREATE the virtual output FIRST, then disable the physical one.
-        // Order matters: kscreen-doctor refuses to disable the ONLY enabled
-        // output (a compositor can't go headless by kscreen), and KWin/kscreen
-        // silently re-enables it — the live session 2026-09-02 proved it
-        // (Virtual-1 enabled again at (0,0), desktop stayed there, the
-        // captured Virtual-lamco was an empty idle area: black). The E2E
-        // recipe that worked (krfb) created the output before disabling the
-        // DRM one. Same order here: with Virtual-lamco already live,
-        // disabling Virtual-1 makes the virtual the primary at (0,0) — the
-        // panel relocates, the coordinate chain closes.
+        // CREATE the virtual output FIRST, then make sure it is ENABLED,
+        // then disable the physical one. Order matters twice over:
+        //
+        // 1. zkde's stream_virtual_output can create the output in a
+        //    DISABLED state — notably when a previous manual
+        //    `kscreen-doctor output.Virtual-lamco.disable` persisted to
+        //    kwinoutputconfig.json (live 2026-09-02: my own zombie cleanup
+        //    did exactly that, and every later output was born disabled).
+        //    A disabled virtual output does not count as "an enabled
+        //    output", so KWin then refuses the physical disable with
+        //    "Disabling all outputs through configuration changes is not
+        //    allowed" — the desktop stays on Virtual-1 and the captured
+        //    virtual area is empty: black screen.
+        // 2. kscreen-doctor refuses to disable the ONLY enabled output
+        //    (same guard, for the born-enabled case before the virtual is
+        //    up).
+        //
+        // So: create → explicitly enable (position/mode are already right
+        // from creation; enable is idempotent) → disable physical. The E2E
+        // recipe (krfb) had the same effective order.
         let _node = self.recreate_stream(w, h).await?;
+        let _ = tokio::task::spawn_blocking(move || enable_output(VIRTUAL_OUTPUT_KSCREEN_NAME))
+            .await
+            .unwrap_or(false);
 
         if self.layout_guard.read().await.is_none() {
             let guard = OutputLayoutGuard::engage().await;
