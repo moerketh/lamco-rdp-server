@@ -234,7 +234,7 @@ ironrdp-rdcleanpath = { git = "https://github.com/moerketh/IronRDP", rev = "106a
 # -----------------------------------------------------------------------------
 # System and utilities
 # -----------------------------------------------------------------------------
-nix = { version = "0.30", features = ["signal", "process", "mman"] }
+nix = { version = "0.30", features = ["signal", "process", "mman", "poll"] }
 libc = "0.2"
 fuser = "0.17"  # FUSE filesystem for clipboard file transfer
 chrono = { version = "0.4", features = ["serde"] }

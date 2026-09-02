@@ -285,6 +285,19 @@ impl SessionHandle for KwinVirtualSessionHandle {
         // The virtual output is elastic: recreate it at the requested size
         // and the stream follows. zkde-screencast accepts ANY resolution —
         // this is the whole point of the strategy (no DRM mode list).
+        //
+        // Short-circuit when the size already matches: establish_for_client
+        // creates the stream and request_initial_size follows immediately
+        // with the client's request — recreating at the SAME size churns
+        // the output (close+create+rebind) on every connect for nothing.
+        {
+            let cur = self.streams.read().await;
+            if let Some(s) = cur.first() {
+                if s.width == width as u32 && s.height == height as u32 {
+                    return Some((width, height));
+                }
+            }
+        }
         if let Err(e) = self.recreate_stream(width, height).await {
             warn!("[kwin-virtual] resize to {width}x{height} failed: {e} — keeping current stream");
             let cur = self.streams.read().await;
@@ -369,6 +382,7 @@ impl StreamRequestMachine {
 }
 
 fn wayland_thread(rx: std::sync::mpsc::Receiver<WlCommand>) {
+    use std::os::fd::AsFd as _;
     use wayland_client::{Connection, Dispatch, QueueHandle, protocol::wl_registry};
 
     use wayland_protocols_plasma::screencast::v1::client::{
@@ -380,7 +394,13 @@ fn wayland_thread(rx: std::sync::mpsc::Receiver<WlCommand>) {
     /// Per-thread dispatch state.
     struct State {
         screencast: Option<ZkdeScreencastUnstableV1>,
-        /// Pending stream: the object + where to send the result.
+        /// Pending request: the object + where to send the result. The
+        /// reply is consumed on the FIRST conclusive event; the proxy itself
+        /// is RETAINED here after conclusion so a later Close command can
+        /// destroy the stream (KWin keeps the virtual output alive until
+        /// the stream object is destroyed — dropping the proxy too early
+        /// leaves a zombie output that blocks every subsequent create,
+        /// observed live 2026-09-02).
         pending: Option<(
             ZkdeScreencastStreamUnstableV1,
             Option<tokio::sync::oneshot::Sender<Result<u32, String>>>,
@@ -452,10 +472,16 @@ fn wayland_thread(rx: std::sync::mpsc::Receiver<WlCommand>) {
         ) {
             // Pure transition, then deliver: the state machine decides if
             // the event concludes the pending request (first conclusive
-            // event wins); delivery consumes the pending reply channel.
+            // event wins). Consume ONLY the reply — the stream PROXY is
+            // retained in state.pending so a later Close command can
+            // destroy the stream (KWin removes the virtual output only on
+            // stream destruction; dropping the proxy early left a zombie
+            // output that wedged all reconnects, observed live 2026-09-02).
             if let Some(outcome) = state.stream_sm.transition(&event) {
-                if let Some((_, Some(reply))) = state.pending.take() {
-                    let _ = reply.send(outcome);
+                if let Some(pending) = state.pending.as_mut() {
+                    if let Some(reply) = pending.1.take() {
+                        let _ = reply.send(outcome);
+                    }
                 }
             }
         }
@@ -512,7 +538,67 @@ fn wayland_thread(rx: std::sync::mpsc::Receiver<WlCommand>) {
     }
 
     loop {
-        // Drain commands first (non-blocking), then dispatch pending events.
+        // Poll the Wayland socket with a short timeout so queued commands
+        // are picked up promptly. This is the fix for the parked-thread
+        // wedge (2026-09-02 live session): blocking_dispatch only wakes on
+        // COMPOSITOR events, and an idle desktop (fresh virtual output
+        // showing nothing) produces none — commands then sat unprocessed
+        // until the 10s timeout, so resize failed on connect and every
+        // reconnect wedged forever. std mpsc has no pollable fd, so the
+        // command side is a 50ms poll timeout; ≤50ms command latency is
+        // fine (the `created` reply is what gates callers, not this loop).
+        let mut poll_fds = [nix::poll::PollFd::new(
+            conn.as_fd(),
+            nix::poll::PollFlags::POLLIN,
+        )];
+        let rc = match nix::poll::poll(&mut poll_fds, 50u16) {
+            Ok(n) => n,
+            Err(nix::errno::Errno::EINTR) => continue,
+            Err(e) => {
+                error!("[kwin-virtual] poll failed: {e} — thread exiting");
+                if let Some(pending) = state.pending.take() {
+                    if let Some(reply) = pending.1 {
+                        let _ = reply.send(Err(format!("poll failed: {e}")));
+                    }
+                }
+                return;
+            }
+        };
+
+        // Wayland socket ready: read + dispatch compositor events.
+        if rc > 0
+            && poll_fds[0]
+                .revents()
+                .is_some_and(|f| f.contains(nix::poll::PollFlags::POLLIN))
+        {
+            if let Some(guard) = event_queue.prepare_read() {
+                match guard.read() {
+                    Ok(_) => {}
+                    Err(e) => {
+                        error!("[kwin-virtual] wayland socket read failed: {e} — thread exiting");
+                        if let Some(pending) = state.pending.take() {
+                            if let Some(reply) = pending.1 {
+                                let _ = reply.send(Err(format!("wayland read failed: {e}")));
+                            }
+                        }
+                        return;
+                    }
+                }
+            }
+            if let Err(e) = event_queue.dispatch_pending(&mut state) {
+                error!("[kwin-virtual] dispatch failed: {e} — thread exiting");
+                if let Some(pending) = state.pending.take() {
+                    if let Some(reply) = pending.1 {
+                        let _ = reply.send(Err(format!("dispatch failed: {e}")));
+                    }
+                }
+                return;
+            }
+        }
+
+        // Drain queued commands (arriving while parked or during the poll
+        // window — try_recv is cheap, and this also covers the case where
+        // the channel filled between the poll and now).
         loop {
             match rx.try_recv() {
                 Ok(WlCommand::CreateStream {
@@ -524,7 +610,11 @@ fn wayland_thread(rx: std::sync::mpsc::Receiver<WlCommand>) {
                         let _ = reply.send(Err("zkde_screencast global not bound".into()));
                         continue;
                     };
-                    // One stream at a time: close any previous.
+                    // One stream at a time: destroy any previous stream (the
+                    // proxy is RETAINED here even after the request concluded,
+                    // because KWin keeps the virtual output alive until the
+                    // stream object is destroyed — dropping it early left a
+                    // zombie output that wedged all reconnects, live 2026-09-02).
                     if let Some((prev, _)) = state.pending.take() {
                         prev.close();
                     }
@@ -548,15 +638,17 @@ fn wayland_thread(rx: std::sync::mpsc::Receiver<WlCommand>) {
                     }
                 }
                 Ok(WlCommand::Close) => {
-                    if let Some((stream, reply)) = state.pending.take() {
-                        // No reply expected for Close; drop the pending
-                        // oneshot silently.
-                        drop(reply);
+                    // The ONLY place the stream is destroyed — this is what
+                    // makes KWin remove the virtual output (the proxy was
+                    // retained past the concluded request for exactly this
+                    // call).
+                    if let Some((stream, _)) = state.pending.take() {
                         stream.close();
                         state.stream_sm.reset();
                         if let Err(e) = conn.flush() {
                             warn!("[kwin-virtual] flush failed: {e}");
                         }
+                        info!("[kwin-virtual] stream destroyed on Close command");
                     }
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
@@ -568,19 +660,9 @@ fn wayland_thread(rx: std::sync::mpsc::Receiver<WlCommand>) {
             }
         }
 
-        // Blocking dispatch: waits for compositor events. Commands queued in
-        // the meantime unblock via the next wake; the `created` reply is what
-        // actually gates callers, so latency is fine.
-        match event_queue.blocking_dispatch(&mut state) {
-            Ok(_) => {}
-            Err(e) => {
-                error!("[kwin-virtual] dispatch failed: {e} — thread exiting");
-                // Fail any pending request.
-                if let Some((_, Some(reply))) = state.pending.take() {
-                    let _ = reply.send(Err(format!("dispatch failed: {e}")));
-                }
-                return;
-            }
+        // Always flush before the next poll iteration so requests reach KWin.
+        if let Err(e) = conn.flush() {
+            warn!("[kwin-virtual] flush failed: {e}");
         }
     }
 }
@@ -714,10 +796,16 @@ fn parse_enabled_physical_outputs(kscreen_text: &str) -> Vec<String> {
     /// The exact name KWin gives our zkde-created virtual output.
     const VIRTUAL_OUTPUT_NAME: &str = "Virtual-lamco";
 
+    // kscreen-doctor colorizes its output unconditionally (even piped), so
+    // ANSI escape sequences sit between the marker words and the values
+    // (live raw dump 2026-09-02: "\u{1b}[01;32mOutput: \u{1b}[0;0m1 Virtual-1").
+    // Strip them BEFORE matching, or every comparison misses.
+    let stripped = strip_ansi(kscreen_text);
+
     let mut result = Vec::new();
     let mut current_name: Option<String> = None;
     let mut current_enabled = false;
-    for line in kscreen_text.lines() {
+    for line in stripped.lines() {
         let line = line.trim();
         if let Some(rest) = line.strip_prefix("Output: ") {
             // Flush previous block.
@@ -740,6 +828,30 @@ fn parse_enabled_physical_outputs(kscreen_text: &str) -> Vec<String> {
         }
     }
     result
+}
+
+/// Remove ANSI escape sequences (ESC [ ... final-byte). kscreen-doctor
+/// emits color codes even when stdout is a pipe.
+fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        // ESC '[' → CSI sequence: consume params/intermediates until the
+        // final byte (0x40–0x7E).
+        if chars.next() == Some('[') {
+            for c in chars.by_ref() {
+                if ('@'..='~').contains(&c) {
+                    break;
+                }
+            }
+        }
+        // A bare ESC with no '[' is dropped (rare/undefined here).
+    }
+    out
 }
 
 fn disable_output(name: &str) -> bool {
@@ -924,6 +1036,35 @@ mod tests {
         let text = "Output: 1 Virtual-1\n        enabled";
         let names = parse_enabled_physical_outputs(text);
         assert_eq!(names, vec!["Virtual-1".to_string()]);
+    }
+
+    #[test]
+    fn test_parser_ansi_colored_output_is_parsed() {
+        // LIVE REGRESSION (2026-09-02, TEST_20260902110104): kscreen-doctor
+        // colorizes unconditionally — even piped. The ANSI bytes between
+        // "Output: " and the values made every comparison miss, so the
+        // guard never disabled Virtual-1, the desktop stayed on the
+        // physical output, and the captured virtual output was a black,
+        // frame-idle screen. Fixture is the exact raw dump from the journal.
+        let text = "\u{1b}[01;32mOutput: \u{1b}[0;0m1 Virtual-1\n\t\u{1b}[01;32menabled\u{1b}[0;0m\n\t\u{1b}[01;32mconnected\u{1b}[0;0m\n\t\u{1b}[01;32mpriority 1\u{1b}[0;0m\n\t\u{1b}[01;33mUnknown\u{1b}[0;0m\n\t\u{1b}[01;34mModes: \u{1b}[0;0m 1:1024x768@60!  2:1920x1080@60* \nOutput: 2 Virtual-lamco\n\tenabled\n";
+        let names = parse_enabled_physical_outputs(text);
+        assert_eq!(names, vec!["Virtual-1".to_string()]);
+    }
+
+    #[test]
+    fn test_strip_ansi_removes_all_csi_sequences() {
+        assert_eq!(strip_ansi("plain text"), "plain text");
+        assert_eq!(
+            strip_ansi("\u{1b}[01;32mOutput: \u{1b}[0;0m1 Virtual-1"),
+            "Output: 1 Virtual-1"
+        );
+        assert_eq!(
+            strip_ansi("\u{1b}[0m enabled \u{1b}[01;32mx\u{1b}[0m"),
+            " enabled x"
+        );
+        // Empty and multi-line inputs survive.
+        assert_eq!(strip_ansi(""), "");
+        assert_eq!(strip_ansi("\u{1b}[1mA\n\u{1b}[0mB"), "A\nB");
     }
 
     // ========================================================================
