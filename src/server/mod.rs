@@ -875,7 +875,7 @@ impl LamcoRdpServer {
             }
 
             // Report subsystems that aren't wired in this code path
-            if !is_wlr_direct && !is_portal_generic {
+            if !is_wlr_direct && !is_portal_generic && !is_kwin_virtual {
                 // ScreenCastOnly: no input injection at all
                 health_reporter.report(crate::health::HealthEvent::SubsystemNotAvailable {
                     subsystem: "input".into(),
@@ -985,8 +985,14 @@ impl LamcoRdpServer {
                 });
             }
 
-            let mut rdp_server = if is_wlr_direct || is_portal_generic {
-                // wlr-direct/portal-generic: input via session handle (native Wayland protocols)
+            let mut rdp_server = if is_wlr_direct || is_portal_generic || is_kwin_virtual {
+                // wlr-direct/portal-generic: input via session handle (native Wayland protocols).
+                // kwin-virtual: input via the strategy's libei session handle
+                // (Portal RemoteDesktop + EIS — the same machinery the kwin-virtual
+                // strategy composes). The live session 2026-09-02 showed why this
+                // must be wired: without it the builder fell into the with_no_input()
+                // branch, EIS never activated, and the client got a remote image
+                // with dead clicks.
                 let monitors: Vec<InputMonitorInfo> = stream_info
                     .iter()
                     .enumerate()
