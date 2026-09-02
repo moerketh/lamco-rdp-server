@@ -535,8 +535,9 @@ pub struct LamcoDisplayHandler {
     /// Graphics queue sender (for priority multiplexing)
     graphics_tx: Option<mpsc::Sender<GraphicsFrame>>,
 
-    /// Monitor configuration from streams
-    stream_info: Vec<StreamInfo>,
+    /// Monitor configuration from streams (interior-mutable: per-connection
+    /// strategies replace it on establish via set_stream_info)
+    stream_info: Arc<RwLock<Vec<StreamInfo>>>,
 
     // === EGFX/H.264 Support ===
     /// Shared GFX server handle for EGFX frame sending
@@ -777,7 +778,7 @@ impl LamcoDisplayHandler {
             capture_node: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(
                 stream_info.first().map_or(0, |s| s.node_id),
             )),
-            stream_info,
+            stream_info: Arc::new(RwLock::new(stream_info)),
             gfx_server_handle,
             gfx_handler_state,
             server_event_tx: Arc::new(RwLock::new(None)),
@@ -882,7 +883,7 @@ impl LamcoDisplayHandler {
             capture_node: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(
                 stream_info.first().map_or(0, |s| s.node_id),
             )),
-            stream_info,
+            stream_info: Arc::new(RwLock::new(stream_info)),
             gfx_server_handle,
             gfx_handler_state,
             server_event_tx: Arc::new(RwLock::new(None)),
@@ -940,6 +941,19 @@ impl LamcoDisplayHandler {
         info!("Elastic capture resize hook set (native virtual output resizing)");
     }
 
+    /// Replace the stream/monitor geometry table (per-connection strategies).
+    ///
+    /// kwin-virtual establishes its streams PER CONNECTION: at server start
+    /// there is no stream at all, so the display handler is constructed with
+    /// empty `stream_info` and a placeholder input-transformer monitor. When
+    /// a client connects and `establish_for_client` produces the real stream
+    /// geometry, this pushes it into the table so the input transformer's
+    /// re-sync (update_capture_size) has the real per-stream geometry to
+    /// build clicks from — otherwise clicks map against the placeholder
+    /// forever (live 2026-09-02: image perfect, clicks dead).
+    pub async fn set_stream_info(&self, streams: Vec<StreamInfo>) {
+        *self.stream_info.write().await = streams;
+    }
     /// Set the shared stream active flag for Portal input coupling.
     ///
     /// The display handler updates this flag on PipeWire state transitions.
@@ -1494,6 +1508,8 @@ impl LamcoDisplayHandler {
         if let Some(ref ih) = *self.input_handler.read().await {
             let monitors: Vec<crate::input::MonitorInfo> = self
                 .stream_info
+                .read()
+                .await
                 .iter()
                 .map(|s| {
                     // Primary monitor carries the CURRENT capture size;
@@ -2016,7 +2032,7 @@ impl LamcoDisplayHandler {
                         // 1. Destroy existing PipeWire stream. Use the live
                         // capture node — a session re-establishment may have
                         // rebound it away from the startup node in stream_info.
-                        if !handler.stream_info.is_empty() {
+                        if !handler.stream_info.read().await.is_empty() {
                             let node_id = handler
                                 .capture_node
                                 .load(std::sync::atomic::Ordering::Relaxed);

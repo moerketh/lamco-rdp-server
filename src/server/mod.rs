@@ -993,25 +993,51 @@ impl LamcoRdpServer {
                 // must be wired: without it the builder fell into the with_no_input()
                 // branch, EIS never activated, and the client got a remote image
                 // with dead clicks.
-                let monitors: Vec<InputMonitorInfo> = stream_info
-                    .iter()
-                    .enumerate()
-                    .map(|(idx, stream)| InputMonitorInfo {
-                        id: idx as u32,
-                        name: format!("Monitor {idx}"),
-                        x: stream.position.0,
-                        y: stream.position.1,
-                        width: stream.size.0,
-                        height: stream.size.1,
+                // Monitor list for the input handler's coordinate
+                // transformer. wlr-direct/portal-generic have their streams
+                // at startup; kwin-virtual creates them PER CONNECTION
+                // (stream_info is empty here). Pass a placeholder primary
+                // so the transformer initializes — the display handler
+                // re-syncs monitors when the connection establishes the
+                // stream geometry (update_monitors / capture re-sync), so
+                // clicks use the real coordinates once the client is in.
+                let monitors: Vec<InputMonitorInfo> = if stream_info.is_empty() {
+                    vec![InputMonitorInfo {
+                        id: 0,
+                        name: "placeholder".to_string(),
+                        x: 0,
+                        y: 0,
+                        width: 1920,
+                        height: 1080,
                         dpi: 96.0,
                         scale_factor: 1.0,
-                        stream_x: stream.position.0 as u32,
-                        stream_y: stream.position.1 as u32,
-                        stream_width: stream.size.0,
-                        stream_height: stream.size.1,
-                        is_primary: idx == 0,
-                    })
-                    .collect();
+                        stream_x: 0,
+                        stream_y: 0,
+                        stream_width: 1920,
+                        stream_height: 1080,
+                        is_primary: true,
+                    }]
+                } else {
+                    stream_info
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, stream)| InputMonitorInfo {
+                            id: idx as u32,
+                            name: format!("Monitor {idx}"),
+                            x: stream.position.0,
+                            y: stream.position.1,
+                            width: stream.size.0,
+                            height: stream.size.1,
+                            dpi: 96.0,
+                            scale_factor: 1.0,
+                            stream_x: stream.position.0 as u32,
+                            stream_y: stream.position.1 as u32,
+                            stream_width: stream.size.0,
+                            stream_height: stream.size.1,
+                            is_primary: idx == 0,
+                        })
+                        .collect()
+                };
 
                 let (input_tx, input_rx) = tokio::sync::mpsc::channel(256);
                 let input_handler = LamcoInputHandler::new(
