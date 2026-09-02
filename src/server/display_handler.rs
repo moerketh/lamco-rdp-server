@@ -1237,21 +1237,28 @@ impl LamcoDisplayHandler {
         Some(sender)
     }
 
-    /// Update the desktop size
+    /// Update the stored desktop size WITHOUT signaling a session resize.
     ///
-    /// Called when monitor configuration changes or client requests resize.
-    pub async fn update_size(&self, width: u16, height: u16) {
+    /// Used during initial capability processing (`request_initial_size`):
+    /// the activation is being built at exactly this size, so broadcasting a
+    /// `DisplayUpdate::Resize` would be a resize of the session to itself.
+    /// The update loop interprets any queued resize as a demand for a full
+    /// Deactivation-Reactivation (~1.2s into the session, mid client channel
+    /// handshake on first connect) — the relayed client either dies decoding
+    /// a mid-state channel PDU ("svc process PDU error") or loses its DVC
+    /// handshake (EGFX never engages). Silent adoption is all that is needed:
+    /// the post-capability `UpdateEncoder` reads the size back from the handler.
+    ///
+    /// This is the ONLY writer of the stored desktop size: mid-session
+    /// DisplayControl resizes go through the pipeline's resize channel and
+    /// never rewrite it.
+    async fn adopt_size_silently(&self, width: u16, height: u16) {
         {
             let mut size = self.size.write().await;
             size.width = width;
             size.height = height;
         }
-        debug!("Updated display size to {}x{}", width, height);
-
-        let update = DisplayUpdate::Resize(DesktopSize { width, height });
-        if let Err(e) = self.update_sender.lock().await.send(update).await {
-            warn!("Failed to send resize update: {}", e);
-        }
+        debug!("Adopted desktop size {}x{} (silent, no resize signal)", width, height);
     }
 
     /// Record a new CAPTURE (compositor/PipeWire) size.
@@ -1769,8 +1776,9 @@ impl LamcoDisplayHandler {
                                             .await;
                                     }
                                     // Record capture truth; desktop stays at the
-                                    // client's request (update_size handles that on
-                                    // the request path).
+                                    // client's request (the stored size is
+                                    // updated by request_initial_size on the
+                                    // next activation).
                                     info!(
                                         "Elastic capture resized: source now delivers {}x{}",
                                         w, h
@@ -3789,7 +3797,10 @@ impl RdpServerDisplay for LamcoDisplayHandler {
                             self.rebind_capture_node(old_node, s.node_id, s.width, s.height)
                                 .await;
                         }
-                        self.update_size(client_size.width, client_size.height)
+                        // Adopt the client's size WITHOUT signaling a
+                        // resize: the activation is being negotiated at
+                        // exactly this size (see adopt_size_silently).
+                        self.adopt_size_silently(client_size.width, client_size.height)
                             .await;
                         info!(
                             "request_initial_size: adopted client desktop {}x{} via elastic capture (source delivers {}x{})",
@@ -3810,7 +3821,10 @@ impl RdpServerDisplay for LamcoDisplayHandler {
             }
         }
 
-        self.update_size(client_size.width, client_size.height)
+        // Same silent adoption on the plain path — a queued resize during
+        // capability processing tears the fresh activation down (see
+        // adopt_size_silently).
+        self.adopt_size_silently(client_size.width, client_size.height)
             .await;
 
         info!(
