@@ -78,6 +78,11 @@ pub struct KwinVirtualSessionHandle {
     libei: Arc<crate::session::strategies::libei::LibeiSessionHandleImpl>,
     /// Current stream info (node id + geometry), updated on establish/release.
     streams: RwLock<Vec<StreamInfo>>,
+    /// Output layout guard for THIS connection: engaged on
+    /// establish_for_client (console stays visible while the server
+    /// idles), dropped on release_after_client (physical outputs
+    /// re-enable first — the sunshine rule).
+    layout_guard: RwLock<Option<Arc<OutputLayoutGuard>>>,
     /// Set when the Wayland thread has died (compositor gone); next
     /// establish_for_client will rebuild it.
     wl_dead: AtomicBool,
@@ -89,6 +94,7 @@ impl KwinVirtualSessionHandle {
             wl: RwLock::new(WlState { tx: None }),
             libei,
             streams: RwLock::new(Vec::new()),
+            layout_guard: RwLock::new(None),
             wl_dead: AtomicBool::new(true),
         }
     }
@@ -174,7 +180,15 @@ impl SessionHandle for KwinVirtualSessionHandle {
     }
 
     fn streams(&self) -> Vec<StreamInfo> {
-        self.streams.blocking_read().clone()
+        // Sync trait method over async state. The runtime forbids
+        // blocking_* on its own threads (tokio panics: "Cannot block the
+        // current thread from within a runtime" — this exact crash killed
+        // the server on first fresh-VM boot 2026-09-02, before any listener
+        // bound). futures::executor::block_on drives the lock's future on
+        // THIS thread without registering with the runtime, which is safe
+        // here (the lock is only held briefly by establish/release) and is
+        // the same pattern the libei handle uses for its streams().
+        futures::executor::block_on(async { self.streams.read().await.clone() })
     }
 
     fn session_type(&self) -> SessionType {
@@ -237,6 +251,16 @@ impl SessionHandle for KwinVirtualSessionHandle {
                 .map_or((1920, 1200), |st| (st.width as u16, st.height as u16))
         };
 
+        // Output management PER CONNECTION (not at session creation): the
+        // console must stay visible while the server idles, or the one-time
+        // input-consent dialog and any future console interaction would be
+        // blanked. The E2E recipe disabled the DRM output right before
+        // capture; recreate that ordering here.
+        if self.layout_guard.read().await.is_none() {
+            let guard = OutputLayoutGuard::engage().await;
+            *self.layout_guard.write().await = Some(Arc::new(guard));
+        }
+
         let _node = self.recreate_stream(w, h).await?;
         let streams = self.streams.read().await.clone();
         Ok((streams, true))
@@ -248,7 +272,13 @@ impl SessionHandle for KwinVirtualSessionHandle {
             let _ = tx.send(WlCommand::Close);
         }
         self.streams.write().await.clear();
-        info!("[kwin-virtual] stream closed — virtual output removed");
+        // Restore the physical outputs — the console must come back the
+        // moment the client is gone (also on abnormal paths: drop order
+        // guarantees the guard runs even if the release sequence errors).
+        if let Some(guard) = self.layout_guard.write().await.take() {
+            drop(guard);
+        }
+        info!("[kwin-virtual] stream closed — virtual output removed, physical outputs restored");
     }
 
     async fn resize_capture_source(&self, width: u16, height: u16) -> Option<(u16, u16)> {
@@ -637,10 +667,33 @@ fn list_enabled_physical_outputs() -> Vec<String> {
         .output()
     {
         Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
-        _ => return Vec::new(),
+        Ok(o) => {
+            // Non-zero exit: the compositor may be mid-restart or kscreen
+            // not ready. Log it — an empty list here would otherwise look
+            // identical to "already headless" in the journal.
+            warn!(
+                "[kwin-virtual] kscreen-doctor -o failed (exit {:?}): {}",
+                o.status.code(),
+                String::from_utf8_lossy(&o.stderr).trim()
+            );
+            return Vec::new();
+        }
+        Err(e) => {
+            warn!("[kwin-virtual] cannot run kscreen-doctor: {e}");
+            return Vec::new();
+        }
     };
 
-    parse_enabled_physical_outputs(&out)
+    let names = parse_enabled_physical_outputs(&out);
+    if names.is_empty() {
+        // Either genuinely headless, or kscreen reported nothing usable.
+        // The first 400 chars make the difference diagnosable in the journal.
+        warn!(
+            "[kwin-virtual] kscreen-doctor listed no enabled physical outputs. Raw output head: {:?}",
+            out.chars().take(400).collect::<String>()
+        );
+    }
+    names
 }
 
 /// Pure parser: given `kscreen-doctor -o` text, return enabled output names
@@ -711,16 +764,11 @@ fn enable_output(name: &str) -> bool {
 pub struct KwinVirtualStrategy {
     /// Token manager for the libei restore token (input consent).
     token_manager: Option<Arc<crate::session::token_manager::Tokens>>,
-    /// Holds the output-layout guard once a session is live.
-    layout: RwLock<Option<Arc<OutputLayoutGuard>>>,
 }
 
 impl KwinVirtualStrategy {
     pub fn new(token_manager: Option<Arc<crate::session::token_manager::Tokens>>) -> Self {
-        Self {
-            token_manager,
-            layout: RwLock::new(None),
-        }
+        Self { token_manager }
     }
 
     /// Availability: KDE + Wayland + kscreen-doctor (for output management) +
@@ -769,20 +817,20 @@ impl crate::session::strategy::SessionStrategy for KwinVirtualStrategy {
             crate::session::strategies::libei::LibeiStrategy::new(None, self.token_manager.clone());
         let libei_impl = libei_strategy.create_session_concrete().await?;
 
-        // Output management: engage the layout guard NOW (session start) so
-        // the virtual output lands at (0,0) as the only enabled screen from
-        // the first frame. Dropped on cleanup — physical outputs re-enable first.
-        let guard = OutputLayoutGuard::engage().await;
-        *self.layout.write().await = Some(Arc::new(guard));
-
+        // NOTE: the output-layout guard is NOT engaged here. It engages on
+        // establish_for_client (per connection) and drops on
+        // release_after_client — engaging at session creation would blank
+        // the console for the entire server lifetime, hiding the one-time
+        // input-consent dialog from the user (fresh-VM boot 2026-09-02
+        // lesson: the dialog must be visible on the console).
         let handle = Arc::new(KwinVirtualSessionHandle::new(libei_impl));
         Ok(handle as Arc<dyn SessionHandle>)
     }
 
     async fn cleanup(&self, _session: &dyn SessionHandle) -> Result<()> {
-        // Drop the layout guard — physical outputs re-enable first.
-        self.layout.write().await.take();
-        info!("[kwin-virtual] session cleanup complete (physical outputs restored)");
+        // The layout guard is owned by the HANDLE and released on
+        // release_after_client; nothing to restore here.
+        info!("[kwin-virtual] session cleanup complete");
         Ok(())
     }
 }
