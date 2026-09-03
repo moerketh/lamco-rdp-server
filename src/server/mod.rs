@@ -528,7 +528,7 @@ impl LamcoRdpServer {
                         .set_cursor_mode(cursor_mode)
                         .set_sources(enumflags2::BitFlags::from(ScSourceType::Monitor))
                         .set_multiple(false)
-                        .set_persist_mode(PersistMode::DoNot),
+                        .set_persist_mode(PersistMode::ExplicitlyRevoked),
                 )
                 .await
                 .context("Failed to select ScreenCast sources for input-only video")?;
@@ -666,15 +666,28 @@ impl LamcoRdpServer {
         // Self-sufficient strategies: skip Portal RemoteDesktop entirely.
         // ScreenCast-only = view-only (no input). WlrDirect = input via native Wayland protocols.
         // PortalGeneric = embedded wlroots video + input + clipboard (no Portal daemon needed).
+        // KwinVirtual = KDE zkde-screencast virtual output (video) + libei (input).
         // All bypass the full-featured Portal RemoteDesktop path.
         if matches!(
             session_handle.session_type(),
-            SessionType::ScreenCastOnly | SessionType::WlrDirect | SessionType::PortalGeneric
+            SessionType::ScreenCastOnly
+                | SessionType::WlrDirect
+                | SessionType::PortalGeneric
+                | SessionType::KwinVirtual
         ) {
             let is_wlr_direct = session_handle.session_type() == SessionType::WlrDirect;
             let is_portal_generic = session_handle.session_type() == SessionType::PortalGeneric;
+            let is_kwin_virtual = session_handle.session_type() == SessionType::KwinVirtual;
 
-            if is_portal_generic {
+            if is_kwin_virtual {
+                info!("═════════════════════════════════════════════════════════");
+                info!("  KWIN-VIRTUAL MODE (zkde-screencast + EIS input)");
+                info!("═════════════════════════════════════════════════════════");
+                info!("Video: native virtual output at the client's requested size.");
+                info!("No scaling, no DRM mode list, no video consent dialog.");
+                info!("Input: Portal RemoteDesktop + EIS (one-time consent).");
+                info!("═════════════════════════════════════════════════════════");
+            } else if is_portal_generic {
                 info!("═══════════════════════════════════════════════════════════");
                 info!("  PORTAL-GENERIC MODE (embedded wlroots backend)");
                 info!("═══════════════════════════════════════════════════════════");
@@ -717,6 +730,11 @@ impl LamcoRdpServer {
                 config.egfx.max_frames_in_flight,
                 compression_mode,
             );
+            if !egfx_enabled {
+                warn!(
+                    "EGFX disabled in config — using lossless surface commands (RemoteFx/QOI) instead of H.264"
+                );
+            }
             gfx_factory.set_monitoring(Arc::clone(&metrics), snapshot_collector.egfx_state());
             gfx_factory.set_health_reporter(health_reporter.clone());
 
@@ -813,6 +831,12 @@ impl LamcoRdpServer {
                 .set_health_reporter(health_reporter.clone())
                 .await;
 
+            // Elastic capture (kwin-virtual): route resize requests to the
+            // session's virtual-output recreation instead of DRM mode switches.
+            if is_kwin_virtual {
+                display_handler.set_elastic_capture(session_handle.clone());
+            }
+
             // Wire PipeWire sensor for version-adaptive health monitoring
             let pw_version = crate::runtime::diagnostics::get_pipewire_version()
                 .and_then(|v| {
@@ -851,7 +875,7 @@ impl LamcoRdpServer {
             }
 
             // Report subsystems that aren't wired in this code path
-            if !is_wlr_direct && !is_portal_generic {
+            if !is_wlr_direct && !is_portal_generic && !is_kwin_virtual {
                 // ScreenCastOnly: no input injection at all
                 health_reporter.report(crate::health::HealthEvent::SubsystemNotAvailable {
                     subsystem: "input".into(),
@@ -961,27 +985,58 @@ impl LamcoRdpServer {
                 });
             }
 
-            let rdp_server = if is_wlr_direct || is_portal_generic {
-                // wlr-direct/portal-generic: input via session handle (native Wayland protocols)
-                let monitors: Vec<InputMonitorInfo> = stream_info
-                    .iter()
-                    .enumerate()
-                    .map(|(idx, stream)| InputMonitorInfo {
-                        id: idx as u32,
-                        name: format!("Monitor {idx}"),
-                        x: stream.position.0,
-                        y: stream.position.1,
-                        width: stream.size.0,
-                        height: stream.size.1,
+            let rdp_server = if is_wlr_direct || is_portal_generic || is_kwin_virtual {
+                // wlr-direct/portal-generic: input via session handle (native Wayland protocols).
+                // kwin-virtual: input via the strategy's libei session handle
+                // (Portal RemoteDesktop + EIS — the same machinery the kwin-virtual
+                // strategy composes). Without this the builder falls into the
+                // with_no_input() branch: EIS never activates and the client
+                // gets a remote image with dead input.
+                // Monitor list for the input handler's coordinate
+                // transformer. wlr-direct/portal-generic have their streams
+                // at startup; kwin-virtual creates them PER CONNECTION
+                // (stream_info is empty here). Pass a placeholder primary
+                // so the transformer initializes — the display handler
+                // re-syncs monitors when the connection establishes the
+                // stream geometry (update_monitors / capture re-sync), so
+                // clicks use the real coordinates once the client is in.
+                let monitors: Vec<InputMonitorInfo> = if stream_info.is_empty() {
+                    vec![InputMonitorInfo {
+                        id: 0,
+                        name: "placeholder".to_string(),
+                        x: 0,
+                        y: 0,
+                        width: 1920,
+                        height: 1080,
                         dpi: 96.0,
                         scale_factor: 1.0,
-                        stream_x: stream.position.0 as u32,
-                        stream_y: stream.position.1 as u32,
-                        stream_width: stream.size.0,
-                        stream_height: stream.size.1,
-                        is_primary: idx == 0,
-                    })
-                    .collect();
+                        stream_x: 0,
+                        stream_y: 0,
+                        stream_width: 1920,
+                        stream_height: 1080,
+                        is_primary: true,
+                    }]
+                } else {
+                    stream_info
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, stream)| InputMonitorInfo {
+                            id: idx as u32,
+                            name: format!("Monitor {idx}"),
+                            x: stream.position.0,
+                            y: stream.position.1,
+                            width: stream.size.0,
+                            height: stream.size.1,
+                            dpi: 96.0,
+                            scale_factor: 1.0,
+                            stream_x: stream.position.0 as u32,
+                            stream_y: stream.position.1 as u32,
+                            stream_width: stream.size.0,
+                            stream_height: stream.size.1,
+                            is_primary: idx == 0,
+                        })
+                        .collect()
+                };
 
                 let (input_tx, input_rx) = tokio::sync::mpsc::channel(256);
                 let input_handler = LamcoInputHandler::new(
@@ -1146,9 +1201,9 @@ impl LamcoRdpServer {
                 // Self-sufficient: Mutter (native clipboard), libei (data-control
                 // clipboard + EIS input), ScreenCast (view-only). Input goes
                 // through the strategy's own handle; the clipboard provider is
-                // built later via build_clipboard(). No separate Portal session —
-                // libei no longer mints a second one (wlr-direct and
-                // portal-generic early-return before reaching this path).
+                // built later via build_clipboard(). No separate Portal session
+                // (wlr-direct and portal-generic early-return before reaching
+                // this path).
                 info!(
                     "Strategy '{}' is self-sufficient — no separate Portal session",
                     session_handle.session_type()
