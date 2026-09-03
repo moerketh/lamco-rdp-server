@@ -1247,6 +1247,9 @@ impl LamcoRdpServer {
                 .await;
 
             // Phase 3: drive server-side auto-detect for this session.
+            // The RTT handle was already shared with the EGFX flow controller
+            // pre-build (see autodetect_rtt above) — its freshness-floor
+            // policy consumes it via `effective_rtt`.
             rdp_server.enable_autodetect();
             if let Some(probe_state) = autodetect_probe_state.as_ref() {
                 spawn_autodetect_probe(
@@ -1255,6 +1258,10 @@ impl LamcoRdpServer {
                     shutdown_broadcast.subscribe(),
                 );
             }
+            // SuppressOutput frame gate: share the RDP server's authoritative
+            // "client cannot present frames" flag (mstsc minimized) with the
+            // pipeline so it stops encoding while suppressed.
+            display_handler.set_display_suppressed_flag(rdp_server.display_suppressed_handle());
 
             let _ = event_tx.send(ServerEvent::SessionTypeChanged {
                 session_type: session_handle.session_type().to_string(),
@@ -1825,6 +1832,9 @@ impl LamcoRdpServer {
             autodetect_probe_state,
             shutdown_broadcast.subscribe(),
         );
+        // SuppressOutput frame gate — see the identical block in the
+        // view-only/wlr path above for rationale.
+        display_handler.set_display_suppressed_flag(rdp_server.display_suppressed_handle());
 
         let _ = event_tx.send(ServerEvent::SessionTypeChanged {
             session_type: session_handle_for_clipboard.session_type().to_string(),
