@@ -56,6 +56,7 @@ pub(crate) mod encode_diagnostics;
 pub mod tone_map;
 mod yuv444_packing;
 
+pub mod dmabuf_access;
 #[cfg(any(feature = "vaapi", feature = "nvenc"))]
 pub mod hardware;
 

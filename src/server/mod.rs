@@ -65,6 +65,7 @@
 
 mod deployment;
 mod display_handler;
+mod dmabuf_materialize;
 mod egfx_sender;
 #[expect(dead_code, reason = "WIP: not yet integrated into the server pipeline")]
 mod event_multiplexer;
@@ -761,6 +762,7 @@ impl LamcoRdpServer {
 
             let (graphics_tx, graphics_rx) = tokio::sync::mpsc::channel(64);
 
+            let egfx_enabled = config.egfx.enabled;
             let force_avc420_only = false;
             let compression_mode = match config.egfx.zgfx_compression.to_lowercase().as_str() {
                 "auto" => CompressionMode::Auto,
@@ -795,17 +797,27 @@ impl LamcoRdpServer {
                 ),
             ));
 
-            let gfx_handler_state = gfx_factory.handler_state();
-            let gfx_server_handle = gfx_factory.server_handle();
+            let gfx_handler_state = if egfx_enabled {
+                Some(gfx_factory.handler_state())
+            } else {
+                None
+            };
+            let gfx_server_handle = if egfx_enabled {
+                Some(gfx_factory.server_handle())
+            } else {
+                None
+            };
 
             // Server-side NetworkAutoDetect: the RDP server writes measured RTT
             // here; the EGFX FlowController reads it as a freshness floor, and the
             // server reports it to the client via a Network Characteristics Result.
             let autodetect_rtt = Arc::new(std::sync::atomic::AtomicU32::new(u32::MAX));
-            if let Ok(mut fc) = gfx_handler_state.flow_controller.lock() {
-                fc.set_autodetect_rtt_handle(Arc::clone(&autodetect_rtt));
+            if let Some(state) = gfx_handler_state.as_ref() {
+                if let Ok(mut fc) = state.flow_controller.lock() {
+                    fc.set_autodetect_rtt_handle(Arc::clone(&autodetect_rtt));
+                }
             }
-            let autodetect_probe_state = Arc::clone(&gfx_handler_state);
+            let autodetect_probe_state = gfx_handler_state.clone();
 
             let display_handler = Arc::new(match pipewire_source {
                 PipeWireSource::Fd(raw_fd) => {
@@ -847,8 +859,8 @@ impl LamcoRdpServer {
                         pipewire_fd,
                         stream_info.clone(),
                         Some(graphics_tx),
-                        Some(gfx_server_handle),
-                        Some(gfx_handler_state),
+                        gfx_server_handle,
+                        gfx_handler_state,
                         Arc::clone(&config),
                         Arc::clone(&service_registry),
                         use_dmabuf,
@@ -863,8 +875,8 @@ impl LamcoRdpServer {
                     raw_rx,
                     stream_info.clone(),
                     Some(graphics_tx),
-                    Some(gfx_server_handle),
-                    Some(gfx_handler_state),
+                    gfx_server_handle,
+                    gfx_handler_state,
                     Arc::clone(&config),
                     Arc::clone(&service_registry),
                     Arc::clone(&client_active_flag),
@@ -1107,7 +1119,11 @@ impl LamcoRdpServer {
                     .with_display_handler((*display_handler).clone())
                     .with_bitmap_codecs(codecs)
                     .with_cliprdr_factory(wlr_clipboard_factory)
-                    .with_gfx_factory(Some(Box::new(gfx_factory)))
+                    .with_gfx_factory(if egfx_enabled {
+                        Some(Box::new(gfx_factory))
+                    } else {
+                        None
+                    })
                     .with_sound_factory(Some(Box::new(sound_factory)))
                     .with_rdpei_factory(rdpei_factory)
                     .with_autodetect_rtt_handle(Arc::clone(&autodetect_rtt))
@@ -1139,7 +1155,11 @@ impl LamcoRdpServer {
                     .with_display_handler((*display_handler).clone())
                     .with_bitmap_codecs(codecs)
                     .with_cliprdr_factory(None)
-                    .with_gfx_factory(Some(Box::new(gfx_factory)))
+                    .with_gfx_factory(if egfx_enabled {
+                        Some(Box::new(gfx_factory))
+                    } else {
+                        None
+                    })
                     .with_sound_factory(Some(Box::new(sound_factory)))
                     .with_autodetect_rtt_handle(Arc::clone(&autodetect_rtt))
                     .build()
@@ -1151,11 +1171,13 @@ impl LamcoRdpServer {
 
             // Phase 3: drive server-side auto-detect for this session.
             rdp_server.enable_autodetect();
-            spawn_autodetect_probe(
-                rdp_server.event_sender().clone(),
-                autodetect_probe_state,
-                shutdown_broadcast.subscribe(),
-            );
+            if let Some(probe_state) = autodetect_probe_state.as_ref() {
+                spawn_autodetect_probe(
+                    rdp_server.event_sender().clone(),
+                    Arc::clone(probe_state),
+                    shutdown_broadcast.subscribe(),
+                );
+            }
 
             let _ = event_tx.send(ServerEvent::SessionTypeChanged {
                 session_type: session_handle.session_type().to_string(),
@@ -1659,6 +1681,12 @@ impl LamcoRdpServer {
         }
 
         info!("Building IronRDP server");
+        let egfx_enabled = config.egfx.enabled;
+        if !egfx_enabled {
+            warn!(
+                "EGFX disabled in config — using lossless surface commands (RemoteFx/QOI) instead of H.264"
+            );
+        }
         let listen_addr: SocketAddr = config
             .server
             .listen_addr
@@ -1689,7 +1717,11 @@ impl LamcoRdpServer {
             .with_display_handler((*display_handler).clone())
             .with_bitmap_codecs(codecs)
             .with_cliprdr_factory(Some(Box::new(clipboard_factory)))
-            .with_gfx_factory(Some(Box::new(gfx_factory)))
+            .with_gfx_factory(if egfx_enabled {
+                Some(Box::new(gfx_factory))
+            } else {
+                None
+            })
             .with_sound_factory(Some(Box::new(sound_factory)))
             .with_rdpei_factory(rdpei_factory)
             .with_autodetect_rtt_handle(Arc::clone(&autodetect_rtt))
