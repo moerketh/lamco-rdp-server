@@ -368,8 +368,8 @@ impl std::fmt::Display for SessionType {
             SessionType::WlrDirect => write!(f, "wlr-direct"),
             SessionType::Libei => write!(f, "libei/EIS"),
             SessionType::PortalGeneric => write!(f, "portal-generic (embedded)"),
-            SessionType::KwinVirtual => write!(f, "kwin-virtual (zkde-screencast)"),
             SessionType::ScreenCastOnly => write!(f, "ScreenCast-only (view-only)"),
+            SessionType::KwinVirtual => write!(f, "kwin-virtual (zkde-screencast)"),
         }
     }
 }

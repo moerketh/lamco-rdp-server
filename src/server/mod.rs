@@ -985,7 +985,7 @@ impl LamcoRdpServer {
                 });
             }
 
-            let rdp_server = if is_wlr_direct || is_portal_generic || is_kwin_virtual {
+            let mut rdp_server = if is_wlr_direct || is_portal_generic || is_kwin_virtual {
                 // wlr-direct/portal-generic: input via session handle (native Wayland protocols).
                 // kwin-virtual: input via the strategy's libei session handle
                 // (Portal RemoteDesktop + EIS — the same machinery the kwin-virtual
@@ -1130,6 +1130,19 @@ impl LamcoRdpServer {
             display_handler
                 .set_server_event_sender(rdp_server.event_sender().clone())
                 .await;
+
+            // NetworkAutoDetect ([MS-RDPBCGR] 2.2.14): enable the probe state
+            // machine and share its handles. The RTT handle feeds the EGFX
+            // flow controller's freshness-floor policy (see
+            // src/egfx/flow_controller.rs `effective_rtt`); the suppress handle
+            // gates the pipeline when the client minimizes (SuppressOutput).
+            rdp_server.enable_autodetect();
+            if let Some(state) = display_handler.egfx_handler_state() {
+                if let Ok(mut fc) = state.flow_controller.lock() {
+                    fc.set_autodetect_rtt_handle(rdp_server.autodetect_rtt_handle());
+                }
+            }
+            display_handler.set_display_suppressed_flag(rdp_server.display_suppressed_handle());
 
             let _ = event_tx.send(ServerEvent::SessionTypeChanged {
                 session_type: session_handle.session_type().to_string(),
@@ -1632,7 +1645,7 @@ impl LamcoRdpServer {
             addr_builder.with_tls(tls_acceptor)
         };
 
-        let rdp_server = handler_builder
+        let mut rdp_server = handler_builder
             .with_input_handler(input_handler)
             .with_display_handler((*display_handler).clone())
             .with_bitmap_codecs(codecs)
@@ -1657,6 +1670,16 @@ impl LamcoRdpServer {
             .set_server_event_sender(rdp_server.event_sender().clone())
             .await;
         info!("Server event sender configured in display handler");
+
+        // NetworkAutoDetect + SuppressOutput gating — see the identical block in
+        // the view-only/wlr path above for rationale.
+        rdp_server.enable_autodetect();
+        if let Some(state) = display_handler.egfx_handler_state() {
+            if let Ok(mut fc) = state.flow_controller.lock() {
+                fc.set_autodetect_rtt_handle(rdp_server.autodetect_rtt_handle());
+            }
+        }
+        display_handler.set_display_suppressed_flag(rdp_server.display_suppressed_handle());
 
         let _ = event_tx.send(ServerEvent::SessionTypeChanged {
             session_type: session_handle_for_clipboard.session_type().to_string(),
