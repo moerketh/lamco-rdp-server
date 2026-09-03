@@ -82,6 +82,8 @@ use tokio::sync::{Mutex, RwLock, mpsc};
 use tracing::{debug, error, info, trace, warn};
 
 use super::pipeline_decisions;
+#[cfg(feature = "x264")]
+use crate::egfx::X264Encoder;
 use crate::{
     damage::{DamageConfig, DamageDetector, DamageRegion},
     egfx::{Avc420Encoder, Avc444Encoder, ColorSpaceConfig, EncoderConfig},
@@ -110,11 +112,16 @@ struct ResizeRequest {
 ///
 /// Supports both AVC420 (standard H.264 4:2:0) and AVC444 (premium H.264 4:4:4).
 /// The codec is selected at runtime based on client capability negotiation.
+/// When the `x264` feature is enabled and the config selects it, an x264-based
+/// AVC420 encoder is used instead of OpenH264 for faster encoding.
 enum VideoEncoder {
-    /// Standard H.264 with 4:2:0 chroma subsampling
+    /// Standard H.264 with 4:2:0 chroma subsampling (OpenH264)
     Avc420(Avc420Encoder),
     /// Premium H.264 with 4:4:4 chroma via dual-stream encoding
     Avc444(Avc444Encoder),
+    /// x264-based H.264 4:2:0 encoder (faster than OpenH264, feature-gated)
+    #[cfg(feature = "x264")]
+    X264(X264Encoder),
 }
 
 /// Result of encoding a frame - varies by codec
@@ -152,14 +159,20 @@ impl VideoEncoder {
                         aux: frame.stream2_data,
                     })
                 }),
+            #[cfg(feature = "x264")]
+            VideoEncoder::X264(encoder) => encoder
+                .encode_bgra(bgra_data, width, height, timestamp_ms)
+                .map(|opt| opt.map(|frame| EncodedVideoFrame::Single(frame.data))),
         }
     }
 
-    /// Active encode backend name for telemetry ("openh264" / "vaapi").
+    /// Active encode backend name for telemetry ("openh264" / "vaapi" / "x264").
     fn backend_name(&self) -> &'static str {
         match self {
             VideoEncoder::Avc420(e) => e.backend_name(),
             VideoEncoder::Avc444(e) => e.backend_name(),
+            #[cfg(feature = "x264")]
+            VideoEncoder::X264(_) => "x264",
         }
     }
 
@@ -168,6 +181,8 @@ impl VideoEncoder {
         match self {
             VideoEncoder::Avc420(_) => "AVC420",
             VideoEncoder::Avc444(_) => "AVC444",
+            #[cfg(feature = "x264")]
+            VideoEncoder::X264(_) => "x264-AVC420",
         }
     }
 
@@ -179,6 +194,8 @@ impl VideoEncoder {
         match self {
             VideoEncoder::Avc420(encoder) => encoder.force_keyframe(),
             VideoEncoder::Avc444(encoder) => encoder.request_idr(),
+            #[cfg(feature = "x264")]
+            VideoEncoder::X264(encoder) => encoder.force_keyframe(),
         }
     }
 
@@ -190,6 +207,8 @@ impl VideoEncoder {
         match self {
             VideoEncoder::Avc420(_) => u64::MAX,
             VideoEncoder::Avc444(encoder) => encoder.ms_since_last_idr(),
+            #[cfg(feature = "x264")]
+            VideoEncoder::X264(_) => u64::MAX,
         }
     }
 
@@ -199,6 +218,8 @@ impl VideoEncoder {
         match self {
             VideoEncoder::Avc420(_) => false, // AVC420 doesn't have periodic IDR
             VideoEncoder::Avc444(encoder) => encoder.is_periodic_idr_due(),
+            #[cfg(feature = "x264")]
+            VideoEncoder::X264(_) => false, // x264 doesn't have periodic IDR
         }
     }
 }
@@ -2782,30 +2803,79 @@ impl LamcoDisplayHandler {
                                         e
                                     );
                                     // Fall through to AVC420
-                                    match Avc420Encoder::new(config) {
-                                        Ok(mut encoder) => {
-                                            encoder.set_diagnostics(encoder_diagnostics.clone());
-                                            video_encoder = Some(VideoEncoder::Avc420(encoder));
-                                            info!(
-                                                "✅ AVC420 encoder initialized for {}×{} (4:2:0 fallback)",
-                                                aligned_width, aligned_height
-                                            );
+                                    // Try x264 first if configured, fall back to OpenH264
+                                    #[cfg(feature = "x264")]
+                                    {
+                                        let backend =
+                                            self.config.egfx.encoder_backend.to_lowercase();
+                                        if backend == "x264" || backend == "auto" {
+                                            match X264Encoder::new(config.clone()) {
+                                                Ok(mut encoder) => {
+                                                    encoder.set_diagnostics(
+                                                        encoder_diagnostics.clone(),
+                                                    );
+                                                    video_encoder =
+                                                        Some(VideoEncoder::X264(encoder));
+                                                    info!(
+                                                        "✅ x264 AVC420 encoder initialized for {}×{} (4:2:0 fallback from AVC444)",
+                                                        aligned_width, aligned_height
+                                                    );
+                                                }
+                                                Err(e) => {
+                                                    warn!(
+                                                        "Failed to create x264 encoder: {:?} - falling back to OpenH264",
+                                                        e
+                                                    );
+                                                }
+                                            }
                                         }
-                                        Err(e) => {
-                                            warn!(
-                                                "Failed to create AVC420 encoder: {:?} - falling back to RemoteFX",
-                                                e
-                                            );
+                                        let _ = &config;
+                                    }
+
+                                    if video_encoder.is_none() {
+                                        match Avc420Encoder::new(config) {
+                                            Ok(mut encoder) => {
+                                                encoder
+                                                    .set_diagnostics(encoder_diagnostics.clone());
+                                                video_encoder = Some(VideoEncoder::Avc420(encoder));
+                                                info!(
+                                                    "✅ AVC420 encoder initialized for {}×{} (4:2:0 fallback)",
+                                                    aligned_width, aligned_height
+                                                );
+                                            }
+                                            Err(e) => {
+                                                warn!(
+                                                    "Failed to create AVC420 encoder: {:?} - falling back to RemoteFX",
+                                                    e
+                                                );
+                                            }
                                         }
                                     }
                                 }
                             }
                         } else {
-                            // Use AVC420 (standard 4:2:0 chroma), preferring the
-                            // VA-API hardware encoder when enabled and available.
+                            // Use AVC420 (standard 4:2:0 chroma). Backend
+                            // preference ladder, governed by
+                            // `egfx.encoder_backend` ("auto" | "x264" |
+                            // "openh264"):
+                            //   auto      -> VA-API hardware (when enabled and
+                            //                available), then x264, then OpenH264
+                            //   x264      -> x264, then OpenH264
+                            //   openh264  -> OpenH264 software only
+                            // AVC444 is unaffected by this ladder: x264 has no
+                            // 4:4:4 support, so that path always uses OpenH264.
+                            let backend_pref =
+                                self.config.egfx.encoder_backend.to_lowercase();
+
+                            // 1. VA-API hardware (auto only — an explicit
+                            //    backend selection never upgrades to hardware).
                             #[cfg(feature = "vaapi")]
-                            let avc420_result = if self.config.hardware_encoding.enabled {
-                                match Avc420Encoder::new_hardware(
+                            let mut avc420_result: Result<Avc420Encoder, _> = Err(
+                                crate::egfx::EncoderError::InitFailed("not attempted".into()),
+                            );
+                            #[cfg(feature = "vaapi")]
+                            if backend_pref == "auto" && self.config.hardware_encoding.enabled {
+                                avc420_result = match Avc420Encoder::new_hardware(
                                     config.clone(),
                                     &self.config.hardware_encoding,
                                 ) {
@@ -2815,31 +2885,75 @@ impl LamcoDisplayHandler {
                                     }
                                     Err(e) => {
                                         warn!(
-                                            "Hardware AVC420 unavailable ({e:?}); using software AVC420"
+                                            "Hardware AVC420 unavailable ({e:?}); trying software backends"
                                         );
-                                        Avc420Encoder::new(config)
+                                        Err(crate::egfx::EncoderError::InitFailed(
+                                            "hardware unavailable".into(),
+                                        ))
+                                    }
+                                };
+                            }
+
+                            // 2. x264 software (feature-gated; "auto" or
+                            //    explicit "x264").
+                            #[cfg(feature = "x264")]
+                            if video_encoder.is_none()
+                                && (backend_pref == "auto" || backend_pref == "x264")
+                            {
+                                match X264Encoder::new(config.clone()) {
+                                    Ok(mut encoder) => {
+                                        encoder.set_diagnostics(encoder_diagnostics.clone());
+                                        video_encoder = Some(VideoEncoder::X264(encoder));
+                                        info!(
+                                            "✅ x264 AVC420 encoder initialized for {}×{} (ultrafast/zerolatency)",
+                                            aligned_width, aligned_height
+                                        );
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            "Failed to create x264 encoder: {:?} - falling back to OpenH264",
+                                            e
+                                        );
+                                        // Fall through to OpenH264 below
                                     }
                                 }
+                            }
+                            #[cfg(feature = "x264")]
+                            let _ = &backend_pref; // referenced on all cfg paths
+
+                            // 3. OpenH264 software (always the final fallback,
+                            //    and the only option for "openh264").
+                            #[cfg(feature = "vaapi")]
+                            let avc420_result = if video_encoder.is_none() {
+                                avc420_result.or_else(|_| Avc420Encoder::new(config))
                             } else {
-                                Avc420Encoder::new(config)
+                                avc420_result
                             };
                             #[cfg(not(feature = "vaapi"))]
-                            let avc420_result = Avc420Encoder::new(config);
+                            let avc420_result = if video_encoder.is_none() {
+                                Avc420Encoder::new(config)
+                            } else {
+                                Err(crate::egfx::EncoderError::InitFailed(
+                                    "x264 selected".into(),
+                                ))
+                            };
 
-                            match avc420_result {
-                                Ok(mut encoder) => {
-                                    encoder.set_diagnostics(encoder_diagnostics.clone());
-                                    video_encoder = Some(VideoEncoder::Avc420(encoder));
-                                    info!(
-                                        "✅ AVC420 encoder initialized for {}×{} (aligned)",
-                                        aligned_width, aligned_height
-                                    );
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        "Failed to create H.264 encoder: {:?} - falling back to RemoteFX",
-                                        e
-                                    );
+                            if video_encoder.is_none() {
+                                match avc420_result {
+                                    Ok(mut encoder) => {
+                                        encoder.set_diagnostics(encoder_diagnostics.clone());
+                                        video_encoder = Some(VideoEncoder::Avc420(encoder));
+                                        info!(
+                                            "✅ AVC420 encoder initialized for {}×{} (aligned)",
+                                            aligned_width, aligned_height
+                                        );
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            "Failed to create H.264 encoder: {:?} - falling back to RemoteFX",
+                                            e
+                                        );
+                                    }
                                 }
                             }
                         }

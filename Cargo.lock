@@ -3833,6 +3833,7 @@ dependencies = [
  "async-trait",
  "bytemuck",
  "bytes",
+ "cc",
  "chrono",
  "clap",
  "criterion",

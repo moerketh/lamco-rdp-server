@@ -31,6 +31,14 @@ fn cargo_lock_pkg_version(name: &str) -> String {
 }
 
 fn main() {
+    if std::env::var_os("CARGO_FEATURE_X264").is_some() {
+        cc::Build::new()
+            .file("src/egfx/x264_shim.c")
+            .warnings(true)
+            .compile("lamco_x264_shim");
+        println!("cargo:rerun-if-changed=src/egfx/x264_shim.c");
+    }
+
     let date_output = run_command("date", &["+%Y-%m-%d"], "unknown");
     println!("cargo:rustc-env=BUILD_DATE={date_output}");
 
