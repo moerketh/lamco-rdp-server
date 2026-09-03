@@ -74,9 +74,9 @@ use std::{
 use anyhow::Result;
 use bytes::Bytes;
 use ironrdp_server::{
-    BitmapUpdate as IronBitmapUpdate, DesktopSize, DisplayUpdate, GfxServerHandle,
-    PixelFormat as IronPixelFormat, RdpServerDisplay, RdpServerDisplayUpdates, ServerEvent,
-    ServerResult,
+    BitmapUpdate as IronBitmapUpdate, ColorPointer, DesktopSize, DisplayUpdate, GfxServerHandle,
+    PixelFormat as IronPixelFormat, PointerUpdate, RdpServerDisplay, RdpServerDisplayUpdates,
+    ServerEvent, ServerResult,
 };
 use tokio::sync::{Mutex, RwLock, mpsc};
 use tracing::{debug, error, info, trace, warn};
@@ -680,6 +680,54 @@ impl LamcoDisplayHandler {
         self.saw_real_disconnect
             .store(true, std::sync::atomic::Ordering::SeqCst);
         info!("Client disconnect signaled to pipeline - frame processing paused");
+    }
+
+    /// Send the guest cursor shape to the client as an RDP ColorPointer
+    /// update (xrdp parity). Called once per client connection, right
+    /// after the pipeline state reset. The client then renders the Parrot
+    /// arrow locally — single cursor, zero latency, no video-cursor trail.
+    ///
+    /// Failure is non-fatal (logged): worst case the client keeps its
+    /// default arrow.
+    async fn send_pointer_shape(handler: &Arc<LamcoDisplayHandler>) {
+        let sender = handler.server_event_tx.read().await.clone();
+        let Some(sender) = sender else {
+            debug!("cursor PDU: no server event sender yet — skipping");
+            return;
+        };
+        match crate::server::cursor_pdu::load_default_pointer() {
+            Ok(pointer) => {
+                // Hand IronRDP the typed pointer rather than pre-encoded bytes: it
+                // owns the TS_COLORPOINTERATTRIBUTE encoding, tags the fast-path
+                // update with the right update code, fragments payloads over the
+                // 16374-byte ceiling, and rejects masks whose scanlines are not
+                // 16-bit aligned ([MS-RDPBCGR] 2.2.9.1.1.4.4).
+                let (width, height) = (pointer.width, pointer.height);
+                let update = PointerUpdate::Color(ColorPointer {
+                    cache_index: pointer.cache_index,
+                    width: pointer.width,
+                    height: pointer.height,
+                    hot_x: pointer.hot_spot.0,
+                    hot_y: pointer.hot_spot.1,
+                    and_mask: pointer.and_mask,
+                    xor_mask: pointer.xor_mask,
+                });
+                let sent = sender.send(ServerEvent::Pointer(update));
+                match sent {
+                    Ok(()) => info!(
+                        width,
+                        height,
+                        "cursor PDU sent: guest pointer shape pushed to client (xrdp parity)"
+                    ),
+                    Err(e) => warn!("cursor PDU send failed: {e}"),
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "cursor PDU: could not load guest pointer ({e}) — client keeps default arrow"
+                );
+            }
+        }
     }
 
     /// Rebind the capture pipeline to a new PipeWire node after a session
@@ -2923,6 +2971,13 @@ impl LamcoDisplayHandler {
                                 match send_result {
                                     Ok(_frame_id) => {
                                         egfx_frames_sent += 1;
+                                        // First successful frame = session provably
+                                        // activated (client accepted EGFX video).
+                                        // mstsc drops pointer PDUs that race
+                                        // the activation handshake.
+                                        if egfx_frames_sent == 1 {
+                                            Self::send_pointer_shape(&handler).await;
+                                        }
                                         if egfx_frames_sent.is_multiple_of(30) {
                                             let codec = encoder.codec_name();
                                             debug!(

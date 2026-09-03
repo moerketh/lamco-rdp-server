@@ -102,26 +102,16 @@ impl ScreenCastOnlyStrategy {
     }
 
     /// Pick the best cursor mode from what the portal supports.
-    /// Preference: Metadata > Embedded > Hidden
+    ///
+    /// Always Hidden: KWin 6.3 Metadata mode emits cursor-only refresh frames
+    /// flagged SPA_CHUNK_FLAG_CORRUPTED (empty video), which the pipewire
+    /// consumer doesn't skip, painting stale cursor bytes into the video —
+    /// perceived as a double cursor + pixel dust around pointer movement.
+    /// With Hidden, KWin does zero cursor work; the RDP client renders its
+    /// own zero-latency pointer from pointer position PDUs. Preference when
+    /// clients gain CORRUPTED-flag awareness: Metadata > Embedded > Hidden.
     fn best_cursor_mode(&self) -> CursorMode {
-        use crate::compositor::CursorMode as CompCursorMode;
-
-        if self.available_cursor_modes.is_empty() {
-            return CursorMode::Metadata;
-        }
-        if self
-            .available_cursor_modes
-            .contains(&CompCursorMode::Metadata)
-        {
-            CursorMode::Metadata
-        } else if self
-            .available_cursor_modes
-            .contains(&CompCursorMode::Embedded)
-        {
-            CursorMode::Embedded
-        } else {
-            CursorMode::Hidden
-        }
+        CursorMode::Hidden
     }
 
     /// Check if ScreenCast portal is available (without requiring RemoteDesktop)
@@ -280,25 +270,28 @@ mod tests {
     fn test_best_cursor_mode_prefers_metadata() {
         use crate::compositor::CursorMode as CompCursorMode;
 
-        // All modes available: pick Metadata
+        // Hidden is forced regardless of portal capabilities (the
+        // composited cursor double-renders on compositors without a
+        // hardware cursor plane, e.g. Hyper-V); capability lists do not
+        // influence the choice.
         let strategy = ScreenCastOnlyStrategy::with_cursor_modes(vec![
             CompCursorMode::Hidden,
             CompCursorMode::Embedded,
             CompCursorMode::Metadata,
         ]);
-        assert_eq!(strategy.best_cursor_mode(), CursorMode::Metadata);
+        assert_eq!(strategy.best_cursor_mode(), CursorMode::Hidden);
     }
 
     #[test]
     fn test_best_cursor_mode_falls_back_to_embedded() {
         use crate::compositor::CursorMode as CompCursorMode;
 
-        // Hyprland/Sway: only Hidden + Embedded
+        // Hyprland/Sway: only Hidden + Embedded — still forced Hidden.
         let strategy = ScreenCastOnlyStrategy::with_cursor_modes(vec![
             CompCursorMode::Hidden,
             CompCursorMode::Embedded,
         ]);
-        assert_eq!(strategy.best_cursor_mode(), CursorMode::Embedded);
+        assert_eq!(strategy.best_cursor_mode(), CursorMode::Hidden);
     }
 
     #[test]
@@ -311,8 +304,12 @@ mod tests {
 
     #[test]
     fn test_best_cursor_mode_empty_defaults_metadata() {
+        // Despite the test name, the default is Hidden: it avoids the
+        // composited-cursor double render. Metadata becomes the
+        // preference only once clients handle CORRUPTED-flagged
+        // metadata frames.
         let strategy = ScreenCastOnlyStrategy::new();
-        assert_eq!(strategy.best_cursor_mode(), CursorMode::Metadata);
+        assert_eq!(strategy.best_cursor_mode(), CursorMode::Hidden);
     }
 
     #[tokio::test]

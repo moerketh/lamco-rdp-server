@@ -63,6 +63,7 @@
     reason = "OwnedFd::from_raw_fd for Portal/PipeWire file descriptors"
 )]
 
+pub mod cursor_pdu;
 mod deployment;
 mod display_handler;
 mod dmabuf_materialize;
@@ -509,23 +510,13 @@ impl LamcoRdpServer {
                 .await
                 .context("Failed to create ScreenCast session for input-only video")?;
 
-            // Pick best available cursor mode from what the portal actually supports.
-            // Hyprland's portal only offers Hidden+Embedded (no Metadata).
-            let cursor_mode = if capabilities
-                .portal
-                .available_cursor_modes
-                .contains(&crate::compositor::CursorMode::Metadata)
-            {
-                CursorMode::Metadata
-            } else if capabilities
-                .portal
-                .available_cursor_modes
-                .contains(&crate::compositor::CursorMode::Embedded)
-            {
-                CursorMode::Embedded
-            } else {
-                CursorMode::Hidden
-            };
+            // Pick cursor mode for the standalone ScreenCast portal.
+            // Use Hidden: the portal hides the cursor from the video frame,
+            // and the RDP client renders its own cursor via pointer PDUs
+            // (metadata cursor mode). This matches xrdp's approach where
+            // the cursor is sent as a separate low-latency PDU and the
+            // client renders it locally — zero cursor latency.
+            let cursor_mode = CursorMode::Hidden;
             debug!("Using cursor mode {:?} for ScreenCast", cursor_mode);
 
             use ashpd::desktop::screencast::SelectSourcesOptions;
