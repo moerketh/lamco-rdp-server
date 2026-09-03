@@ -664,6 +664,30 @@ pub struct CursorConfig {
     /// Predictor configuration (for predictive mode)
     #[serde(default)]
     pub predictor: CursorPredictorConfig,
+
+    /// Make the guest console cursor transparent only while an RDP client
+    /// is connected, restoring it on disconnect (Hyper-V software-cursor
+    /// workaround; requires the transparent theme preinstalled on the
+    /// guest image).
+    #[serde(default = "default_true")]
+    pub session_scoped_cursor_theme: bool,
+
+    /// Theme to restore on the guest console when no RDP client is
+    /// connected. Also the persistent kcminputrc value (crash-safe).
+    #[serde(default = "default_console_cursor_theme")]
+    pub console_cursor_theme: String,
+
+    /// Name of the fully transparent XCursor theme installed by provisioning.
+    #[serde(default = "default_transparent_cursor_theme")]
+    pub transparent_cursor_theme: String,
+}
+
+fn default_console_cursor_theme() -> String {
+    "breeze_cursors".to_string()
+}
+
+fn default_transparent_cursor_theme() -> String {
+    "transparent".to_string()
 }
 
 fn default_cursor_mode() -> String {
@@ -686,6 +710,9 @@ impl Default for CursorConfig {
             predictive_latency_threshold_ms: 100,
             cursor_update_fps: 60,
             predictor: CursorPredictorConfig::default(),
+            session_scoped_cursor_theme: true,
+            console_cursor_theme: default_console_cursor_theme(),
+            transparent_cursor_theme: default_transparent_cursor_theme(),
         }
     }
 }
