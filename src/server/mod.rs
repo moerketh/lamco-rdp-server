@@ -586,12 +586,23 @@ impl LamcoRdpServer {
                 .context("Failed to open PipeWire remote for input-only video")?;
 
             use std::os::fd::AsRawFd;
-            let raw_fd = fd.as_raw_fd();
+            let portal_fd = fd.as_raw_fd();
             // Leak the OwnedFd so the PipeWire connection stays alive for the session.
             // Cleaned up when the server process exits.
             std::mem::forget(fd);
 
-            info!("PipeWire FD: {}", raw_fd);
+            // Hyper-V zero-copy: use the shared PipeWire daemon connection
+            // instead of the private Portal FD. The private FD causes DmaBuf
+            // buffer allocation failures (-EIO); the shared daemon works
+            // because WirePlumber handles link creation properly. The
+            // node_id from the portal is still used.
+            info!(
+                "Portal FD: {} — switching to shared PipeWire daemon",
+                portal_fd
+            );
+            let raw_fd = crate::mutter::connect_to_pipewire_daemon()
+                .context("Failed to connect to shared PipeWire daemon")?;
+            info!("Connected to shared PipeWire daemon, FD: {}", raw_fd);
 
             // Provide stream dimensions to the session handle so pointer
             // coordinate transformation uses the real resolution.
@@ -622,8 +633,19 @@ impl LamcoRdpServer {
 
             match session_handle.pipewire_access() {
                 PipeWireAccess::FileDescriptor(fd) => {
-                    info!("Using Portal-provided PipeWire file descriptor: {}", fd);
-                    (PipeWireSource::Fd(fd), portal_streams)
+                    // Hyper-V zero-copy (see the identical comment at the
+                    // Portal-FD path above for the rationale): use the
+                    // shared PipeWire daemon connection instead of the
+                    // private Portal FD. The node_id from the portal
+                    // streams is still used for binding.
+                    info!(
+                        "Using Portal-provided PipeWire node ID (ignoring private FD {})",
+                        fd
+                    );
+                    let daemon_fd = crate::mutter::connect_to_pipewire_daemon()
+                        .context("Failed to connect to PipeWire daemon for Portal strategy")?;
+                    info!("Connected to shared PipeWire daemon, FD: {}", daemon_fd);
+                    (PipeWireSource::Fd(daemon_fd), portal_streams)
                 }
                 PipeWireAccess::NodeId(node_id) => {
                     info!("Using Mutter-provided PipeWire node ID: {}", node_id);
