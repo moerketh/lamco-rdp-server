@@ -1134,6 +1134,14 @@ impl LamcoRdpServer {
                     .with_rdpei_factory(rdpei_factory)
                     .with_autodetect_rtt_handle(Arc::clone(&autodetect_rtt))
                     .with_connection_handler(Some(Box::new(keyboard_layout_handler)))
+                    // Resolution support: honor the client's requested desktop
+                    // size (dialog choice), clamped to 3840x2160. The display
+                    // handler adopts the requested desktop size (elastic
+                    // capture recreates the compositor source to match).
+                    .with_honor_client_desktop_size(Some(ironrdp_server::DesktopSize {
+                        width: 3840,
+                        height: 2160,
+                    }))
                     .build()
             } else {
                 // ScreenCast-only: view-only, no input
@@ -1168,6 +1176,12 @@ impl LamcoRdpServer {
                     })
                     .with_sound_factory(Some(Box::new(sound_factory)))
                     .with_autodetect_rtt_handle(Arc::clone(&autodetect_rtt))
+                    // Resolution support (view-only too): same honor flag
+                    // and adoption semantics as the input path above.
+                    .with_honor_client_desktop_size(Some(ironrdp_server::DesktopSize {
+                        width: 3840,
+                        height: 2160,
+                    }))
                     .build()
             };
 
@@ -1732,6 +1746,14 @@ impl LamcoRdpServer {
             .with_rdpei_factory(rdpei_factory)
             .with_autodetect_rtt_handle(Arc::clone(&autodetect_rtt))
             .with_connection_handler(Some(Box::new(keyboard_layout_handler)))
+            // Resolution support: honor the client's requested desktop size
+            // (dialog choice), clamped to 3840x2160. The display handler
+            // adopts the requested desktop size (elastic capture recreates
+            // the compositor source to match).
+            .with_honor_client_desktop_size(Some(ironrdp_server::DesktopSize {
+                width: 3840,
+                height: 2160,
+            }))
             .build();
 
         display_handler

@@ -284,6 +284,21 @@ pub trait SessionHandle: Send + Sync {
     /// half-idle session and the next client is handed a fresh one.
     async fn release_after_client(&self) {}
 
+    /// Resize the strategy's capture source to the client's requested desktop
+    /// size, returning the size the source will actually deliver.
+    ///
+    /// Only strategies whose capture size is elastic implement this — today
+    /// that is the KWin virtual-output strategy (zkde-screencast can recreate
+    /// the virtual output at ANY resolution, so it always returns the request
+    /// unchanged). The display handler calls this from `request_initial_size`
+    /// when the active session is elastic. Default: None (capture size is
+    /// fixed by the compositor; the display handler silently adopts the
+    /// client's requested desktop size and frames pass through at capture
+    /// geometry).
+    async fn resize_capture_source(&self, _width: u16, _height: u16) -> Option<(u16, u16)> {
+        None
+    }
+
     // === Clipboard Support ===
 
     /// Describes how this strategy provides clipboard functionality.
