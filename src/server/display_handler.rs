@@ -864,6 +864,14 @@ impl LamcoDisplayHandler {
         }
     }
 
+    /// Force-restore the visible console cursor regardless of tracked state
+    /// (process-shutdown recovery — ExecStopPost semantics). Idempotent.
+    pub fn restore_console_cursor_forced(&self) {
+        if let Some(mgr) = &self.cursor_theme {
+            mgr.restore_visible();
+        }
+    }
+
     /// Signal that the client has disconnected.
     ///
     /// The pipeline loop checks `client_active` and skips encoding/sending when
