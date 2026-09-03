@@ -1815,30 +1815,50 @@ impl LamcoRdpServer {
         self.event_rx.take()
     }
 
-    /// Useful for signal handlers that need to trigger shutdown after `run()` consumes self.
-    pub fn shutdown_sender(
-        &self,
-    ) -> tokio::sync::mpsc::UnboundedSender<ironrdp_server::ServerEvent> {
-        self.rdp_server.event_sender().clone()
-    }
-
     /// Broadcast sender for coordinating shutdown across all async tasks.
-    /// Signal handlers should send on this AND on `shutdown_sender()` —
-    /// IronRDP needs the Quit event to close the TLS connection gracefully,
-    /// while the broadcast breaks our outer select loop and stops clipboard/PipeWire tasks.
+    /// Signal handlers should send on this (and disconnect the active client
+    /// via [`Self::error_info_disconnect_handle`]) — the graceful disconnect
+    /// closes the RDP connection with a client-visible reason, while the
+    /// broadcast breaks our outer select loop and stops clipboard/PipeWire
+    /// tasks.
     pub fn shutdown_broadcast(&self) -> Arc<tokio::sync::broadcast::Sender<()>> {
         Arc::clone(&self.shutdown_broadcast)
     }
 
+    /// Handle for disconnecting the active client with a client-visible
+    /// reason (`ServerSetErrorInfoPdu`, MS-RDPBCGR 2.2.5.1) while `run()`
+    /// owns the server. Unlike a bare `Quit` — which tears the connection
+    /// down silently — the client decodes the PDU and can surface *why* it
+    /// was disconnected to the user before the drop.
+    ///
+    /// Use this before `run()` consumes the server (same pattern as
+    /// [`Self::shutdown_broadcast`]); the handle is `Clone` and the underlying
+    /// event channel is unbounded, so one early clone covers the process
+    /// lifetime.
+    #[must_use]
+    pub fn error_info_disconnect_handle(&self) -> ironrdp_server::ErrorInfoDisconnectHandle {
+        self.rdp_server.error_info_disconnect_handle()
+    }
+
     /// Signal graceful shutdown. Actual cleanup happens in cleanup_resources().
+    ///
+    /// Sends the client-visible disconnect (administrative-tool reason) rather
+    /// than a bare `Quit`: the connected client shows "disconnected by an
+    /// administrative tool" instead of a generic transport error. The send
+    /// failing is the common no-client-connected case, not an error.
     pub fn signal_shutdown(&self) {
         info!("Initiating graceful shutdown");
-        let _ = self
+        use ironrdp_pdu::rdp::server_error_info::{ErrorInfo, ProtocolIndependentCode};
+        if self
             .rdp_server
-            .event_sender()
-            .send(ironrdp_server::ServerEvent::Quit(
-                "Shutdown requested".to_string(),
-            ));
+            .error_info_disconnect_handle()
+            .disconnect(ErrorInfo::ProtocolIndependentCode(
+                ProtocolIndependentCode::RpcInitiatedDisconnect,
+            ))
+            .is_err()
+        {
+            debug!("No active client to disconnect on shutdown");
+        }
         let _ = self.shutdown_broadcast.send(());
     }
 
