@@ -22,7 +22,7 @@ pub struct TransportsConfig {
     #[serde(default)]
     pub tcp: Option<TcpTransportConfig>,
     /// AF_VSOCK transport (Hyper-V Enhanced Session Mode + future QEMU guest).
-    /// Auto-enabled on Hyper-V detection if absent. See `VsockTransportConfig`.
+    /// Opt-in only; absent means disabled. See `VsockTransportConfig`.
     #[serde(default)]
     pub vsock: Option<VsockTransportConfig>,
     /// WebSocket+RDCleanPath transport for browser/WASM clients
@@ -100,17 +100,16 @@ impl Default for TcpTransportConfig {
 /// - `Some(true)`  — enable
 /// - `Some(false)` / `None` / subtable absent — disabled
 ///
-/// This transport was previously auto-enabled whenever `/sys/class/dmi` looked
-/// like Hyper-V. It no longer is. The Enhanced Session path it serves performs
+/// Opt-in only. The Enhanced Session path it serves performs
 /// no TLS, no CredSSP and no credential check, and cannot authenticate at all —
 /// vmms relays empty Client Info credentials because the user was already
 /// authenticated against the host. Switching on an unauthenticated listener is
 /// an operator decision, not something to infer from two DMI strings that a
-/// hypervisor or container runtime can set. Hyper-V detection now only logs a
+/// hypervisor or container runtime can set. Hyper-V detection only logs a
 /// suggestion at startup.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VsockTransportConfig {
-    /// `None` = auto-detect Hyper-V. See struct-level docs.
+    /// `None` = disabled (opt-in only). See struct-level docs.
     #[serde(default)]
     pub enabled: Option<bool>,
     /// AF_VSOCK port to listen on. Defaults to 3389 (parallel to TCP).
@@ -219,7 +218,7 @@ impl TransportsConfig {
             }
         };
 
-        // -- vsock (tri-state with Hyper-V auto-detection) --
+        // -- vsock (opt-in only; Hyper-V detection just logs a suggestion) --
         let vsock = match &self.vsock {
             Some(cfg) => match cfg.enabled {
                 Some(true) => {
@@ -396,7 +395,7 @@ mod tests {
     }
 
     /// The transport is unauthenticated by construction, so it must never come up
-    /// unasked. Previously two `/sys/class/dmi` reads were enough to enable it —
+    /// unasked — and `/sys/class/dmi` strings are not a basis for enabling it:
     /// strings a hypervisor or container runtime controls, and which a container
     /// inherits from its host VM.
     #[test]

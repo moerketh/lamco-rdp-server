@@ -591,10 +591,11 @@ impl LamcoRdpServer {
             // Cleaned up when the server process exits.
             std::mem::forget(fd);
 
-            // Hyper-V zero-copy: Use the shared PipeWire daemon connection instead
-            // of the private Portal FD. The private FD causes DmaBuf buffer allocation
-            // failures (-EIO). The shared daemon works because WirePlumber handles
-            // link creation properly. The node_id from the portal is still used.
+            // Hyper-V zero-copy: use the shared PipeWire daemon connection
+            // instead of the private Portal FD. The private FD causes DmaBuf
+            // buffer allocation failures (-EIO); the shared daemon works
+            // because WirePlumber handles link creation properly. The
+            // node_id from the portal is still used.
             info!(
                 "Portal FD: {} — switching to shared PipeWire daemon",
                 portal_fd
@@ -632,11 +633,11 @@ impl LamcoRdpServer {
 
             match session_handle.pipewire_access() {
                 PipeWireAccess::FileDescriptor(fd) => {
-                    // Hyper-V zero-copy: Use the shared PipeWire daemon connection instead
-                    // of the private Portal FD. The private FD causes buffer allocation
-                    // failures (-EIO) during DmaBuf negotiation. The shared daemon works
-                    // because WirePlumber handles link creation properly.
-                    // The node_id from the portal streams is still used for binding.
+                    // Hyper-V zero-copy (see the identical comment at the
+                    // Portal-FD path above for the rationale): use the
+                    // shared PipeWire daemon connection instead of the
+                    // private Portal FD. The node_id from the portal
+                    // streams is still used for binding.
                     info!(
                         "Using Portal-provided PipeWire node ID (ignoring private FD {})",
                         fd
@@ -988,10 +989,9 @@ impl LamcoRdpServer {
                 // wlr-direct/portal-generic: input via session handle (native Wayland protocols).
                 // kwin-virtual: input via the strategy's libei session handle
                 // (Portal RemoteDesktop + EIS — the same machinery the kwin-virtual
-                // strategy composes). The live session 2026-09-02 showed why this
-                // must be wired: without it the builder fell into the with_no_input()
-                // branch, EIS never activated, and the client got a remote image
-                // with dead clicks.
+                // strategy composes). Without this the builder falls into the
+                // with_no_input() branch: EIS never activates and the client
+                // gets a remote image with dead input.
                 // Monitor list for the input handler's coordinate
                 // transformer. wlr-direct/portal-generic have their streams
                 // at startup; kwin-virtual creates them PER CONNECTION
@@ -1083,7 +1083,8 @@ impl LamcoRdpServer {
                     .with_sound_factory(Some(Box::new(sound_factory)))
                     // Resolution support: honor the client's requested desktop
                     // size (dialog choice), clamped to 3840x2160. The display
-                    // handler bridges compositor mismatch via the scaler.
+                    // handler adopts the requested desktop size (elastic
+                    // capture recreates the compositor source to match).
                     // BuilderDone-phase method (same phase as sound factory).
                     .with_honor_client_desktop_size(Some(ironrdp_server::DesktopSize {
                         width: 3840,
@@ -1117,7 +1118,8 @@ impl LamcoRdpServer {
                         None
                     })
                     .with_sound_factory(Some(Box::new(sound_factory)))
-                    // Resolution support (view-only too): same honor flag.
+                    // Resolution support (view-only too): same honor flag
+                    // and adoption semantics as the input path above.
                     .with_honor_client_desktop_size(Some(ironrdp_server::DesktopSize {
                         width: 3840,
                         height: 2160,
@@ -1212,9 +1214,9 @@ impl LamcoRdpServer {
                 // Self-sufficient: Mutter (native clipboard), libei (data-control
                 // clipboard + EIS input), ScreenCast (view-only). Input goes
                 // through the strategy's own handle; the clipboard provider is
-                // built later via build_clipboard(). No separate Portal session —
-                // libei no longer mints a second one (wlr-direct and
-                // portal-generic early-return before reaching this path).
+                // built later via build_clipboard(). No separate Portal session
+                // (wlr-direct and portal-generic early-return before reaching
+                // this path).
                 info!(
                     "Strategy '{}' is self-sufficient — no separate Portal session",
                     session_handle.session_type()
@@ -1656,7 +1658,8 @@ impl LamcoRdpServer {
             .with_sound_factory(Some(Box::new(sound_factory)))
             // Resolution support: honor the client's requested desktop size
             // (dialog choice), clamped to 3840x2160. The display handler
-            // bridges any compositor mismatch via the scaler.
+            // adopts the requested desktop size (elastic capture recreates
+            // the compositor source to match).
             .with_honor_client_desktop_size(Some(ironrdp_server::DesktopSize {
                 width: 3840,
                 height: 2160,

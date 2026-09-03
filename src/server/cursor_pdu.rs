@@ -148,17 +148,17 @@ fn to_rdp(img: &ImageChunk, cache_index: u16) -> RdpPointer {
 
             // xor: 24bpp BGR, bottom-up.
             // Alpha rule: only FULLY transparent (a==0) pixels are
-            // transparent; every a>0 pixel draws its color (the earlier
-            // a>128 threshold dropped the breeze arrow's 85 anti-aliased
-            // edge/shadow pixels — speckled holes around the cursor).
+            // transparent; every a>0 pixel draws its color (an a>128
+            // threshold would drop anti-aliased edge/shadow pixels —
+            // speckled holes around the cursor).
             // ColorPointer carries no alpha channel, so semi-transparent
             // source pixels flatten to opaque — the same tradeoff xrdp
             // makes on its 24bpp path.
             //
-            // 2026-08-22 fix: the xor mask MUST be 24bpp. The previous
-            // w*4 layout wrote 4 bytes/px into a field clients decode at
-            // 3 bytes/px, shearing every scanline left by one cursor
-            // width — clients rendered three side-by-side contour ghosts.
+            // The xor mask MUST be 24bpp: a w*4 layout writes 4
+            // bytes/px into a field clients decode at 3 bytes/px,
+            // shearing every scanline left by one cursor width —
+            // clients render three side-by-side contour ghosts.
             let opaque = a > 0;
             if opaque {
                 let xo = dst_y * xor_stride + x * 3;
@@ -286,12 +286,12 @@ mod tests {
 
     #[test]
     fn xor_stride_pads_odd_widths() {
-        // REGRESSION (2026-08-22): 24bpp xor scanlines must be padded to
+        // 24bpp xor scanlines must be padded to
         // an even byte count — clients compute the stride as
         // ceil(w*24/16)*2. A width-5 cursor needs a 16-byte stride
         // (15 data + 1 pad), not 15. The length check in IronRDP's
         // decode_pointer (InvalidXorMaskSize) rejects the unpadded form,
-        // and the pre-fix 4-bytes/px form sheared every scanline.
+        // and a 4-bytes/px form shears every scanline.
         let data = minimal_xcursor(5, 4);
         let img = parse_xcursor(&data).expect("parse");
         let p = to_rdp(&img, 0);
@@ -316,10 +316,10 @@ mod tests {
         assert_eq!(top_row_bits, 0b01);
     }
 
-    /// REGRESSION (2026-08-22): the a>128 alpha threshold dropped the
-    /// breeze arrow's 85 anti-aliased pixels to fully transparent,
+    /// Alpha rule invariant: any alpha > 0 must draw its color; only
+    /// a==0 is punch-through. An a>128 threshold would drop
+    /// anti-aliased edge pixels to fully transparent,
     /// producing speckled holes around the rendered cursor ("glitching").
-    /// Any alpha > 0 must draw its color; only a==0 is punch-through.
     #[test]
     fn semi_transparent_pixels_are_drawn() {
         let mut data = minimal_xcursor(2, 2);
@@ -350,11 +350,11 @@ mod tests {
         assert_eq!(byte >> 6 & 1, 1, "a=0 pixel stays transparent");
     }
 
-    /// REGRESSION (2026-08-22, THE bug): round-trip our ColorPointer PDU
-    /// through IronRDP's own CLIENT decoder. The pre-fix 32bpp xor mask
-    /// made decode_pointer fail InvalidXorMaskSize (it expects
+    /// Producer→consumer conformance: round-trip our ColorPointer PDU
+    /// through IronRDP's own CLIENT decoder. A 32bpp xor mask fails
+    /// decode_pointer with InvalidXorMaskSize (it expects
     /// ceil(w*3/16)*2 * h bytes); on clients that don't length-check,
-    /// the extra byte per pixel sheared each scanline — rendering as
+    /// the extra byte per pixel shears each scanline — rendering as
     /// three side-by-side contour ghosts. This test pins the full
     /// producer→consumer conformance: iterator decode, exact colors,
     /// transparency, and hotspot.
@@ -408,11 +408,11 @@ mod tests {
         );
     }
 
-    /// REGRESSION GUARD (2026-08-21): the hand-rolled wire encoder in
+    /// Wire-encoder conformance: the hand-rolled encoder in
     /// `encode_color_pointer` must stay byte-identical to ironrdp's own
     /// `ColorPointerAttribute::encode`. Any drift (field order, the
     /// xor-before-and mask ordering, length fields) produces a PDU that
-    /// clients silently drop. Verified against fork rev 95375180.
+    /// clients silently drop.
     #[test]
     fn wire_encode_matches_ironrdp_encoder() {
         use ironrdp_core::encode_vec;
@@ -443,7 +443,7 @@ mod tests {
         );
     }
 
-    /// REGRESSION GUARD: malformed/truncated XCursor files must return
+    /// Robustness invariant: malformed/truncated XCursor files must return
     /// Err, never panic. Guards parse_xcursor against bad-system-input.
     #[test]
     fn malformed_xcursor_is_error_not_panic() {

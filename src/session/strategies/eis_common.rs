@@ -153,26 +153,17 @@ pub async fn eis_pointer_motion_absolute(
     x: f64,
     y: f64,
 ) -> Result<()> {
-    // 2026-09-01 (E2E Virtual-lamco test): the old "prefer the region with
-    // a non-zero offset" heuristic DOUBLE-OFFSET every pointer event in the
-    // multi-output world. The absolute pointer coordinates arriving here are
-    // already in GLOBAL compositor space: the input handler's
-    // CoordinateTransformer maps RDP desktop coords into the captured
-    // monitor's geometry INCLUDING its position (StreamInfo.position feeds
-    // the transformer's monitor layout — e.g. a virtual output at (1920,0)
-    // yields global coords in [1920, 3840)). Adding an EIS region offset on
-    // top landed clicks at x+3840 — nothing clickable, while the
-    // client-rendered cursor looked fine. KWin takes motion_absolute as
-    // global coordinates directly
-    // (PointerInputRedirection::processMotionAbsolute); no region
-    // translation is needed or correct.
-    //
-    // The historical reason for the offset hack was the KWin ScreenCast
-    // virtual-output-at-offset era (stream captured a virtual output whose
-    // region had a non-zero offset while the desktop coords were relative
-    // to the primary). With the transformer now authoritative for monitor
-    // geometry (and re-synced on every capture-size change), offsets here
-    // are always wrong.
+    // Never apply an EIS region offset: the absolute pointer coordinates
+    // arriving here are already in GLOBAL compositor space. The input
+    // handler's CoordinateTransformer maps RDP desktop coords into the
+    // captured monitor's geometry INCLUDING its position
+    // (StreamInfo.position feeds the transformer's monitor layout — e.g.
+    // a virtual output at (1920,0) yields global coords in [1920, 3840)).
+    // Adding an EIS region offset on top double-offsets the event and
+    // lands clicks outside the desktop, while the client-rendered cursor
+    // looks fine. KWin takes motion_absolute as global coordinates
+    // directly (PointerInputRedirection::processMotionAbsolute); no
+    // region translation is needed or correct.
 
     with_device_interface::<ei::PointerAbsolute>(
         context,

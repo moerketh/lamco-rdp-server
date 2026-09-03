@@ -600,7 +600,8 @@ pub struct CursorConfig {
 
     /// Make the guest console cursor transparent only while an RDP client
     /// is connected, restoring it on disconnect (Hyper-V software-cursor
-    /// workaround; requires the transparent theme installed by VMCreate).
+    /// workaround; requires the transparent theme preinstalled on the
+    /// guest image).
     #[serde(default = "default_true")]
     pub session_scoped_cursor_theme: bool,
 

@@ -214,9 +214,10 @@ pub trait SessionHandle: Send + Sync {
     /// that is the KWin virtual-output strategy (zkde-screencast can recreate
     /// the virtual output at ANY resolution, so it always returns the request
     /// unchanged). The display handler calls this from `request_initial_size`
-    /// INSTEAD of the kscreen-doctor mode-switching path when the active
-    /// session is elastic. Default: None (capture size is fixed by the
-    /// compositor; the scaler bridges, as before).
+    /// when the active session is elastic. Default: None (capture size is
+    /// fixed by the compositor; the display handler silently adopts the
+    /// client's requested desktop size and frames pass through at capture
+    /// geometry).
     async fn resize_capture_source(&self, _width: u16, _height: u16) -> Option<(u16, u16)> {
         None
     }

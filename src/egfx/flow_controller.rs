@@ -42,7 +42,7 @@
 //! server layer calls `enable_autodetect()` on `RdpServer` and wires
 //! `RdpServer::autodetect_rtt_handle()` into
 //! `FlowController::set_autodetect_rtt_handle` (see `server::mod`, both
-//! build paths). `effective_rtt` fuses the two (R2b, freshness-floor policy):
+//! build paths). `effective_rtt` fuses the two (freshness-floor policy):
 //! the FrameAck-derived `avg_rtt` while a sample is fresh, otherwise the
 //! autodetect RTT so an idle gap doesn't leave the threshold on a stale
 //! average. See

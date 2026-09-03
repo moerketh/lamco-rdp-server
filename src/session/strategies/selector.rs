@@ -194,8 +194,8 @@ impl SessionStrategySelector {
         // VIDEO dialogs — output created per connection at the client's exact
         // requested size; input via libei below).
         //
-        // Validated end-to-end 2026-09-01: native 1920x1200 capture with a
-        // fully interactive desktop. Selected BEFORE the portal path so KDE
+        // Native-resolution capture with a fully interactive desktop.
+        // Selected BEFORE the portal path so KDE
         // gets native resolutions; the libei strategy's portal-RemoteDesktop
         // input session is composed in (input consent remains, one-time).
         #[cfg(feature = "kwin-virtual")]

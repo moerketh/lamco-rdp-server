@@ -1,11 +1,10 @@
 //! Handshake-deadline stream wrapper — mitigation for the dead-client wedge.
 //!
-//! 2026-08-27 capture finding (see `memories/repo/enhanced-session-capture-findings.md`):
-//! a connection that completes TCP/vsock accept but never sends a byte parks the
+//! A connection that completes TCP/vsock accept but never sends a byte parks the
 //! IronRDP acceptor's first read *inside the serial accept dispatcher*, blacking
 //! out every listener for as long as the silent peer keeps the socket open
-//! (measured: 13.5 minutes; two queued vmconnect connections waited the entire
-//! time in the listen backlog and only proceeded after the silent client died).
+//! (further connections wait in the listen backlog until the silent client
+//! goes away).
 //!
 //! [`HandshakeDeadlineStream`] enforces a one-shot deadline on the *first*
 //! client read of a freshly accepted connection:
@@ -40,8 +39,8 @@ use super::listener::AsyncRdpStream;
 /// Default window for the first client bytes after accept.
 ///
 /// Generous by protocol standards: mstsc's pre-connect probe, vmms's relayed
-/// X.224 Connection Request, and FreeRDP all send their first bytes within
-/// tens of milliseconds of connect. Slow-path TLS handshakes still complete
+/// X.224 Connection Request, and FreeRDP all send their first bytes promptly
+/// after connect. Slow-path TLS handshakes still complete
 /// the ClientHello well inside this window; the deadline covers
 /// time-to-first-byte, not the whole handshake.
 pub const DEFAULT_HANDSHAKE_DEADLINE: Duration = Duration::from_secs(30);

@@ -2,7 +2,7 @@
 //!
 //! Coefficients match the openh264 crate's fast scalar path
 //! (`formats::rgb2yuv::write_yuv_scalar`) so output is bit-comparable
-//! with the previous `YUVBuffer::from_rgb_source` pipeline, but:
+//! with the openh264 `YUVBuffer::from_rgb_source` path, but:
 //! - no per-frame allocation (writes into a caller-provided buffer)
 //! - integer-only arithmetic (no per-pixel f32 rounds like `read_rgb`)
 //! - writes the three planes contiguously (Y, then U, then V), which is
@@ -11,7 +11,7 @@
 //! Two range encodings are supported (see `Range`): the default
 //! limited-range matches OpenH264 bit-for-bit; full-range maps black to
 //! Y0/white to Y255 and is used when the client (mstsc) does not perform
-//! limited→full expansion — grey-blacks fix, 2026-08-21.
+//! limited→full expansion, which would otherwise render black as grey.
 
 /// YUV value range the converter emits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -229,7 +229,8 @@ mod tests {
     }
     #[test]
     fn test_full_range_black_and_white_corners() {
-        // Full-range: pure black ⇒ Y 0 (the grey-blacks fix), white ⇒ Y 255,
+        // Full-range: pure black ⇒ Y 0 (mstsc does not expand limited
+        // range, so limited-range Y16 would render as grey), white ⇒ Y 255,
         // grayscale chroma exactly neutral (U=V=128).
         let width = 4usize;
         let height = 4usize;
@@ -251,7 +252,7 @@ mod tests {
         );
         assert!(
             y[8..].iter().all(|&v| v == 0),
-            "black half Y=0 (grey-blacks fix), got {:?}",
+            "black half Y=0 (mstsc renders limited-range black as grey), got {:?}",
             &y[8..]
         );
         let mid_uv = &yuv[width * height..];

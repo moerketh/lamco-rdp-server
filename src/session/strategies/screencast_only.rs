@@ -270,9 +270,10 @@ mod tests {
     fn test_best_cursor_mode_prefers_metadata() {
         use crate::compositor::CursorMode as CompCursorMode;
 
-        // 0b90311 forces Hidden regardless of portal capabilities (the
-        // composited cursor double-rendered on Hyper-V); capability lists no
-        // longer influence the choice.
+        // Hidden is forced regardless of portal capabilities (the
+        // composited cursor double-renders on compositors without a
+        // hardware cursor plane, e.g. Hyper-V); capability lists do not
+        // influence the choice.
         let strategy = ScreenCastOnlyStrategy::with_cursor_modes(vec![
             CompCursorMode::Hidden,
             CompCursorMode::Embedded,
@@ -303,8 +304,10 @@ mod tests {
 
     #[test]
     fn test_best_cursor_mode_empty_defaults_metadata() {
-        // Name kept for history; the default is Hidden since 0b90311 forced
-        // it to avoid the composited-cursor double render.
+        // Despite the test name, the default is Hidden: it avoids the
+        // composited-cursor double render. Metadata becomes the
+        // preference only once clients handle CORRUPTED-flagged
+        // metadata frames.
         let strategy = ScreenCastOnlyStrategy::new();
         assert_eq!(strategy.best_cursor_mode(), CursorMode::Hidden);
     }

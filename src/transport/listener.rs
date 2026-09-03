@@ -118,16 +118,15 @@ pub enum AcceptorMode {
     /// # Security
     ///
     /// This mode authenticates nobody, and cannot: vmms sends a Client Info PDU
-    /// with empty username and password (measured, 2026-08-27), because the user
+    /// with empty username and password, because the user
     /// was already authenticated against the *host*. No server configuration can
     /// put a credential check on this transport — in particular `auth_method =
     /// "pam"` would hand PAM a zero-length password and deny every connection.
     ///
-    /// The transport is therefore the only security boundary, and it is
-    /// currently **not enforced**: the listener binds `VMADDR_CID_ANY` and
-    /// accepts any peer CID, so an unprivileged process inside this guest can
-    /// reach this mode over the vsock loopback CID (1) and obtain the desktop.
-    /// A peer-CID allowlist is required before this is fit to ship.
+    /// The transport is therefore the only security boundary: the listener
+    /// enforces the peer-CID allowlist at accept time (default:
+    /// `VMADDR_CID_HOST` only; the in-guest vsock loopback CID is refused
+    /// regardless of configuration).
     EnhancedSession,
 }
 
@@ -409,8 +408,8 @@ pub fn default_allowed_cids() -> Vec<u32> {
 fn cid_allowed(cid: u32, allowed: &[u32]) -> bool {
     // Refused even if an operator lists it explicitly. An Enhanced Session is
     // relayed inward by the hypervisor, so a peer presenting the in-guest
-    // loopback CID is by definition not one — and that is exactly the vector
-    // measured on 2026-08-27.
+    // loopback CID is by definition not one — accepting it would let an
+    // unprivileged local process reach the desktop.
     if cid == tokio_vsock::VMADDR_CID_LOCAL {
         return false;
     }
@@ -435,12 +434,11 @@ impl VsockListenerImpl {
     /// against the host. The peer allowlist is consequently not defence in
     /// depth, it is the entire access control for this transport.
     ///
-    /// An earlier revision bound `VMADDR_CID_ANY` with no filtering, on the
-    /// reasoning that "operator-side firewall or hypervisor policy handles
-    /// access control". Neither does: netfilter does not filter AF_VSOCK, and
-    /// hypervisor policy has no say over a connection made *inside* the guest.
-    /// Measured 2026-08-27, an unprivileged local process reached the desktop
-    /// via loopback CID 1.
+    /// VMADDR_CID_ANY is only the *local* bind wildcard; peer filtering must
+    /// happen at accept time. Nothing outside this listener provides it:
+    /// netfilter does not filter AF_VSOCK, and hypervisor policy has no say
+    /// over a connection made *inside* the guest — which is why the
+    /// in-guest loopback CID (1) is refused outright.
     pub fn bind(port: u32, allowed_cids: Vec<u32>) -> Result<Self, TransportError> {
         let addr = tokio_vsock::VsockAddr::new(tokio_vsock::VMADDR_CID_ANY, port);
         let listener = tokio_vsock::VsockListener::bind(addr).map_err(TransportError::Io)?;
@@ -539,14 +537,14 @@ impl Listener for VsockListenerImpl {
 }
 
 /// Best-effort detection of whether this process is running inside a Hyper-V
-/// virtual machine. Used to auto-enable the vsock listener for Enhanced
-/// Session Mode without operator configuration.
+/// virtual machine. Used only to log a startup suggestion for the vsock
+/// listener (Enhanced Session Mode); the listener itself stays opt-in.
 ///
 /// Checks `/sys/class/dmi/id/sys_vendor == "Microsoft Corporation"` AND
 /// `/sys/class/dmi/id/product_name` contains `"Virtual Machine"`. Both must
-/// be true; we never auto-enable on uncertainty (false negatives are
-/// preferred to false positives — the latter would bind an unwanted vsock
-/// listener, the former just means the operator must configure manually).
+/// be true; on uncertainty nothing is suggested (a missed suggestion just
+/// means the operator must configure manually, whereas a false positive
+/// would point at a listener that must not be enabled implicitly).
 ///
 /// Returns `false` on non-Linux systems and on any I/O error reading DMI.
 pub fn detect_hyperv() -> bool {
@@ -771,11 +769,12 @@ mod tests {
         }
     }
 
-    /// REGRESSION (measured 2026-08-27): an unprivileged in-guest process
-    /// connected to loopback CID 1 and was handed `AcceptorMode::EnhancedSession`
-    /// — a path with no TLS, no CredSSP and no credential check. The loopback CID
-    /// must stay refused even when an operator widens the allowlist, because an
-    /// Enhanced Session never originates inside the guest.
+    /// The loopback CID (1) must NEVER be handed
+    /// `AcceptorMode::EnhancedSession` — a path with no TLS, no CredSSP and
+    /// no credential check — because an Enhanced Session never originates
+    /// inside the guest, but an unprivileged in-guest process can connect to
+    /// loopback CID 1. The loopback CID
+    /// must stay refused even when an operator widens the allowlist.
     #[cfg(feature = "vsock")]
     #[test]
     fn cid_policy_never_admits_loopback_even_if_configured() {

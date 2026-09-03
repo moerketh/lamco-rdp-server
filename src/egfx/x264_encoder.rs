@@ -407,7 +407,7 @@ mod tests {
             .expect("IDR output must include an SPS NAL");
         // profile_idc must be a 4:2:0 profile decodable by mstsc's AVC420
         // decoder: 66=Baseline, 77=Main, 88=Extended, 100=High.
-        // 244 (High 4:4:4 Predictive) is what caused the black screen.
+        // 244 (High 4:4:4 Predictive) is not decodable and yields a black screen.
         let profile_idc = frame.data[sps_start + 5];
         assert!(
             matches!(profile_idc, 66 | 77 | 88 | 100),

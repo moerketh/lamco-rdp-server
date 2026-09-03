@@ -8,8 +8,7 @@
 //! "double cursor": the crisp client pointer plus the lagging composited
 //! guest sprite inside the stream.
 //!
-//! The workaround (verified 2026-08-22, see VMCreate memory
-//! `double-cursor-fix.md`) is a fully transparent XCursor theme while an
+//! The workaround is a fully transparent XCursor theme while an
 //! RDP client is connected. That leaves the *local console* without a
 //! pointer, so this module scopes the transparency to the RDP session:
 //!
@@ -64,7 +63,7 @@ pub struct CursorThemes {
     /// Theme applied while no RDP client is connected. Also what
     /// kcminputrc persistently names — crash-safe reboot state.
     pub visible: String,
-    /// Fully transparent theme installed by VMCreate provisioning.
+    /// Fully transparent theme preinstalled on the guest image.
     pub transparent: String,
 }
 
@@ -77,7 +76,7 @@ pub trait CmdRunner: Send + Sync {
 }
 
 /// Production runner: the lamco service runs as the desktop user inside
-/// the graphical session (VMCreate's systemd user unit), so commands
+/// the graphical session (the desktop's systemd user unit), so commands
 /// only need the session-bus env a non-login context may be missing.
 pub struct SessionCmdRunner {
     runtime_dir: String,

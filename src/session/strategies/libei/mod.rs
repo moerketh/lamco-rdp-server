@@ -179,8 +179,12 @@ impl LibeiStrategy {
 
         let portal_session = Arc::new(RwLock::new(session));
 
-        // Session.Closed watchdog — see the original trait impl for the full
-        // rationale (dead-handle cascade ~7s later as TCP RST otherwise).
+        // Session.Closed watchdog: the portal backend can close the session
+        // behind our back (e.g. backend restart), and every EIS handle
+        // derived from it then writes into a dead D-Bus session — the
+        // client observes input failing later as a TCP RST cascade. Log
+        // the closure at ERROR so the root cause is distinguishable from
+        // the delayed connection failure it causes.
         {
             let session_for_closed = portal_session.clone();
             let task_tag = session_tag.clone();
@@ -430,13 +434,13 @@ impl LibeiSessionHandleImpl {
         self.eis_activated
             .store(true, std::sync::atomic::Ordering::Release);
 
-        // 2026-09-01 (TEST_20260901163732): keep consuming events AFTER setup.
+        // Keep consuming events AFTER setup.
         // KWin re-creates the EIS absolute device on every output change
         // (outputsChanged → changeDevice: remove old + add new with fresh
-        // regions). Until now the EiEventStream was dropped here, so the
-        // removal was never seen and pointer_absolute kept a DEAD device
+        // regions). Dropping the EiEventStream here would make the
+        // removal invisible and pointer_absolute would keep a DEAD device
         // handle forever — after a mid-session resolution switch, absolute
-        // pointer injection went into the void ("mouse defective"). The
+        // pointer injection goes into the void ("mouse defective"). The
         // persistent loop re-binds roles when the replacement device's Done
         // event arrives and answers compositor Pings.
         let weak_handle = self
@@ -586,10 +590,10 @@ impl LibeiSessionHandleImpl {
                             "[libei] Device region: {}x{} at ({},{}) scale={}",
                             width, hight, offset_x, offset_y, scale
                         );
-                        // 2026-09-01: REPLACE regions instead of appending —
+                        // REPLACE regions instead of appending —
                         // KWin re-creates the device on output changes, and a
                         // re-added device may carry updated regions for the
-                        // SAME device object. Appending left stale (possibly
+                        // SAME device object. Appending leaves stale (possibly
                         // larger) regions that offset absolute pointer
                         // coordinates into the void.
                         data.regions = vec![eis_common::DeviceRegion {
@@ -600,7 +604,7 @@ impl LibeiSessionHandleImpl {
                         }];
                     }
                     ei::device::Event::Destroyed { serial } => {
-                        // 2026-09-01 (TEST_20260901163732): KWin's
+                        // KWin's
                         // outputsChanged → changeDevice removes the old
                         // device before adding a fresh one with new regions.
                         // Clear every role that held this device so injection

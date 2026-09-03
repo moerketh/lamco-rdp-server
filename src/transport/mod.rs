@@ -132,7 +132,7 @@ impl AcceptDispatcher {
                         "Connection accepted"
                     );
 
-                    // Dead-client wedge mitigation (2026-08-27 finding): a
+                    // Dead-client wedge mitigation: a
                     // silent peer parks the acceptor's first read inside this
                     // serial loop and blacks out every listener until it goes
                     // away. Wrap the stream so the FIRST client byte must
@@ -181,9 +181,9 @@ impl AcceptDispatcher {
                             // the X.224 exchange and skips both TLS and CredSSP.
                             //
                             // HostRelayed authenticates nobody and cannot: vmms sends
-                            // an empty Client Info credential (measured 2026-08-27).
-                            // The vsock transport is the access boundary: the listener
-                            // enforces the peer-CID allowlist (beaa24e; default
+                            // an empty Client Info credential. The vsock transport is
+                            // the access boundary: the listener
+                            // enforces the peer-CID allowlist (default
                             // VMADDR_CID_HOST only, in-guest loopback CID 1 refused).
                             // Never widen this arm to a TCP listener.
                             rdp_server

@@ -77,8 +77,8 @@ void *lamco_x264_create(uint32_t width, uint32_t height, uint32_t fps,
     param.rc.i_rc_method = X264_RC_CRF;
     /* Colorimetry VUI: signal BT.601 with the requested range. mstsc does
      * not perform limited->full expansion (limited black Y16 renders as
-     * RGB 16 = grey), so fullrange=1 encoding + flag is the grey-blacks
-     * fix. Values: colmatrix 6=BT.601 (SMPTE170M), colorprim 6=SMPTE170M,
+     * RGB 16 = grey), so full-range encoding + flag is used to keep black
+     * rendering as black. Values: colmatrix 6=BT.601 (SMPTE170M), colorprim 6=SMPTE170M,
      * transfer 1=BT.709 (standard for computer graphics per sRGB). */
     param.vui.i_colmatrix = 6;   /* X264_VUI_COLORSPEC_SMPTE170M */
     param.vui.i_colorprim = 6;   /* SMPTE170M */
@@ -86,8 +86,9 @@ void *lamco_x264_create(uint32_t width, uint32_t height, uint32_t fps,
     param.vui.b_fullrange = fullrange ? 1 : 0;
     /* CRF 0 is lossless and rejected by the 4:2:0 profiles required for
      * MS-RDPEGFX AVC420. Screen content is visually lossless around CRF 15;
-     * OpenH264-style qp_min values (0-10) must not map to CRF 1, which makes
-     * the encoder ~10x slower for no perceptible gain on text/UI. */
+     * OpenH264-style qp_min values (0-10) must not map to CRF 1, which is
+     * near-lossless and makes the encoder much slower for no perceptible
+     * gain on text/UI. */
     param.rc.f_rf_constant = qp_min < 15 ? 15.0f : (qp_min > 30 ? 30.0f : (float)qp_min);
     if (apply_profile(&param, "main") != 0) {
         cleanup(&param);

@@ -103,8 +103,8 @@ x509-parser = "0.18"
 # (publish = false in upstream Cargo.toml)
 #
 # IronRDP — moerketh fork, branch feature/enhanced-session-server.
-# Eight commits on top of Devolutions upstream master (rebased 2026-08-28
-# onto b828a6cf), all unsubmitted: Hyper-V Enhanced Session guest support
+# Eight commits on top of Devolutions upstream master (based on b828a6cf),
+# all unsubmitted: Hyper-V Enhanced Session guest support
 # (ironrdp-vmconnect::server plus TransportTls::HostRelayed), a typed
 # ServerEvent::Pointer for out-of-band cursor updates, a fix for fast-path
 # updates with an empty payload (PTR_NULL / PTR_DEFAULT were silently never
@@ -113,10 +113,10 @@ x509-parser = "0.18"
 # CredSSP) so one silent peer can no longer park the single-connection
 # accept loop indefinitely.
 #
-# The 2026-08-28 rebase absorbed upstream #1796, which dropped
-# ironrdp-server's `tokio`/`tokio_rustls` re-exports; this crate now
+# Upstream #1796 dropped ironrdp-server's `tokio`/`tokio_rustls`
+# re-exports; this crate now
 # depends on rustls and tokio-rustls directly (see Networking section).
-# The same rebase reshaped MouseEvent buttons into Button{button, pressed}
+# The same upstream change reshaped MouseEvent buttons into Button{button, pressed}
 # and moved ServerResult onto ironrdp_error::Error<ServerErrorKind>.
 #
 # Drop fork when picky ships with stable RustCrypto deps.
@@ -386,8 +386,7 @@ metrics-server = ["tiny_http"]
 # and the builder's .with_rdpdr_factory(). The channel is wired into
 # ironrdp-server unconditionally (compile cost only until a factory is set).
 # Enabling actual drive redirection here needs a backend implementing
-# RdpdrServerBackend + a factory; design notes in
-# docs/analysis/spec/MS-RDPEFS/ ("RDPDR Server Spec v2", 2026-03-10).
+# RdpdrServerBackend + a factory.
 rdpdr = []
 
 # Future features (not yet implemented)

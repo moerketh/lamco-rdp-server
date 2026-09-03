@@ -53,8 +53,8 @@ pub(crate) fn compute_damage_ratio(regions: &[DamageRegion], width: u32, height:
 ///   `true` for `ENGAGE_AFTER` (some clients pulse the PDU under wire
 ///   pressure), and release immediately when it clears — a returning client
 ///   must get frames at once, not after another delay.
-/// - `None` (no shared flag) never skips: gate inactive, matching the
-///   pre-existing unconditional-encode behavior.
+/// - `None` (no shared flag) never skips: the gate is inactive and the
+///   pipeline encodes unconditionally.
 pub(crate) fn should_skip_for_suppress(
     suppressed: Option<&std::sync::atomic::AtomicBool>,
     suppressed_since: Option<Instant>,

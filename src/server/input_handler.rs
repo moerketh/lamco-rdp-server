@@ -779,9 +779,8 @@ impl LamcoInputHandler {
                     .map_err(input_injection_err)?;
             }
 
-            // The rebased fork collapsed the ten per-button press/release
-            // variants into one `Button { button, pressed }` arm (upstream
-            // reshaped MouseEvent around a shared MouseButton identity).
+            // All buttons share one `Button { button, pressed }` arm
+            // (MouseEvent uses a shared MouseButton identity).
             IronMouseEvent::Button {
                 button, pressed, ..
             } => {

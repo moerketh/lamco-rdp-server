@@ -62,7 +62,7 @@ pub fn materialize_dmabuf_frame(mut frame: VideoFrame) -> VideoFrame {
                 modifier = desc.modifier,
                 "DMA-BUF frame could not be materialized to CPU memory ({e}); dropping frame"
             );
-            // Leave as DmaBuf: downstream paths drop/log it as before.
+            // Leave as DmaBuf: downstream paths drop/log it.
             frame
         }
     }

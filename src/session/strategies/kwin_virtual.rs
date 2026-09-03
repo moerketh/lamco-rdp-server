@@ -8,17 +8,16 @@
 //!
 //! One request (`stream_virtual_output`) creates the output AND its PipeWire
 //! stream — no portal session, no consent dialog, no source picker. Capture
-//! size == desktop size, so the whole scaling/mode-switching machinery
-//! (frame_scaler, kscreen-doctor parsing, inverse pointer mapping, stride
-//! compaction) is bypassed by construction.
+//! size == desktop size, so no capture-to-desktop scaling, coordinate
+//! remapping, or stride compaction machinery is needed between the
+//! stream and the encoder.
 //!
 //! Input reuses the libei machinery (EIS via Portal RemoteDesktop) — KWin's
 //! only supported injection route. The input consent dialog still applies
 //! (one-time via restore token); the VIDEO path is dialog-free.
 //!
-//! E2E validated 2026-09-01 (TEST_20260901180150): krfb-virtualmonitor +
-//! portal picker + DRM-output-off produced a fully working native 1920x1200
-//! session. This strategy is that recipe, done in-process and per-connection.
+//! This strategy reproduces the krfb-virtualmonitor + portal-picker +
+//! DRM-output-off recipe, done in-process and per-connection.
 //!
 //! Architecture:
 //!
@@ -185,12 +184,11 @@ impl SessionHandle for KwinVirtualSessionHandle {
     fn streams(&self) -> Vec<StreamInfo> {
         // Sync trait method over async state. The runtime forbids
         // blocking_* on its own threads (tokio panics: "Cannot block the
-        // current thread from within a runtime" — this exact crash killed
-        // the server on first fresh-VM boot 2026-09-02, before any listener
-        // bound). futures::executor::block_on drives the lock's future on
-        // THIS thread without registering with the runtime, which is safe
-        // here (the lock is only held briefly by establish/release) and is
-        // the same pattern the libei handle uses for its streams().
+        // current thread from within a runtime"). futures::executor::block_on
+        // drives the lock's future on THIS thread without registering with
+        // the runtime, which is safe here (the lock is only held briefly by
+        // establish/release) and is the same pattern the libei handle uses
+        // for its streams().
         futures::executor::block_on(async { self.streams.read().await.clone() })
     }
 
@@ -260,8 +258,7 @@ impl SessionHandle for KwinVirtualSessionHandle {
         // 1. zkde's stream_virtual_output can create the output in a
         //    DISABLED state — notably when a previous manual
         //    `kscreen-doctor output.Virtual-lamco.disable` persisted to
-        //    kwinoutputconfig.json (live 2026-09-02: my own zombie cleanup
-        //    did exactly that, and every later output was born disabled).
+        //    kwinoutputconfig.json, every later output is born disabled.
         //    A disabled virtual output does not count as "an enabled
         //    output", so KWin then refuses the physical disable with
         //    "Disabling all outputs through configuration changes is not
@@ -272,8 +269,7 @@ impl SessionHandle for KwinVirtualSessionHandle {
         //    up).
         //
         // So: create → explicitly enable (position/mode are already right
-        // from creation; enable is idempotent) → disable physical. The E2E
-        // recipe (krfb) had the same effective order.
+        // from creation; enable is idempotent) → disable physical.
         let _node = self.recreate_stream(w, h).await?;
         let _ = tokio::task::spawn_blocking(move || enable_output(VIRTUAL_OUTPUT_KSCREEN_NAME))
             .await
@@ -421,8 +417,7 @@ fn wayland_thread(rx: std::sync::mpsc::Receiver<WlCommand>) {
         /// is RETAINED here after conclusion so a later Close command can
         /// destroy the stream (KWin keeps the virtual output alive until
         /// the stream object is destroyed — dropping the proxy too early
-        /// leaves a zombie output that blocks every subsequent create,
-        /// observed live 2026-09-02).
+        /// leaves a zombie output that blocks every subsequent create).
         pending: Option<(
             ZkdeScreencastStreamUnstableV1,
             Option<tokio::sync::oneshot::Sender<Result<u32, String>>>,
@@ -497,8 +492,8 @@ fn wayland_thread(rx: std::sync::mpsc::Receiver<WlCommand>) {
             // event wins). Consume ONLY the reply — the stream PROXY is
             // retained in state.pending so a later Close command can
             // destroy the stream (KWin removes the virtual output only on
-            // stream destruction; dropping the proxy early left a zombie
-            // output that wedged all reconnects, observed live 2026-09-02).
+            // stream destruction; dropping the proxy early leaves a zombie
+            // output that wedges all reconnects).
             if let Some(outcome) = state.stream_sm.transition(&event) {
                 if let Some(pending) = state.pending.as_mut() {
                     if let Some(reply) = pending.1.take() {
@@ -561,12 +556,11 @@ fn wayland_thread(rx: std::sync::mpsc::Receiver<WlCommand>) {
 
     loop {
         // Poll the Wayland socket with a short timeout so queued commands
-        // are picked up promptly. This is the fix for the parked-thread
-        // wedge (2026-09-02 live session): blocking_dispatch only wakes on
+        // are picked up promptly. blocking_dispatch only wakes on
         // COMPOSITOR events, and an idle desktop (fresh virtual output
-        // showing nothing) produces none — commands then sat unprocessed
-        // until the 10s timeout, so resize failed on connect and every
-        // reconnect wedged forever. std mpsc has no pollable fd, so the
+        // showing nothing) produces none — commands would then sit
+        // unprocessed until a long timeout, wedging resize on connect
+        // and every reconnect. std mpsc has no pollable fd, so the
         // command side is a 50ms poll timeout; ≤50ms command latency is
         // fine (the `created` reply is what gates callers, not this loop).
         let mut poll_fds = [nix::poll::PollFd::new(
@@ -635,8 +629,8 @@ fn wayland_thread(rx: std::sync::mpsc::Receiver<WlCommand>) {
                     // One stream at a time: destroy any previous stream (the
                     // proxy is RETAINED here even after the request concluded,
                     // because KWin keeps the virtual output alive until the
-                    // stream object is destroyed — dropping it early left a
-                    // zombie output that wedged all reconnects, live 2026-09-02).
+                    // stream object is destroyed — dropping it early leaves a
+                    // zombie output that wedges all reconnects).
                     if let Some((prev, _)) = state.pending.take() {
                         prev.close();
                     }
@@ -694,8 +688,8 @@ fn wayland_thread(rx: std::sync::mpsc::Receiver<WlCommand>) {
 // ============================================================================
 
 /// Output-management for the session: disable the physical (DRM) outputs so
-/// the virtual output becomes the primary at (0,0) — the layout that made the
-/// E2E session fully interactive (panel+windows relocate; pointer coordinate
+/// the virtual output becomes the primary at (0,0) — the layout that makes
+/// the session fully interactive (panel+windows relocate; pointer coordinate
 /// chain closes). Re-enables them on drop, physical FIRST (sunshine rule:
 /// never leave the host blind).
 ///
@@ -731,8 +725,8 @@ impl OutputLayoutGuard {
         }
         // VERIFY the disables stuck. KWin/kscreen can silently refuse —
         // notably disabling the only enabled output, which is reverted
-        // immediately (live 2026-09-02: Virtual-1 came back enabled at
-        // (0,0) and the captured virtual output stayed an empty secondary:
+        // immediately (the physical output comes back enabled at (0,0)
+        // and the captured virtual output stays an empty secondary:
         // black screen). Callers of engage() must have created the virtual
         // output FIRST so a disable here leaves a valid layout; if a
         // disable still bounced, retry once after the compositor settles.
@@ -807,8 +801,8 @@ impl Drop for OutputLayoutGuard {
 /// match: hyperv_drm's connector is itself named `Virtual-1`, and that IS
 /// a physical output this guard must manage (disabling it is the whole
 /// point — panel relocation + origin placement). A prefix exclusion would
-/// skip the DRM output entirely and leave the two-screen layout that broke
-/// clicks in the E2E.
+/// skip the DRM output entirely and leave a two-screen layout that breaks
+/// pointer coordinate mapping.
 fn list_enabled_physical_outputs() -> Vec<String> {
     let out = match std::process::Command::new("kscreen-doctor")
         .arg("-o")
@@ -865,7 +859,7 @@ fn parse_enabled_physical_outputs(kscreen_text: &str) -> Vec<String> {
 
     // kscreen-doctor colorizes its output unconditionally (even piped), so
     // ANSI escape sequences sit between the marker words and the values
-    // (live raw dump 2026-09-02: "\u{1b}[01;32mOutput: \u{1b}[0;0m1 Virtual-1").
+    // (e.g. "\u{1b}[01;32mOutput: \u{1b}[0;0m1 Virtual-1").
     // Strip them BEFORE matching, or every comparison misses.
     let stripped = strip_ansi(kscreen_text);
 
@@ -964,8 +958,7 @@ impl KwinVirtualStrategy {
         // degrades (panel elsewhere) — treat as available anyway. The
         // definitive probe is the zkde global, done on the connection thread
         // at establish time (the global only appears after the screencast
-        // plugin loads, so a pre-flight probe is unreliable — see the
-        // 2026-09-01 spike notes).
+        // plugin loads, so a pre-flight probe is unreliable).
         true
     }
 }
@@ -990,8 +983,8 @@ impl crate::session::strategy::SessionStrategy for KwinVirtualStrategy {
         info!("[kwin-virtual] creating session (zkde-screencast video + libei input)");
 
         // Input: reuse the libei machinery verbatim (Portal RemoteDesktop +
-        // EIS, restore token, persistent event consumer — all the Bug-5
-        // machinery). The concrete handle lets us delegate input directly.
+        // EIS, restore token, persistent event consumer). The concrete
+        // handle lets us delegate input directly.
         let libei_strategy =
             crate::session::strategies::libei::LibeiStrategy::new(None, self.token_manager.clone());
         let libei_impl = libei_strategy.create_session_concrete().await?;
@@ -1000,8 +993,8 @@ impl crate::session::strategy::SessionStrategy for KwinVirtualStrategy {
         // establish_for_client (per connection) and drops on
         // release_after_client — engaging at session creation would blank
         // the console for the entire server lifetime, hiding the one-time
-        // input-consent dialog from the user (fresh-VM boot 2026-09-02
-        // lesson: the dialog must be visible on the console).
+        // input-consent dialog from the user (the dialog must be visible
+        // on the console).
         let handle = Arc::new(KwinVirtualSessionHandle::new(libei_impl));
         Ok(handle as Arc<dyn SessionHandle>)
     }
@@ -1022,8 +1015,8 @@ mod tests {
     //! kwin-virtual strategy unit tests.
     //!
     //! The Wayland object layer can't be exercised off-compositor, so the
-    //! testable seams are the pure logic: the kscreen output parser (whose
-    //! Virtual-1 exclusion bug shipped once — see the regression test) and
+    //! testable seams are the pure logic: the kscreen output parser (with
+    //! its exact-name exclusion rule — see the regression test) and
     //! the stream-event state machine (Created/Failed/Closed ordering
     //! rules).
 
@@ -1033,17 +1026,17 @@ mod tests {
     // parse_enabled_physical_outputs
     // ========================================================================
 
-    /// Real-world sample from the Hyper-V VM (2026-09-01 E2E): hyperv_drm's
+    /// Real-world connector naming on Hyper-V: hyperv_drm's
     /// connector is named `Virtual-1` and MUST be managed (disabled) by the
-    /// guard; our zkde output is `Virtual-lamco` and MUST be excluded.
-    /// The first shipped version excluded ANY `Virtual-*` name — skipping the
-    /// DRM output entirely and leaving the two-screen layout that broke
-    /// clicks. This sample is that exact machine's output.
+    /// guard; our zkde output is `Virtual-lamco` and MUST be excluded —
+    /// the exclusion is exact-name, never a `Virtual-` prefix (a prefix
+    /// match would skip the DRM output and leave a two-screen layout that
+    /// breaks pointer mapping). This sample mirrors that machine's output.
     const KSCREEN_TWO_OUTPUTS: &str = "Output: 1 Virtual-1\n        enabled\n        connected\n        priority 1\n        Unknown\n        Modes:  1:1024x768@60!  2:1920x1080@60*  3:1600x1200@60 \n        Geometry: 0,0 1920x1080\n        Scale: 1\nOutput: 2 Virtual-lamco\n        enabled\n        connected\n        priority 2\n        Unknown\n        Modes:  25:1920x1200@60*! \n        Geometry: 1920,0 1920x1200\n        Scale: 1\n";
 
     #[test]
     fn test_parser_hyperv_drm_output_is_managed() {
-        // The critical regression: hyperv_drm's `Virtual-1` is a PHYSICAL
+        // hyperv_drm's `Virtual-1` is a PHYSICAL
         // output here — it must appear (be disabled by the guard), not be
         // excluded by a Virtual- prefix.
         let names = parse_enabled_physical_outputs(KSCREEN_TWO_OUTPUTS);
@@ -1107,12 +1100,13 @@ mod tests {
 
     #[test]
     fn test_parser_ansi_colored_output_is_parsed() {
-        // LIVE REGRESSION (2026-09-02, TEST_20260902110104): kscreen-doctor
-        // colorizes unconditionally — even piped. The ANSI bytes between
-        // "Output: " and the values made every comparison miss, so the
-        // guard never disabled Virtual-1, the desktop stayed on the
-        // physical output, and the captured virtual output was a black,
-        // frame-idle screen. Fixture is the exact raw dump from the journal.
+        // kscreen-doctor colorizes unconditionally — even piped. The
+        // parser must strip ANSI sequences before comparing: without
+        // stripping, the ANSI bytes between "Output: " and the values
+        // make every comparison miss, so the guard would never disable
+        // Virtual-1, the desktop would stay on the physical output, and
+        // the captured virtual output would be a black, frame-idle
+        // screen. The fixture contains ANSI sequences for this reason.
         let text = "\u{1b}[01;32mOutput: \u{1b}[0;0m1 Virtual-1\n\t\u{1b}[01;32menabled\u{1b}[0;0m\n\t\u{1b}[01;32mconnected\u{1b}[0;0m\n\t\u{1b}[01;32mpriority 1\u{1b}[0;0m\n\t\u{1b}[01;33mUnknown\u{1b}[0;0m\n\t\u{1b}[01;34mModes: \u{1b}[0;0m 1:1024x768@60!  2:1920x1080@60* \nOutput: 2 Virtual-lamco\n\tenabled\n";
         let names = parse_enabled_physical_outputs(text);
         assert_eq!(names, vec!["Virtual-1".to_string()]);
@@ -1247,7 +1241,9 @@ mod tests {
     #[tokio::test]
     async fn test_resize_capture_source_default_is_none() {
         // The trait's default (non-elastic strategies) must be None —
-        // the display handler falls back to the DRM mode-switch path.
+        // capture size is fixed by the compositor and the display
+        // handler silently adopts the client's requested desktop size
+        // instead of recreating the capture source.
         // Use a minimal anonymous handle to prove the default.
         struct NoElastic;
         #[async_trait]
