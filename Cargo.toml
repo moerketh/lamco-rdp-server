@@ -2,7 +2,7 @@
 name = "lamco-rdp-server"
 version = "1.4.4"
 edition = "2024"
-rust-version = "1.89"
+rust-version = "1.94"
 authors = ["Greg Lamberson <greg@lamco.io>"]
 description = "Wayland RDP server - Portal mode for Linux desktop sharing"
 license = "BUSL-1.1"
@@ -34,16 +34,18 @@ path = "src/lib.rs"
 # -----------------------------------------------------------------------------
 # Clipboard crates use crates.io releases. Their ironrdp-cliprdr/core deps are
 # redirected to the same patched IronRDP git rev as the rest of the binary via
-# [patch.crates-io], and the versions are aligned (lamco-rdp-clipboard 0.4
-# requires ironrdp-cliprdr 0.6, which the patch supplies), so there is no
-# trait-diamond conflict.
-lamco-rdp = "0.6.3"
+# [patch.crates-io], and the versions must stay aligned: lamco-rdp-clipboard
+# 0.5 requires ironrdp-cliprdr 0.7, which the patch supplies. If the pinned
+# IronRDP rev ever moves to a semver-incompatible ironrdp-cliprdr, the patch
+# silently stops applying to this crate and cargo pulls a second copy from
+# crates.io, producing a trait-diamond error on CliprdrBackend.
+lamco-rdp = "0.7.0"
 lamco-portal = { version = "0.4.1", features = ["dbus-clipboard"] }
 lamco-pipewire = { version = "0.5.1", features = ["audio", "damage"] }
 lamco-video = "0.2.0"
 lamco-rdp-input = "0.1.5"
 lamco-clipboard-core = { version = "0.6.1", features = ["image"] }
-lamco-rdp-clipboard = "0.4.2"
+lamco-rdp-clipboard = "0.5.0"
 
 # -----------------------------------------------------------------------------
 # Async runtime
@@ -84,6 +86,11 @@ socket2 = "0.6"
 # -----------------------------------------------------------------------------
 bytes = "1.5"
 rustls-pemfile = "2.2"
+# Direct deps since the IronRDP rebase absorbed upstream #1796, which dropped
+# ironrdp-server's `tokio`/`tokio_rustls` re-exports. Versions match what
+# ironrdp-server 0.13 pins so TlsAcceptor/ServerConfig unify to one instance.
+rustls = "0.23"
+tokio-rustls = "0.26"
 x509-cert = "0.2.5"
 x509-parser = "0.18"
 
@@ -92,30 +99,37 @@ x509-parser = "0.18"
 # Git deps required: ironrdp-egfx is not published to crates.io yet
 # (publish = false in upstream Cargo.toml)
 #
-# IronRDP — lamco-admin fork, branch feat/lamco-combined.
-# Rebased onto upstream/master 2026-07-03 (was 38 commits behind); most prior
-# fork-local patches are now upstream-merged and were dropped rather than
-# replayed. Combines: diagnostic logging for backpressure/dispatch/outbound
-# timing (unsubmitted), mid-session CapsAdvertise re-advertise handling for
-# mstsc/macOS decoder recovery (unsubmitted), NetworkAutoDetect over the MCS
-# message channel (PR #1348, open upstream), and a dispatch_pdu stall-warning
-# split (unsubmitted).
-# Based on picky rc.20 / sspi 0.18 — upstream master blocked by
-# picky rc.22 / rand_core RC conflict with ashpd's getrandom 0.4.
+# IronRDP — moerketh fork, branch feature/enhanced-session-server.
+# Eight commits on top of Devolutions upstream master (based on b828a6cf),
+# all unsubmitted: Hyper-V Enhanced Session guest support
+# (ironrdp-vmconnect::server plus TransportTls::HostRelayed), a typed
+# ServerEvent::Pointer for out-of-band cursor updates, a fix for fast-path
+# updates with an empty payload (PTR_NULL / PTR_DEFAULT were silently never
+# sent), negotiated-protocol exposure guarding the host-relayed upgrade
+# skip, and 30s bounds on each pre-auth handshake step (X.224 / TLS /
+# CredSSP) so one silent peer can no longer park the single-connection
+# accept loop indefinitely.
+#
+# Upstream #1796 dropped ironrdp-server's `tokio`/`tokio_rustls`
+# re-exports; this crate now
+# depends on rustls and tokio-rustls directly (see Networking section).
+# The same upstream change reshaped MouseEvent buttons into Button{button, pressed}
+# and moved ServerResult onto ironrdp_error::Error<ServerErrorKind>.
+#
 # Drop fork when picky ships with stable RustCrypto deps.
 # See: docs/analysis/UNIFIED-ARCHITECTURE-RESEARCH-2026-04-05.md
 # -----------------------------------------------------------------------------
-ironrdp = { git = "https://github.com/lamco-admin/IronRDP", rev = "a760e438bd34e5f2fe4d2deb83170387c76add5f", default-features = false, features = ["server"] }
-ironrdp-server = { git = "https://github.com/lamco-admin/IronRDP", rev = "a760e438bd34e5f2fe4d2deb83170387c76add5f", features = ["egfx", "helper"] }
-ironrdp-pdu = { git = "https://github.com/lamco-admin/IronRDP", rev = "a760e438bd34e5f2fe4d2deb83170387c76add5f" }
-ironrdp-displaycontrol = { git = "https://github.com/lamco-admin/IronRDP", rev = "a760e438bd34e5f2fe4d2deb83170387c76add5f" }
-ironrdp-cliprdr = { git = "https://github.com/lamco-admin/IronRDP", rev = "a760e438bd34e5f2fe4d2deb83170387c76add5f" }
-ironrdp-core = { git = "https://github.com/lamco-admin/IronRDP", rev = "a760e438bd34e5f2fe4d2deb83170387c76add5f" }
-ironrdp-dvc = { git = "https://github.com/lamco-admin/IronRDP", rev = "a760e438bd34e5f2fe4d2deb83170387c76add5f" }
-ironrdp-svc = { git = "https://github.com/lamco-admin/IronRDP", rev = "a760e438bd34e5f2fe4d2deb83170387c76add5f" }
-ironrdp-egfx = { git = "https://github.com/lamco-admin/IronRDP", rev = "a760e438bd34e5f2fe4d2deb83170387c76add5f" }
-ironrdp-graphics = { git = "https://github.com/lamco-admin/IronRDP", rev = "a760e438bd34e5f2fe4d2deb83170387c76add5f" }
-ironrdp-rdpsnd = { git = "https://github.com/lamco-admin/IronRDP", rev = "a760e438bd34e5f2fe4d2deb83170387c76add5f" }
+ironrdp = { git = "https://github.com/moerketh/IronRDP", rev = "106a3d831a049b3da598c6270b38b9b312f83e7c", default-features = false, features = ["server"] }
+ironrdp-server = { git = "https://github.com/moerketh/IronRDP", rev = "106a3d831a049b3da598c6270b38b9b312f83e7c", features = ["egfx", "helper"] }
+ironrdp-pdu = { git = "https://github.com/moerketh/IronRDP", rev = "106a3d831a049b3da598c6270b38b9b312f83e7c" }
+ironrdp-displaycontrol = { git = "https://github.com/moerketh/IronRDP", rev = "106a3d831a049b3da598c6270b38b9b312f83e7c" }
+ironrdp-cliprdr = { git = "https://github.com/moerketh/IronRDP", rev = "106a3d831a049b3da598c6270b38b9b312f83e7c" }
+ironrdp-core = { git = "https://github.com/moerketh/IronRDP", rev = "106a3d831a049b3da598c6270b38b9b312f83e7c" }
+ironrdp-dvc = { git = "https://github.com/moerketh/IronRDP", rev = "106a3d831a049b3da598c6270b38b9b312f83e7c" }
+ironrdp-svc = { git = "https://github.com/moerketh/IronRDP", rev = "106a3d831a049b3da598c6270b38b9b312f83e7c" }
+ironrdp-egfx = { git = "https://github.com/moerketh/IronRDP", rev = "106a3d831a049b3da598c6270b38b9b312f83e7c" }
+ironrdp-graphics = { git = "https://github.com/moerketh/IronRDP", rev = "106a3d831a049b3da598c6270b38b9b312f83e7c" }
+ironrdp-rdpsnd = { git = "https://github.com/moerketh/IronRDP", rev = "106a3d831a049b3da598c6270b38b9b312f83e7c" }
 
 # -----------------------------------------------------------------------------
 # Wayland and Portal integration
@@ -205,7 +219,7 @@ tokio-vsock = { version = "0.7", optional = true }
 # WebSocket transport for browser/WASM clients via RDCleanPath. Gated behind
 # the `websocket` Cargo feature.
 tokio-tungstenite = { version = "0.29", optional = true, default-features = false, features = ["handshake"] }
-ironrdp-rdcleanpath = { git = "https://github.com/lamco-admin/IronRDP", rev = "a760e438bd34e5f2fe4d2deb83170387c76add5f", optional = true }
+ironrdp-rdcleanpath = { git = "https://github.com/moerketh/IronRDP", rev = "106a3d831a049b3da598c6270b38b9b312f83e7c", optional = true }
 
 # -----------------------------------------------------------------------------
 # System and utilities
@@ -324,9 +338,10 @@ vsock = ["tokio-vsock"]
 
 # WebSocket + RDCleanPath transport listener — eliminates ws-rdp-proxy from
 # production for browser/WASM clients (lamco-rdp-wasm and any other
-# RDCleanPath-aware client). Requires our IronRDP fork at 6fa2bf5f+ for
-# RdpServer::run_connection_pre_authenticated. Vanilla RDP clients (mstsc,
-# xfreerdp) must continue to use the TCP path. See
+# RDCleanPath-aware client). Uses RdpServer::run_connection_with +
+# TransportTls::AlreadyDone (upstream PR #1281, which reshaped our fork's
+# original run_connection_pre_authenticated patch). Vanilla RDP clients
+# (mstsc, xfreerdp) must continue to use the TCP path. See
 # docs/design/transport/TRANSPORT-PHASE-3B-SDS-2026-05-16.md
 websocket = ["tokio-tungstenite", "ironrdp-rdcleanpath"]
 
@@ -334,14 +349,14 @@ websocket = ["tokio-tungstenite", "ironrdp-rdcleanpath"]
 # Adds tiny-http for lightweight synchronous HTTP serving.
 metrics-server = ["tiny_http"]
 
-# RDPDR (MS-RDPEFS) server-side drive redirection — NOT YET AVAILABLE.
-# Server-side RDPDR (RdpdrServerBackend / RdpdrServerFactory) exists in neither
-# upstream IronRDP nor our fork; the ironrdp-rdpdr crate is client-side only.
-# The rdpdr feature is design scaffolding written against the planned API
-# (docs/analysis/spec/MS-RDPEFS/, the 2026-03-10 "RDPDR Server Spec v2"). This
-# empty-stub feature only keeps the #[cfg(feature = "rdpdr")] gates valid;
-# nothing enables it. Add the ironrdp-rdpdr server dependency here once the
-# upstream/fork server-side support lands.
+# RDPDR (MS-RDPEFS) server-side drive redirection.
+# Server-side RDPDR landed upstream (PRs #1779/#1783/#1784) and is in our
+# pinned fork rev 106a3d83+: ironrdp_rdpdr::server::{RdpdrServer,
+# RdpdrServerBackend, RdpdrServerMessage}, ironrdp_server::RdpdrServerFactory,
+# and the builder's .with_rdpdr_factory(). The channel is wired into
+# ironrdp-server unconditionally (compile cost only until a factory is set).
+# Enabling actual drive redirection here needs a backend implementing
+# RdpdrServerBackend + a factory.
 rdpdr = []
 
 # Future features (not yet implemented)
@@ -474,28 +489,26 @@ cast_precision_loss = "allow"
 # lamco-portal = { path = "/home/greg/lamco-workspaces/lamco-wayland/crates/lamco-portal" }
 # lamco-wayland = { path = "/home/greg/lamco-workspaces/lamco-wayland" }
 
-# IronRDP lamco-admin fork — used by lamco-rdp-server.
+# IronRDP moerketh fork — used by lamco-rdp-server.
 # Pinned to an IMMUTABLE rev so switching branches in the local IronRDP
 # checkout for upstream-PR work never breaks this build. The rev is
-# feat/lamco-combined rebased onto upstream master 90461444 (2026-06-09,
-# post-#1172/#1345 merges; prior head archived as
-# archive/lamco-combined-pre-rebase-2026-06-09). lamco-rdp-clipboard 0.4
-# (crates.io) requires
-# ironrdp-cliprdr 0.6, which these patches supply from the same rev, so there
-# is no trait-diamond conflict. Drop the whole IronRDP [patch] once Devolutions
-# publishes ironrdp-egfx to crates.io.
+# feature/enhanced-session-server: Hyper-V Enhanced Session guest support on
+# top of Devolutions upstream master. lamco-rdp-clipboard 0.5 (crates.io)
+# requires ironrdp-cliprdr 0.7, which these patches supply from the same rev,
+# so there is no trait-diamond conflict. Drop the whole IronRDP [patch] once
+# Devolutions publishes ironrdp-egfx to crates.io.
 #
 # To hack on IronRDP locally against this server, temporarily swap the
 # `git`/`rev` entries below for `path = "/home/greg/IronRDP/crates/<crate>"`
 # (do NOT commit the path form — it couples the build to the working tree).
-ironrdp = { git = "https://github.com/lamco-admin/IronRDP", rev = "a760e438bd34e5f2fe4d2deb83170387c76add5f" }
-ironrdp-pdu = { git = "https://github.com/lamco-admin/IronRDP", rev = "a760e438bd34e5f2fe4d2deb83170387c76add5f" }
-ironrdp-server = { git = "https://github.com/lamco-admin/IronRDP", rev = "a760e438bd34e5f2fe4d2deb83170387c76add5f" }
-ironrdp-graphics = { git = "https://github.com/lamco-admin/IronRDP", rev = "a760e438bd34e5f2fe4d2deb83170387c76add5f" }
-ironrdp-cliprdr = { git = "https://github.com/lamco-admin/IronRDP", rev = "a760e438bd34e5f2fe4d2deb83170387c76add5f" }
-ironrdp-svc = { git = "https://github.com/lamco-admin/IronRDP", rev = "a760e438bd34e5f2fe4d2deb83170387c76add5f" }
-ironrdp-dvc = { git = "https://github.com/lamco-admin/IronRDP", rev = "a760e438bd34e5f2fe4d2deb83170387c76add5f" }
-ironrdp-core = { git = "https://github.com/lamco-admin/IronRDP", rev = "a760e438bd34e5f2fe4d2deb83170387c76add5f" }
-ironrdp-displaycontrol = { git = "https://github.com/lamco-admin/IronRDP", rev = "a760e438bd34e5f2fe4d2deb83170387c76add5f" }
-ironrdp-egfx = { git = "https://github.com/lamco-admin/IronRDP", rev = "a760e438bd34e5f2fe4d2deb83170387c76add5f" }
-ironrdp-rdpsnd = { git = "https://github.com/lamco-admin/IronRDP", rev = "a760e438bd34e5f2fe4d2deb83170387c76add5f" }
+ironrdp = { git = "https://github.com/moerketh/IronRDP", rev = "106a3d831a049b3da598c6270b38b9b312f83e7c" }
+ironrdp-pdu = { git = "https://github.com/moerketh/IronRDP", rev = "106a3d831a049b3da598c6270b38b9b312f83e7c" }
+ironrdp-server = { git = "https://github.com/moerketh/IronRDP", rev = "106a3d831a049b3da598c6270b38b9b312f83e7c" }
+ironrdp-graphics = { git = "https://github.com/moerketh/IronRDP", rev = "106a3d831a049b3da598c6270b38b9b312f83e7c" }
+ironrdp-cliprdr = { git = "https://github.com/moerketh/IronRDP", rev = "106a3d831a049b3da598c6270b38b9b312f83e7c" }
+ironrdp-svc = { git = "https://github.com/moerketh/IronRDP", rev = "106a3d831a049b3da598c6270b38b9b312f83e7c" }
+ironrdp-dvc = { git = "https://github.com/moerketh/IronRDP", rev = "106a3d831a049b3da598c6270b38b9b312f83e7c" }
+ironrdp-core = { git = "https://github.com/moerketh/IronRDP", rev = "106a3d831a049b3da598c6270b38b9b312f83e7c" }
+ironrdp-displaycontrol = { git = "https://github.com/moerketh/IronRDP", rev = "106a3d831a049b3da598c6270b38b9b312f83e7c" }
+ironrdp-egfx = { git = "https://github.com/moerketh/IronRDP", rev = "106a3d831a049b3da598c6270b38b9b312f83e7c" }
+ironrdp-rdpsnd = { git = "https://github.com/moerketh/IronRDP", rev = "106a3d831a049b3da598c6270b38b9b312f83e7c" }

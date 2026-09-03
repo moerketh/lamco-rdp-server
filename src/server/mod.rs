@@ -86,6 +86,7 @@ use ironrdp_graphics::zgfx::CompressionMode;
 use ironrdp_pdu::rdp::capability_sets::server_codecs_capabilities;
 use ironrdp_server::RdpServer;
 use tokio::sync::Mutex;
+use tokio_rustls::TlsAcceptor as TokioTlsAcceptor;
 use tracing::{debug, error, info, warn};
 
 use crate::{
@@ -850,8 +851,7 @@ impl LamcoRdpServer {
                 config.security.require_tls_13,
             )
             .context("Failed to load TLS certificates")?;
-            let tls_acceptor =
-                ironrdp_server::tokio_rustls::TlsAcceptor::from(tls_config.server_config());
+            let tls_acceptor = TokioTlsAcceptor::from(tls_config.server_config());
             let tls_pub_key = tls_config.public_key().ok();
 
             let codecs = server_codecs_capabilities(&["remotefx"])
@@ -1325,8 +1325,7 @@ impl LamcoRdpServer {
         )
         .context("Failed to load TLS certificates")?;
 
-        let tls_acceptor =
-            ironrdp_server::tokio_rustls::TlsAcceptor::from(tls_config.server_config());
+        let tls_acceptor = TokioTlsAcceptor::from(tls_config.server_config());
         let tls_pub_key = tls_config.public_key().ok();
 
         let codecs = server_codecs_capabilities(&["remotefx"])

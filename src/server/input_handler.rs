@@ -779,82 +779,80 @@ impl LamcoInputHandler {
                     .map_err(input_injection_err)?;
             }
 
-            IronMouseEvent::LeftPressed => {
-                mouse.handle_button_down(MouseButton::Left)?;
+            // All buttons share one `Button { button, pressed }` arm
+            // (MouseEvent uses a shared MouseButton identity).
+            IronMouseEvent::Button {
+                button, pressed, ..
+            } => {
+                use ironrdp_server::MouseButton as IronMouseButton;
+
+                // evdev BTN_* codes: 272 LEFT, 273 RIGHT, 274 MIDDLE,
+                // 275 SIDE (back), 276 EXTRA (forward).
+                let (lamco_button, evdev_code) = match button {
+                    IronMouseButton::Left => (MouseButton::Left, 272),
+                    IronMouseButton::Right => (MouseButton::Right, 273),
+                    IronMouseButton::Middle => (MouseButton::Middle, 274),
+                    IronMouseButton::X1 => (MouseButton::Extra1, 275),
+                    IronMouseButton::X2 => (MouseButton::Extra2, 276),
+                    _ => {
+                        trace!(?button, "Ignoring unknown mouse button");
+                        return Ok(());
+                    }
+                };
+
+                if pressed {
+                    mouse.handle_button_down(lamco_button)?;
+                } else {
+                    mouse.handle_button_up(lamco_button)?;
+                }
                 session_handle
-                    .notify_pointer_button(272, true) // BTN_LEFT
+                    .notify_pointer_button(evdev_code, pressed)
                     .await
                     .map_err(input_injection_err)?;
             }
 
-            IronMouseEvent::LeftReleased => {
-                mouse.handle_button_up(MouseButton::Left)?;
-                session_handle
-                    .notify_pointer_button(272, false)
-                    .await
-                    .map_err(input_injection_err)?;
-            }
+            // Relative-motion button events (MouseRelPdu path): apply the
+            // delta first so button state and injected position agree.
+            IronMouseEvent::ButtonRel {
+                x,
+                y,
+                button,
+                pressed,
+            } => {
+                use ironrdp_server::MouseButton as IronMouseButton;
 
-            IronMouseEvent::RightPressed => {
-                mouse.handle_button_down(MouseButton::Right)?;
-                session_handle
-                    .notify_pointer_button(273, true) // BTN_RIGHT
-                    .await
-                    .map_err(input_injection_err)?;
-            }
+                let mouse_event = mouse.handle_relative_move(x, y, &mut transformer)?;
+                if let crate::input::MouseEvent::Move {
+                    x: stream_x,
+                    y: stream_y,
+                    ..
+                } = mouse_event
+                {
+                    session_handle
+                        .notify_pointer_motion_absolute(stream_id, stream_x, stream_y)
+                        .await
+                        .map_err(input_injection_err)?;
+                }
 
-            IronMouseEvent::RightReleased => {
-                mouse.handle_button_up(MouseButton::Right)?;
-                session_handle
-                    .notify_pointer_button(273, false)
-                    .await
-                    .map_err(input_injection_err)?;
-            }
+                let (lamco_button, evdev_code) = match button {
+                    IronMouseButton::Left => (MouseButton::Left, 272),
+                    IronMouseButton::Right => (MouseButton::Right, 273),
+                    IronMouseButton::Middle => (MouseButton::Middle, 274),
+                    IronMouseButton::X1 => (MouseButton::Extra1, 275),
+                    IronMouseButton::X2 => (MouseButton::Extra2, 276),
+                    _ => {
+                        trace!(?button, "Ignoring unknown relative mouse button");
+                        return Ok(());
+                    }
+                };
 
-            IronMouseEvent::MiddlePressed => {
-                mouse.handle_button_down(MouseButton::Middle)?;
+                if pressed {
+                    mouse.handle_button_down(lamco_button)?;
+                } else {
+                    mouse.handle_button_up(lamco_button)?;
+                }
                 session_handle
-                    .notify_pointer_button(274, true) // BTN_MIDDLE
-                    .await
-                    .map_err(input_injection_err)?;
-            }
-
-            IronMouseEvent::MiddleReleased => {
-                mouse.handle_button_up(MouseButton::Middle)?;
-                session_handle
-                    .notify_pointer_button(274, false)
-                    .await
-                    .map_err(input_injection_err)?;
-            }
-
-            IronMouseEvent::Button4Pressed => {
-                mouse.handle_button_down(MouseButton::Extra1)?;
-                session_handle
-                    .notify_pointer_button(275, true) // BTN_SIDE
-                    .await
-                    .map_err(input_injection_err)?;
-            }
-
-            IronMouseEvent::Button4Released => {
-                mouse.handle_button_up(MouseButton::Extra1)?;
-                session_handle
-                    .notify_pointer_button(275, false)
-                    .await
-                    .map_err(input_injection_err)?;
-            }
-
-            IronMouseEvent::Button5Pressed => {
-                mouse.handle_button_down(MouseButton::Extra2)?;
-                session_handle
-                    .notify_pointer_button(276, true) // BTN_EXTRA
-                    .await
-                    .map_err(input_injection_err)?;
-            }
-
-            IronMouseEvent::Button5Released => {
-                mouse.handle_button_up(MouseButton::Extra2)?;
-                session_handle
-                    .notify_pointer_button(276, false)
+                    .notify_pointer_button(evdev_code, pressed)
                     .await
                     .map_err(input_injection_err)?;
             }
@@ -877,6 +875,13 @@ impl LamcoInputHandler {
                     .notify_pointer_axis(delta_x, delta_y)
                     .await
                     .map_err(input_injection_err)?;
+            }
+
+            // MouseEvent is #[non_exhaustive]; upstream may add variants
+            // (e.g. new pointer PDUs). Unknown events are logged and dropped
+            // rather than failing the input pipeline.
+            unexpected => {
+                trace!(?unexpected, "Unhandled mouse event variant");
             }
         }
 

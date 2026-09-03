@@ -76,6 +76,7 @@ use bytes::Bytes;
 use ironrdp_server::{
     BitmapUpdate as IronBitmapUpdate, DesktopSize, DisplayUpdate, GfxServerHandle,
     PixelFormat as IronPixelFormat, RdpServerDisplay, RdpServerDisplayUpdates, ServerEvent,
+    ServerResult,
 };
 use tokio::sync::{Mutex, RwLock, mpsc};
 use tracing::{debug, error, info, trace, warn};
@@ -3057,7 +3058,7 @@ impl RdpServerDisplay for LamcoDisplayHandler {
         clippy::expect_used,
         reason = "mutex poisoning is unrecoverable; receiver guaranteed after reset"
     )]
-    async fn updates(&mut self) -> Result<Box<dyn RdpServerDisplayUpdates>> {
+    async fn updates(&mut self) -> ServerResult<Box<dyn RdpServerDisplayUpdates>> {
         let mut receiver_option = self.update_receiver.lock().await;
 
         // If receiver was already taken by a previous connection, create a new channel
@@ -3322,7 +3323,7 @@ impl DisplayUpdatesStream {
 #[async_trait::async_trait]
 impl RdpServerDisplayUpdates for DisplayUpdatesStream {
     /// Cancellation-safe as required by IronRDP.
-    async fn next_update(&mut self) -> Result<Option<DisplayUpdate>> {
+    async fn next_update(&mut self) -> ServerResult<Option<DisplayUpdate>> {
         match self.receiver.recv().await {
             Some(update) => {
                 trace!("Providing display update: {:?}", update);
