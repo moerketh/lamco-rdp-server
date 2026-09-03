@@ -82,6 +82,8 @@ use tokio::sync::{Mutex, RwLock, mpsc};
 use tracing::{debug, error, info, trace, warn};
 
 use super::pipeline_decisions;
+#[cfg(feature = "x264")]
+use crate::egfx::X264Encoder;
 use crate::{
     damage::{DamageConfig, DamageDetector, DamageRegion},
     egfx::{Avc420Encoder, Avc444Encoder, ColorSpaceConfig, EncoderConfig},
@@ -110,11 +112,16 @@ struct ResizeRequest {
 ///
 /// Supports both AVC420 (standard H.264 4:2:0) and AVC444 (premium H.264 4:4:4).
 /// The codec is selected at runtime based on client capability negotiation.
+/// When the `x264` feature is enabled and the config selects it, an x264-based
+/// AVC420 encoder is used instead of OpenH264 for faster encoding.
 enum VideoEncoder {
-    /// Standard H.264 with 4:2:0 chroma subsampling
+    /// Standard H.264 with 4:2:0 chroma subsampling (OpenH264)
     Avc420(Avc420Encoder),
     /// Premium H.264 with 4:4:4 chroma via dual-stream encoding
     Avc444(Avc444Encoder),
+    /// x264-based H.264 4:2:0 encoder (faster than OpenH264, feature-gated)
+    #[cfg(feature = "x264")]
+    X264(X264Encoder),
 }
 
 /// Result of encoding a frame - varies by codec
@@ -152,6 +159,10 @@ impl VideoEncoder {
                         aux: frame.stream2_data,
                     })
                 }),
+            #[cfg(feature = "x264")]
+            VideoEncoder::X264(encoder) => encoder
+                .encode_bgra(bgra_data, width, height, timestamp_ms)
+                .map(|opt| opt.map(|frame| EncodedVideoFrame::Single(frame.data))),
         }
     }
 
@@ -160,6 +171,8 @@ impl VideoEncoder {
         match self {
             VideoEncoder::Avc420(_) => "AVC420",
             VideoEncoder::Avc444(_) => "AVC444",
+            #[cfg(feature = "x264")]
+            VideoEncoder::X264(_) => "x264-AVC420",
         }
     }
 
@@ -171,6 +184,8 @@ impl VideoEncoder {
         match self {
             VideoEncoder::Avc420(encoder) => encoder.force_keyframe(),
             VideoEncoder::Avc444(encoder) => encoder.request_idr(),
+            #[cfg(feature = "x264")]
+            VideoEncoder::X264(encoder) => encoder.force_keyframe(),
         }
     }
 
@@ -182,6 +197,8 @@ impl VideoEncoder {
         match self {
             VideoEncoder::Avc420(_) => u64::MAX,
             VideoEncoder::Avc444(encoder) => encoder.ms_since_last_idr(),
+            #[cfg(feature = "x264")]
+            VideoEncoder::X264(_) => u64::MAX,
         }
     }
 
@@ -191,6 +208,8 @@ impl VideoEncoder {
         match self {
             VideoEncoder::Avc420(_) => false, // AVC420 doesn't have periodic IDR
             VideoEncoder::Avc444(encoder) => encoder.is_periodic_idr_due(),
+            #[cfg(feature = "x264")]
+            VideoEncoder::X264(_) => false, // x264 doesn't have periodic IDR
         }
     }
 }
@@ -2313,40 +2332,101 @@ impl LamcoDisplayHandler {
                                         e
                                     );
                                     // Fall through to AVC420
-                                    match Avc420Encoder::new(config) {
-                                        Ok(mut encoder) => {
-                                            encoder.set_diagnostics(encoder_diagnostics.clone());
-                                            video_encoder = Some(VideoEncoder::Avc420(encoder));
-                                            info!(
-                                                "✅ AVC420 encoder initialized for {}×{} (4:2:0 fallback)",
-                                                aligned_width, aligned_height
-                                            );
+                                    // Try x264 first if configured, fall back to OpenH264
+                                    #[cfg(feature = "x264")]
+                                    {
+                                        let backend =
+                                            self.config.egfx.encoder_backend.to_lowercase();
+                                        if backend == "x264" || backend == "auto" {
+                                            match X264Encoder::new(config.clone()) {
+                                                Ok(mut encoder) => {
+                                                    encoder.set_diagnostics(
+                                                        encoder_diagnostics.clone(),
+                                                    );
+                                                    video_encoder =
+                                                        Some(VideoEncoder::X264(encoder));
+                                                    info!(
+                                                        "✅ x264 AVC420 encoder initialized for {}×{} (4:2:0 fallback from AVC444)",
+                                                        aligned_width, aligned_height
+                                                    );
+                                                }
+                                                Err(e) => {
+                                                    warn!(
+                                                        "Failed to create x264 encoder: {:?} - falling back to OpenH264",
+                                                        e
+                                                    );
+                                                }
+                                            }
                                         }
-                                        Err(e) => {
-                                            warn!(
-                                                "Failed to create AVC420 encoder: {:?} - falling back to RemoteFX",
-                                                e
-                                            );
+                                        let _ = &config;
+                                    }
+
+                                    if video_encoder.is_none() {
+                                        match Avc420Encoder::new(config) {
+                                            Ok(mut encoder) => {
+                                                encoder
+                                                    .set_diagnostics(encoder_diagnostics.clone());
+                                                video_encoder = Some(VideoEncoder::Avc420(encoder));
+                                                info!(
+                                                    "✅ AVC420 encoder initialized for {}×{} (4:2:0 fallback)",
+                                                    aligned_width, aligned_height
+                                                );
+                                            }
+                                            Err(e) => {
+                                                warn!(
+                                                    "Failed to create AVC420 encoder: {:?} - falling back to RemoteFX",
+                                                    e
+                                                );
+                                            }
                                         }
                                     }
                                 }
                             }
                         } else {
                             // Use AVC420 (standard 4:2:0 chroma)
-                            match Avc420Encoder::new(config) {
-                                Ok(mut encoder) => {
-                                    encoder.set_diagnostics(encoder_diagnostics.clone());
-                                    video_encoder = Some(VideoEncoder::Avc420(encoder));
-                                    info!(
-                                        "✅ AVC420 encoder initialized for {}×{} (aligned)",
-                                        aligned_width, aligned_height
-                                    );
+                            // Try x264 first if configured, fall back to OpenH264
+                            #[cfg(feature = "x264")]
+                            {
+                                let backend = self.config.egfx.encoder_backend.to_lowercase();
+                                let try_x264 = backend == "x264" || backend == "auto";
+                                if try_x264 {
+                                    match X264Encoder::new(config.clone()) {
+                                        Ok(mut encoder) => {
+                                            encoder.set_diagnostics(encoder_diagnostics.clone());
+                                            video_encoder = Some(VideoEncoder::X264(encoder));
+                                            info!(
+                                                "✅ x264 AVC420 encoder initialized for {}×{} (ultrafast/zerolatency)",
+                                                aligned_width, aligned_height
+                                            );
+                                        }
+                                        Err(e) => {
+                                            warn!(
+                                                "Failed to create x264 encoder: {:?} - falling back to OpenH264",
+                                                e
+                                            );
+                                            // Fall through to OpenH264 below
+                                        }
+                                    }
                                 }
-                                Err(e) => {
-                                    warn!(
-                                        "Failed to create H.264 encoder: {:?} - falling back to RemoteFX",
-                                        e
-                                    );
+                                let _ = &config; // suppress unused when x264 handles it
+                            }
+
+                            if video_encoder.is_none() {
+                                match Avc420Encoder::new(config) {
+                                    Ok(mut encoder) => {
+                                        encoder.set_diagnostics(encoder_diagnostics.clone());
+                                        video_encoder = Some(VideoEncoder::Avc420(encoder));
+                                        info!(
+                                            "✅ AVC420 encoder initialized for {}×{} (aligned)",
+                                            aligned_width, aligned_height
+                                        );
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            "Failed to create H.264 encoder: {:?} - falling back to RemoteFX",
+                                            e
+                                        );
+                                    }
                                 }
                             }
                         }

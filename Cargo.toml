@@ -28,6 +28,9 @@ path = "src/lib.rs"
 # Dependencies
 # =============================================================================
 
+[build-dependencies]
+cc = "1"
+
 [dependencies]
 # -----------------------------------------------------------------------------
 # Lamco crates (published to crates.io)
@@ -193,6 +196,12 @@ openh264 = { version = "0.9.2", optional = true, default-features = false, featu
 openh264-sys2 = { version = "0.9.1", default-features = false, features = ["libloading"], optional = true }
 libloading = { version = "0.8", optional = true }
 
+# x264: faster software H.264 encoder (AVC420 only).
+# Loaded dynamically at runtime via libloading, linking against system libx264.so.
+# Requires libx264-dev (or libx264-164) installed on the target system.
+# x264 is ~2-3× faster than OpenH264 for real-time encoding with ultrafast/zerolatency.
+# Only used for AVC420; AVC444 falls back to OpenH264 (x264 doesn't support 4:4:4).
+
 # -----------------------------------------------------------------------------
 # Hardware-accelerated encoding (optional)
 # -----------------------------------------------------------------------------
@@ -314,6 +323,14 @@ h264 = ["openh264", "openh264-sys2", "libloading"]
 # Development/testing only: compile OpenH264 from source (NO patent coverage).
 # NEVER enable in any shipped binary.
 h264-source = ["openh264", "openh264-sys2", "libloading", "openh264/source", "openh264-sys2/source"]
+
+# x264 software encoding: faster alternative to OpenH264 for AVC420.
+# Loaded dynamically via libloading (same pattern as OpenH264).
+# Requires libx264.so (libx264-dev / libx264-164) on the target system.
+# When enabled, the encoder backend selection config can choose "x264" or "openh264".
+# Depends on h264 for the shared BGRA->I420 conversion path (bgra_to_i420) and
+# the encoder-selection tests.
+x264 = ["libloading", "h264"]
 
 # Hardware-accelerated H.264 encoding (premium feature)
 # VA-API: Intel (iHD/i965) and AMD (radeonsi) GPU encoding
