@@ -14,6 +14,7 @@
 
 pub mod config;
 pub mod handler;
+pub mod handshake_deadline;
 pub mod listener;
 pub mod proxy_auth;
 pub mod socket_activation;
@@ -131,6 +132,19 @@ impl AcceptDispatcher {
                         "Connection accepted"
                     );
 
+                    // Dead-client wedge mitigation: a
+                    // silent peer parks the acceptor's first read inside this
+                    // serial loop and blacks out every listener until it goes
+                    // away. Wrap the stream so the FIRST client byte must
+                    // arrive within the deadline; once the exchange starts the
+                    // deadline is disarmed and idle sessions are unaffected.
+                    let peer_display = peer.to_display();
+                    let stream: Box<dyn AsyncRdpStream> =
+                        Box::new(handshake_deadline::HandshakeDeadlineStream::new(
+                            stream,
+                            handshake_deadline::DEFAULT_HANDSHAKE_DEADLINE,
+                        ));
+
                     // on_accept_async: PAM peer-IP setup, ClientConnected event,
                     // cache client state for matching on_disconnected.
                     let accept_ok = handler.on_accept_async(&peer).await;
@@ -181,6 +195,15 @@ impl AcceptDispatcher {
                         }
                     };
                     let duration = start.elapsed();
+
+                    // Surface deadline-based aborts distinctly from ordinary
+                    // handshake failures — the wedge mitigation working as
+                    // designed is worth seeing in logs at a glance.
+                    if let Err(ref e) = conn_result {
+                        if e.to_string().contains("handshake deadline elapsed") {
+                            handshake_deadline::log_deadline_rejection(&peer_display, duration);
+                        }
+                    }
 
                     // on_disconnected_async: classify error, emit ClientDisconnected,
                     // prune PAM rate limits, check Portal validity.
