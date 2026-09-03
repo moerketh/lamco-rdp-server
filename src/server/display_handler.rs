@@ -108,6 +108,44 @@ struct ResizeRequest {
     height: u16,
 }
 
+/// Build the session-scoped cursor theme manager from config.
+///
+/// Returns None when the feature is disabled in config, when the desktop
+/// is not Plasma (plasma-apply-cursortheme not installed), or when the
+/// service runs as root (cannot address the user session bus).
+fn build_cursor_theme_manager(
+    config: &crate::config::Config,
+) -> Option<
+    Arc<
+        crate::server::cursor_theme::CursorThemeManager<
+            crate::server::cursor_theme::SessionCmdRunner,
+        >,
+    >,
+> {
+    let cc = &config.cursor;
+    if !cc.session_scoped_cursor_theme {
+        debug!("Session-scoped cursor theme disabled in config");
+        return None;
+    }
+    let Some(runner) = crate::server::cursor_theme::SessionCmdRunner::new() else {
+        debug!("No session context for cursor theme manager (root or no uid)");
+        return None;
+    };
+    if !std::path::Path::new("/usr/bin/plasma-apply-cursortheme").exists() {
+        debug!("plasma-apply-cursortheme not installed — cursor theme manager off");
+        return None;
+    }
+    Some(Arc::new(
+        crate::server::cursor_theme::CursorThemeManager::new(
+            crate::server::cursor_theme::CursorThemes {
+                visible: cc.console_cursor_theme.clone(),
+                transparent: cc.transparent_cursor_theme.clone(),
+            },
+            runner,
+        ),
+    ))
+}
+
 /// Video encoder abstraction for codec-agnostic frame encoding
 ///
 /// Supports both AVC420 (standard H.264 4:2:0) and AVC444 (premium H.264 4:4:4).
@@ -422,6 +460,20 @@ pub struct LamcoDisplayHandler {
     /// `updates()` but must NOT tear down clipboard lifecycle.
     saw_real_disconnect: Arc<std::sync::atomic::AtomicBool>,
 
+    /// Session-scoped guest cursor theme manager. While an RDP client is
+    /// connected the guest cursor is made transparent (compositor-relative
+    /// capture would otherwise bake it into the video stream — no hardware
+    /// cursor plane on hyperv_drm); on disconnect the console cursor is
+    /// restored. Arc<Option<..>> so the manager can be absent (non-Plasma
+    /// desktops / feature off) and clones share one instance.
+    cursor_theme: Option<
+        Arc<
+            crate::server::cursor_theme::CursorThemeManager<
+                crate::server::cursor_theme::SessionCmdRunner,
+            >,
+        >,
+    >,
+
     /// Health reporter for forwarding PipeWire stream state to health monitor
     health_reporter: Arc<RwLock<Option<crate::health::HealthReporter>>>,
 
@@ -563,6 +615,10 @@ impl LamcoDisplayHandler {
         // Capacity 4: enough to absorb a burst without blocking, pipeline coalesces
         let (resize_tx, resize_rx) = std::sync::mpsc::sync_channel(4);
 
+        // Session-scoped cursor theme manager (built before the struct
+        // literal below moves `config`).
+        let cursor_theme_mgr = build_cursor_theme_manager(&config);
+
         Ok(Self {
             size,
             pipewire_thread,
@@ -595,6 +651,7 @@ impl LamcoDisplayHandler {
             ),
             client_active,
             saw_real_disconnect: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            cursor_theme: cursor_theme_mgr,
             health_reporter: Arc::new(RwLock::new(None)),
             pipewire_sensor: Arc::new(RwLock::new(None)),
             egfx_snapshot: Arc::new(RwLock::new(None)),
@@ -660,6 +717,10 @@ impl LamcoDisplayHandler {
 
         let (resize_tx, resize_rx) = std::sync::mpsc::sync_channel(4);
 
+        // Session-scoped cursor theme manager (built before the struct
+        // literal below moves `config`).
+        let cursor_theme_mgr = build_cursor_theme_manager(&config);
+
         Ok(Self {
             size,
             pipewire_thread,
@@ -692,6 +753,7 @@ impl LamcoDisplayHandler {
             ),
             client_active,
             saw_real_disconnect: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            cursor_theme: cursor_theme_mgr,
             health_reporter: Arc::new(RwLock::new(None)),
             pipewire_sensor: Arc::new(RwLock::new(None)),
             egfx_snapshot: Arc::new(RwLock::new(None)),
@@ -789,6 +851,16 @@ impl LamcoDisplayHandler {
             {
                 warn!("Failed to notify clipboard of RDP disconnect: {e}");
             }
+        }
+    }
+
+    /// Restore the guest console cursor after the RDP session ends
+    /// (disconnect cleanup path — also safe when never made transparent).
+    /// Uses the state-tracked restore: a no-op if no session ever began
+    /// (probe disconnects leave the console cursor untouched).
+    pub fn restore_console_cursor(&self) {
+        if let Some(mgr) = &self.cursor_theme {
+            mgr.end_rdp_session();
         }
     }
 
@@ -3438,10 +3510,12 @@ impl LamcoDisplayHandler {
                                     accumulated_damage.len()
                                 );
                             }
-                            let hint_ratio = if frame.damage_regions.is_empty() {
-                                None
-                            } else {
-                                Some(pipeline_decisions::compute_damage_ratio(
+                            // Cross-check from the calibration probe: the
+                            // probe already measured the pixel-diff ratio for
+                            // this same frame (see compositor-hint arm above),
+                            // so reuse it rather than re-diffing the hints.
+                            if let Some(pixel_diff_ratio) = compositor_vs_pixel_diff {
+                                let hint_ratio = pipeline_decisions::compute_damage_ratio(
                                     &frame
                                         .damage_regions
                                         .iter()
@@ -3449,14 +3523,12 @@ impl LamcoDisplayHandler {
                                         .collect::<Vec<_>>(),
                                     frame.width,
                                     frame.height,
-                                ))
-                            };
-                            if let Some(h) = hint_ratio {
-                                let delta_pct = (damage_ratio - h) * 100.0;
+                                );
+                                let delta_pct = (hint_ratio - pixel_diff_ratio) * 100.0;
                                 debug!(
-                                    "🎯 Damage source cross-check: pixel-diff={:.1}% compositor-hint={:.1}% delta={delta_pct:+.1}pp",
-                                    damage_ratio * 100.0,
-                                    h * 100.0
+                                    "🎯 Damage source cross-check: compositor-hint={:.1}% pixel-diff={:.1}% delta={delta_pct:+.1}pp",
+                                    hint_ratio * 100.0,
+                                    pixel_diff_ratio * 100.0
                                 );
                             }
                             if adaptive_fps_enabled {
@@ -4256,6 +4328,14 @@ impl RdpServerDisplay for LamcoDisplayHandler {
             warn!("Failed to activate EIS input: {}", e);
         }
 
+        // The RDP session now owns the guest cursor: make it transparent so
+        // the captured stream carries no composited sprite (restored on
+        // disconnect). Skipped on same-connection reactivation (resize);
+        // gated by the config below.
+        if let Some(mgr) = &self.cursor_theme {
+            mgr.begin_rdp_session();
+        }
+
         // Signal pipeline that a client is now consuming frames
         self.client_active
             .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -4414,6 +4494,7 @@ impl Clone for LamcoDisplayHandler {
             client_active: Arc::clone(&self.client_active),
             capture_node: Arc::clone(&self.capture_node),
             saw_real_disconnect: Arc::clone(&self.saw_real_disconnect),
+            cursor_theme: self.cursor_theme.clone(),
             health_reporter: Arc::clone(&self.health_reporter),
             pipewire_sensor: Arc::clone(&self.pipewire_sensor),
             egfx_snapshot: Arc::clone(&self.egfx_snapshot),
