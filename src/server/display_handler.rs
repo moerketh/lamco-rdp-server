@@ -317,8 +317,14 @@ impl FrameRateRegulator {
 /// through the EGFX channel for better quality and compression. Falls back
 /// to RemoteFX when H.264 is not available.
 pub struct LamcoDisplayHandler {
-    /// Current desktop size
+    /// Current desktop size — the RDP-visible geometry. With the kwin-virtual
+    /// strategy the compositor-side virtual output is created at the client's
+    /// requested size, so the desktop size IS the capture size.
     size: Arc<RwLock<DesktopSize>>,
+
+    /// Current compositor capture size (what PipeWire delivers). Tracked per
+    /// frame; drives the input-transformer geometry re-sync.
+    capture_size: Arc<RwLock<(u32, u32)>>,
 
     /// PipeWire thread manager
     pipewire_thread: Arc<Mutex<PipeWireThreadManager>>,
@@ -338,8 +344,9 @@ pub struct LamcoDisplayHandler {
     /// Graphics queue sender (for priority multiplexing)
     graphics_tx: Option<mpsc::Sender<GraphicsFrame>>,
 
-    /// Monitor configuration from streams
-    stream_info: Vec<StreamInfo>,
+    /// Monitor configuration from streams (interior-mutable: per-connection
+    /// strategies replace it on establish via set_stream_info)
+    stream_info: Arc<RwLock<Vec<StreamInfo>>>,
 
     // === EGFX/H.264 Support ===
     /// Shared GFX server handle for EGFX frame sending
@@ -390,11 +397,26 @@ pub struct LamcoDisplayHandler {
     /// The pipeline loop checks this to avoid encoding/sending frames to nobody.
     client_active: Arc<std::sync::atomic::AtomicBool>,
 
+    /// Shared "display suppressed" flag — `true` while the connected client
+    /// sent `SuppressOutput { desktop_rect: None }` (e.g. mstsc minimized).
+    ///
+    /// Mirrors `RdpServer::display_suppressed_handle()`: the RDP server owns
+    /// the authoritative copy (set on the PDU, reset per connection) and shares
+    /// it here via `set_display_suppressed_flag` before the pipeline starts.
+    /// `None` (never shared) means the gate is inactive — the pipeline
+    /// encodes unconditionally. See the gating policy
+    /// in [`pipeline_decisions::should_skip_for_suppress`].
+    display_suppressed: parking_lot::RwLock<Option<Arc<std::sync::atomic::AtomicBool>>>,
+
     /// Live PipeWire capture node id. A session re-establishment (PerConnection
     /// lifecycle) rebinds capture to a new node via `rebind_capture_node`; this
     /// tracks it so a subsequent client resize acts on the current node rather
     /// than the one captured at startup (which `stream_info` still holds).
     capture_node: Arc<std::sync::atomic::AtomicU32>,
+    /// Capture buffer type. Atomic so the pipeline task can flip it during
+    /// the one-shot DmaBuf→MemFd fallback rebind (virtual GPUs negotiate
+    /// DmaBuf but never deliver a frame).
+    use_dmabuf: Arc<std::sync::atomic::AtomicBool>,
 
     /// Set true by `on_client_disconnect` on a real disconnect; consumed
     /// (swap→false) by the connect-start reset in `updates()`. Distinguishes a
@@ -442,10 +464,15 @@ pub struct LamcoDisplayHandler {
     /// Resize via PipeWire DestroyStream/CreateStream is not available in this mode.
     direct_channel_mode: bool,
 
-    /// Capture buffer type. Atomic so the pipeline task can flip it during
-    /// the one-shot DmaBuf→MemFd fallback rebind (virtual GPUs negotiate
-    /// DmaBuf but never deliver a frame).
-    use_dmabuf: Arc<std::sync::atomic::AtomicBool>,
+    /// Elastic capture resize hook (kwin-virtual strategy): when set, client
+    /// resize requests are routed to the session handle's
+    /// `resize_capture_source` — which recreates the compositor-side virtual
+    /// output at ANY resolution — instead of the kscreen-doctor DRM mode
+    /// switching path (whose mode list caps at what the kernel exposes).
+    /// After the source resizes, `rebind_capture_node` reconnects the
+    /// PipeWire stream to the new node. None for all other strategies.
+    /// parking_lot RwLock so the hand-written (sync) Clone impl can copy it.
+    elastic_capture: parking_lot::RwLock<Option<Arc<dyn crate::session::strategy::SessionHandle>>>,
 }
 
 impl LamcoDisplayHandler {
@@ -543,6 +570,7 @@ impl LamcoDisplayHandler {
 
         Ok(Self {
             size,
+            capture_size: Arc::new(RwLock::new((initial_width as u32, initial_height as u32))),
             pipewire_thread,
             bitmap_converter,
             update_sender,
@@ -551,7 +579,7 @@ impl LamcoDisplayHandler {
             capture_node: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(
                 stream_info.first().map_or(0, |s| s.node_id),
             )),
-            stream_info,
+            stream_info: Arc::new(RwLock::new(stream_info)),
             gfx_server_handle,
             gfx_handler_state,
             server_event_tx: Arc::new(RwLock::new(None)),
@@ -568,6 +596,7 @@ impl LamcoDisplayHandler {
                     .unwrap_or(Instant::now()),
             ),
             client_active,
+            display_suppressed: parking_lot::RwLock::new(None),
             saw_real_disconnect: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             cursor_theme: cursor_theme_mgr,
             health_reporter: Arc::new(RwLock::new(None)),
@@ -577,6 +606,7 @@ impl LamcoDisplayHandler {
             stream_active_flag: parking_lot::RwLock::new(None),
             direct_channel_mode: false,
             use_dmabuf: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(use_dmabuf)),
+            elastic_capture: parking_lot::RwLock::new(None),
         })
     }
 
@@ -637,6 +667,7 @@ impl LamcoDisplayHandler {
 
         Ok(Self {
             size,
+            capture_size: Arc::new(RwLock::new((initial_width as u32, initial_height as u32))),
             pipewire_thread,
             bitmap_converter,
             update_sender,
@@ -645,7 +676,7 @@ impl LamcoDisplayHandler {
             capture_node: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(
                 stream_info.first().map_or(0, |s| s.node_id),
             )),
-            stream_info,
+            stream_info: Arc::new(RwLock::new(stream_info)),
             gfx_server_handle,
             gfx_handler_state,
             server_event_tx: Arc::new(RwLock::new(None)),
@@ -662,6 +693,7 @@ impl LamcoDisplayHandler {
                     .unwrap_or(Instant::now()),
             ),
             client_active,
+            display_suppressed: parking_lot::RwLock::new(None),
             saw_real_disconnect: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             cursor_theme: cursor_theme_mgr,
             health_reporter: Arc::new(RwLock::new(None)),
@@ -671,6 +703,7 @@ impl LamcoDisplayHandler {
             stream_active_flag: parking_lot::RwLock::new(None),
             direct_channel_mode: true,
             use_dmabuf: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), // direct channel always CPU-resident
+            elastic_capture: parking_lot::RwLock::new(None),
         })
     }
 
@@ -691,6 +724,29 @@ impl LamcoDisplayHandler {
         *self.health_reporter.write().await = Some(reporter);
     }
 
+    /// Wire the elastic capture resize hook (kwin-virtual strategy).
+    ///
+    /// When set, resize requests recreate the compositor-side virtual output
+    /// at the requested size via the session handle instead of switching
+    /// DRM modes. Must be called BEFORE the first client connects.
+    pub fn set_elastic_capture(&self, session: Arc<dyn crate::session::strategy::SessionHandle>) {
+        *self.elastic_capture.write() = Some(session);
+        info!("Elastic capture resize hook set (native virtual output resizing)");
+    }
+
+    /// Replace the stream/monitor geometry table (per-connection strategies).
+    ///
+    /// kwin-virtual establishes its streams PER CONNECTION: at server start
+    /// there is no stream at all, so the display handler is constructed with
+    /// empty `stream_info` and a placeholder input-transformer monitor. When
+    /// a client connects and `establish_for_client` produces the real stream
+    /// geometry, this pushes it into the table so the input transformer's
+    /// re-sync (update_capture_size) has the real per-stream geometry to
+    /// build clicks from — otherwise clicks map against the placeholder
+    /// forever (video updates, input never lands).
+    pub async fn set_stream_info(&self, streams: Vec<StreamInfo>) {
+        *self.stream_info.write().await = streams;
+    }
     /// Set the shared stream active flag for Portal input coupling.
     ///
     /// The display handler updates this flag on PipeWire state transitions.
@@ -698,6 +754,27 @@ impl LamcoDisplayHandler {
     /// preventing hundreds of futile D-Bus calls when the stream is paused.
     pub fn set_stream_active_flag(&self, flag: Arc<std::sync::atomic::AtomicBool>) {
         *self.stream_active_flag.write() = Some(flag);
+    }
+
+    /// Shared EGFX handler state (when EGFX is configured).
+    ///
+    /// Lets the server layer wire complementary signal sources — e.g. the
+    /// NetworkAutoDetect RTT handle — into the flow controller after the RDP
+    /// server is built.
+    pub fn egfx_handler_state(&self) -> Option<Arc<SharedHandlerState>> {
+        self.gfx_handler_state.clone()
+    }
+
+    /// Share the RDP server's "display suppressed" flag (`SuppressOutput {
+    /// desktop_rect: None }`, e.g. mstsc minimized).
+    ///
+    /// The RDP server owns the authoritative copy — it sets the flag on the
+    /// PDU and resets it per connection — and this installs the shared handle
+    /// so the pipeline's frame gate can stop encoding while the client cannot
+    /// present frames. Call after building the RDP server and before
+    /// `start_pipeline` (the task snapshots the flag at spawn).
+    pub fn set_display_suppressed_flag(&self, flag: Arc<std::sync::atomic::AtomicBool>) {
+        *self.display_suppressed.write() = Some(flag);
     }
 
     /// Set clipboard manager reference for disconnect cleanup
@@ -1160,18 +1237,92 @@ impl LamcoDisplayHandler {
         Some(sender)
     }
 
-    /// Update the desktop size
+    /// Update the stored desktop size WITHOUT signaling a session resize.
     ///
-    /// Called when monitor configuration changes or client requests resize.
-    pub async fn update_size(&self, width: u16, height: u16) {
-        let mut size = self.size.write().await;
-        size.width = width;
-        size.height = height;
-        debug!("Updated display size to {}x{}", width, height);
+    /// Used during initial capability processing (`request_initial_size`):
+    /// the activation is being built at exactly this size, so broadcasting a
+    /// `DisplayUpdate::Resize` would be a resize of the session to itself.
+    /// The update loop interprets any queued resize as a demand for a full
+    /// Deactivation-Reactivation mid client channel handshake — the relayed
+    /// client either dies decoding a mid-state channel PDU or loses its DVC
+    /// handshake (EGFX never engages). Silent adoption is all that is needed:
+    /// the post-capability `UpdateEncoder` reads the size back from the handler.
+    ///
+    /// This is the ONLY writer of the stored desktop size: mid-session
+    /// DisplayControl resizes go through the pipeline's resize channel and
+    /// never rewrite it.
+    async fn adopt_size_silently(&self, width: u16, height: u16) {
+        {
+            let mut size = self.size.write().await;
+            size.width = width;
+            size.height = height;
+        }
+        debug!(
+            "Adopted desktop size {}x{} (silent, no resize signal)",
+            width, height
+        );
+    }
 
-        let update = DisplayUpdate::Resize(DesktopSize { width, height });
-        if let Err(e) = self.update_sender.lock().await.send(update).await {
-            warn!("Failed to send resize update: {}", e);
+    /// Record a new CAPTURE (compositor/PipeWire) size.
+    ///
+    /// Called when the compositor's actual output changes (per-frame capture
+    /// truth tracking after stream recreation/renegotiation). With the
+    /// kwin-virtual strategy capture == desktop by construction, so this only
+    /// needs to refresh the input transformer's monitor geometry — there is
+    /// no capture->desktop scaling layer.
+    pub async fn update_capture_size(&self, width: u32, height: u32) {
+        {
+            let mut cap = self.capture_size.write().await;
+            if (cap.0, cap.1) == (width, height) {
+                return;
+            }
+            (cap.0, cap.1) = (width, height);
+        }
+
+        // Re-sync the input transformer's monitor geometry to the new
+        // capture size. The transformer maps capture-space coordinates into
+        // per-stream space using the monitor list; a stale geometry makes
+        // clicks land offset. For kwin-virtual, per-connection streams
+        // replace the placeholder here.
+        if let Some(ref ih) = *self.input_handler.read().await {
+            let monitors: Vec<crate::input::MonitorInfo> = self
+                .stream_info
+                .read()
+                .await
+                .iter()
+                .map(|s| {
+                    // Primary monitor carries the CURRENT capture size;
+                    // positioned streams keep their own geometry.
+                    let (w, h) = if s.node_id
+                        == self.capture_node.load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        (width, height)
+                    } else {
+                        (s.size.0, s.size.1)
+                    };
+                    crate::input::MonitorInfo {
+                        id: s.node_id,
+                        name: format!("Stream {}", s.node_id),
+                        x: s.position.0,
+                        y: s.position.1,
+                        width: w,
+                        height: h,
+                        dpi: 96.0,
+                        scale_factor: 1.0,
+                        stream_x: s.position.0.max(0) as u32,
+                        stream_y: s.position.1.max(0) as u32,
+                        stream_width: w,
+                        stream_height: h,
+                        is_primary: s.node_id
+                            == self.capture_node.load(std::sync::atomic::Ordering::Relaxed),
+                    }
+                })
+                .collect();
+            if let Err(e) = ih.update_monitors(monitors).await {
+                warn!("Failed to re-sync input monitors after capture resize: {e}");
+            } else {
+                info!("Input monitors re-synced to capture {}x{}", width, height);
+            }
         }
     }
 
@@ -1331,6 +1482,14 @@ impl LamcoDisplayHandler {
 
             let mut loop_iterations = 0u64;
 
+            // SuppressOutput gate state: onset of the current suppress period
+            // (None while the flag is low). IronRDP resets the shared flag per
+            // connection; the onset tracker belongs to this pipeline instance.
+            // Snapshot the shared flag once — `set_display_suppressed_flag`
+            // runs before `start_pipeline` spawns this task.
+            let suppress_flag = handler.display_suppressed.read().clone();
+            let mut suppressed_since: Option<Instant> = None;
+
             // L2 stress detector: track frames_dropped + frames_sent over a
             // rolling 1-second window. When drop_rate sustains > 50% AND the
             // encoder hasn't emitted an IDR in the last 1500ms, we request an
@@ -1460,9 +1619,7 @@ impl LamcoDisplayHandler {
             // increments before the latency governor's Skip/WaitForMore continues
             // and the empty-damage continue, so a stable throttle pattern can put
             // every Nth-count frame on a skipped iteration -- deterministically,
-            // if the skip period shares a factor with N. Observed in practice:
-            // this fired ZERO times across an entire 12s sustained-high-activity
-            // session with frames_sent crossing 60/120/180. Time-based gating
+            // if the skip period shares a factor with N. Time-based gating
             // fires on whatever frame is actually being processed when the
             // interval elapses, independent of skip patterns.
             let mut last_telemetry_log = std::time::Instant::now();
@@ -1585,10 +1742,59 @@ impl LamcoDisplayHandler {
                             continue;
                         }
 
+                        // Elastic capture (kwin-virtual): the compositor-side virtual
+                        // output is recreated at ANY requested size; PipeWire stream
+                        // rebinds to the new node. This replaces the DRM mode-switch
+                        // path entirely — no mode list, no kscreen-doctor, identity
+                        // scaling guaranteed (capture == desktop).
+                        let elastic = {
+                            let hook = handler.elastic_capture.read();
+                            hook.clone()
+                        };
+                        if let Some(session) = elastic {
+                            info!(
+                                "Elastic capture: recreating virtual output at {}x{}",
+                                req.width, req.height
+                            );
+                            match session.resize_capture_source(req.width, req.height).await {
+                                Some((w, h)) => {
+                                    // Rebind the PipeWire stream to the new node.
+                                    // resize_capture_source already updated the
+                                    // session's stream table; fetch the fresh node.
+                                    let streams = session.streams();
+                                    if let Some(s) = streams.first() {
+                                        let old_node = handler
+                                            .capture_node
+                                            .load(std::sync::atomic::Ordering::Relaxed);
+                                        handler
+                                            .rebind_capture_node(
+                                                old_node, s.node_id, s.width, s.height,
+                                            )
+                                            .await;
+                                    }
+                                    // Record capture truth; desktop stays at the
+                                    // client's request (the stored size is
+                                    // updated by request_initial_size on the
+                                    // next activation).
+                                    info!(
+                                        "Elastic capture resized: source now delivers {}x{}",
+                                        w, h
+                                    );
+                                }
+                                None => {
+                                    warn!(
+                                        "Elastic capture resize to {}x{} failed — keeping current stream",
+                                        req.width, req.height
+                                    );
+                                }
+                            }
+                            continue;
+                        }
+
                         // 1. Destroy existing PipeWire stream. Use the live
                         // capture node — a session re-establishment may have
                         // rebound it away from the startup node in stream_info.
-                        if !handler.stream_info.is_empty() {
+                        if !handler.stream_info.read().await.is_empty() {
                             let node_id = handler
                                 .capture_node
                                 .load(std::sync::atomic::Ordering::Relaxed);
@@ -1859,18 +2065,58 @@ impl LamcoDisplayHandler {
                             let actual_h = f.height as u16;
 
                             {
+                                // Resolution support: the BitmapConverter serves
+                                // the RDP desktop (bitmap fallback path), so it
+                                // must be sized to the DESKTOP, not the capture
+                                // frame. The converter's dirty-region hashing
+                                // runs on what we hand it — desktop-space data.
+                                let desktop = *handler.size.read().await;
                                 let mut converter = handler.bitmap_converter.lock().await;
-                                *converter = BitmapConverter::new(actual_w, actual_h);
+                                *converter = BitmapConverter::new(desktop.width, desktop.height);
                             }
                             handler
                                 .egfx_needs_init
                                 .store(true, std::sync::atomic::Ordering::SeqCst);
-                            handler.update_size(actual_w, actual_h).await;
+                            // Resolution support: the frame reveals
+                            // the CAPTURE size the compositor actually negotiated.
+                            // The RDP DESKTOP stays at the size the client asked
+                            // for (set when the resize was requested); only the
+                            // capture size updates here — rewriting `size`
+                            // would force the desktop back to the compositor
+                            // mode and defeat honoring the client's request.
+                            handler
+                                .update_capture_size(actual_w as u32, actual_h as u32)
+                                .await;
 
                             info!(
-                                "Resize finalized from first frame: {}x{} (compositor negotiated)",
+                                "Resize finalized from first frame: capture {}x{} (compositor negotiated), desktop stays client-requested",
                                 actual_w, actual_h
                             );
+                        }
+
+                        // Continuous capture-size tracking (resolution support).
+                        //
+                        // The PipeWire stream can (re)negotiate its size at ANY
+                        // time — whenever KWin's output mode changes (a connect-
+                        // or resize-time mode switch), the stream keeps serving
+                        // the OLD size for a while and then flaps to the new
+                        // one. One-shot "first frame is truth" logic records
+                        // the PRE-renegotiation size and then misses the real
+                        // one: stale geometry then offsets input mapping into
+                        // a capture size that no longer exists. Tracking per
+                        // frame is one comparison and self-heals every
+                        // transition.
+                        {
+                            let (cw, ch) = *handler.capture_size.read().await;
+                            if (f.width, f.height) != (cw, ch) {
+                                info!(
+                                    "Capture size changed: {}x{} -> {}x{} (stream renegotiated)",
+                                    cw, ch, f.width, f.height
+                                );
+                                handler
+                                    .update_capture_size(f.width as u32, f.height as u32)
+                                    .await;
+                            }
                         }
 
                         // Report recovery if we previously flagged a stall
@@ -1914,6 +2160,9 @@ impl LamcoDisplayHandler {
                                 .egfx_needs_init
                                 .store(true, std::sync::atomic::Ordering::SeqCst);
                             info!("Pipeline state reset for new client connection");
+                            // Pointer shape is sent after the FIRST frame is
+                            // delivered (see egfx_frames_sent==1 below): mstsc
+                            // discards pointer PDUs that race activation.
                         }
                         debug!("Received frame from PipeWire");
                         f
@@ -2004,9 +2253,9 @@ impl LamcoDisplayHandler {
                             }
                         }
 
-                        // DMA-BUF zero-data is fixed at the source in lamco-pipewire
-                        // ≥0.4.4 (MOD_LINEAR negotiation, lamco-admin/lamco-wayland#5),
-                        // so the old detect-zeros-and-reconnect-with-MemFd fallback is gone.
+                        // DMA-BUF zero-data is fixed at the source in
+                        // lamco-pipewire ≥0.4.4 (MOD_LINEAR negotiation,
+                        // lamco-admin/lamco-wayland#5).
                         // The virtual-GPU MemFd gate in server/mod.rs remains as defense.
 
                         // No fresh frame from PipeWire. Check if we should replay
@@ -2376,10 +2625,8 @@ impl LamcoDisplayHandler {
                     // accumulated frames_dropped from BEFORE the re-init
                     // continues to count, immediately re-triggering L2 on
                     // Frame #1 — yielding two IDRs back-to-back (the L1
-                    // forced first-frame IDR and L2's stress-IDR). Observed
-                    // in round 5 log: 17 stress IDRs fired in the 19.5s
-                    // post-reinit window, contributing to mstsc decoder
-                    // giving up.
+                    // forced first-frame IDR and L2's stress-IDR), which
+                    // can overload the client decoder.
                     let now = std::time::Instant::now();
                     stress_window_start = now;
                     stress_window_dropped_at_start = frames_dropped;
@@ -2427,10 +2674,22 @@ impl LamcoDisplayHandler {
                             "🎬 EGFX channel ready - initializing H.264 encoder (needs_init=true)"
                         );
 
+                        // Resolution support: ALL EGFX geometry —
+                        // encoder, surface, ResetGraphics output dims — comes
+                        // from the DESKTOP size (self.size), never from
+                        // frame.width/height (capture), which can be stale
+                        // during stream renegotiation windows. The desktop
+                        // size is the negotiated truth; with kwin-virtual
+                        // capture == desktop by construction.
+                        let (egfx_fw, egfx_fh): (u32, u32) = {
+                            let s = handler.size.read().await;
+                            (s.width as u32, s.height as u32)
+                        };
+
                         // Calculate aligned dimensions first (needed for encoder and surface)
                         use crate::egfx::align_to_16;
-                        let aligned_width = align_to_16(frame.width as u32) as u16;
-                        let aligned_height = align_to_16(frame.height as u32) as u16;
+                        let aligned_width = align_to_16(egfx_fw) as u16;
+                        let aligned_height = align_to_16(egfx_fh) as u16;
 
                         // Create H.264 encoder with resolution-appropriate level
                         // Use config values for quality settings and color space
@@ -2655,8 +2914,11 @@ impl LamcoDisplayHandler {
                         }
                         if let Some(sender) = handler
                             .setup_egfx_surface(
-                                frame.width,
-                                frame.height,
+                                // Resolution support: surface + ResetGraphics
+                                // output dims in DESKTOP space (see the
+                                // desktop-size computation above).
+                                egfx_fw,
+                                egfx_fh,
                                 aligned_width,
                                 aligned_height,
                             )
@@ -2669,6 +2931,36 @@ impl LamcoDisplayHandler {
                             force_first_frame = true;
                             info!("EGFX surface setup complete (AVC path)");
                         }
+                    }
+
+                    // SuppressOutput gate (client minimized / asked us to stop).
+                    // Skips encode+send while the client can't present frames,
+                    // after first-frame grace and a 1s debounce (mstsc raises
+                    // SuppressOutput mid-handshake and pulses it under load —
+                    // see `should_skip_for_suppress`). Damage must accumulate
+                    // so the un-suppress refresh loses nothing; the periodic
+                    // IDR cycle self-heals the P-slice chain on resume.
+                    let suppressed_now = suppress_flag
+                        .as_ref()
+                        .is_some_and(|f| f.load(std::sync::atomic::Ordering::Relaxed));
+                    if suppressed_now {
+                        if suppressed_since.is_none() {
+                            suppressed_since = Some(Instant::now());
+                            debug!(
+                                "Client SuppressOutput observed — engaging frame gate after debounce"
+                            );
+                        }
+                        if pipeline_decisions::should_skip_for_suppress(
+                            suppress_flag.as_deref(),
+                            suppressed_since,
+                            frames_sent,
+                            Instant::now(),
+                        ) {
+                            frames_paced += 1;
+                            continue;
+                        }
+                    } else {
+                        suppressed_since = None;
                     }
 
                     // Try to send via EGFX H.264 if encoder is available
@@ -2744,6 +3036,13 @@ impl LamcoDisplayHandler {
                             continue;
                         }
 
+                        // Capture == desktop with the kwin-virtual strategy
+                        // (the compositor-side virtual output is created at the
+                        // client's requested size), so the frame passes through
+                        // unscaled at its own geometry.
+                        let frame_width = frame.width;
+                        let frame_height = frame.height;
+
                         // === DAMAGE DETECTION (Config-controlled) ===
                         // Detect which regions changed since the last frame
                         // Skip encoding entirely if nothing changed (huge bandwidth savings)
@@ -2780,7 +3079,7 @@ impl LamcoDisplayHandler {
                                     "Forcing full frame for periodic IDR (bypassing damage detection)"
                                 );
                             }
-                            vec![DamageRegion::full_frame(frame.width, frame.height)]
+                            vec![DamageRegion::full_frame(frame_width, frame_height)]
                         } else if let Some(ref mut detector) = damage_detector_opt {
                             // Pixel-diff damage detection (SIMD, ~1.9ms at 1080p).
                             //
@@ -2792,21 +3091,33 @@ impl LamcoDisplayHandler {
                             // over". Over-reporting (hints larger than diff) is common
                             // and harmless; under-reporting is user-visible breakage.
                             // detect() also keeps the reference frame synchronized.
+                            // NOTE: detection runs on the raw capture buffer
+                            // (== desktop space for kwin-virtual), so regions
+                            // arrive in desktop space and need no further mapping.
                             damage_source = "pixel-diff";
-                            detector.detect(&pixel_data, frame.width, frame.height)
+                            detector.detect(&pixel_data, frame_width, frame_height)
                         } else if !frame.damage_regions.is_empty() {
                             // No detector available — fall back to compositor hints
                             // (zero CPU cost, but susceptible to under-reporting).
+                            // Capture == desktop (kwin-virtual): hint regions are
+                            // already in the right space — pass through unmapped.
                             damage_source = "compositor-hint";
                             frame
                                 .damage_regions
                                 .iter()
-                                .map(|r| DamageRegion::from(*r))
+                                .map(|r| {
+                                    DamageRegion::new(
+                                        r.x.max(0) as u32,
+                                        r.y.max(0) as u32,
+                                        r.width.max(0) as u32,
+                                        r.height.max(0) as u32,
+                                    )
+                                })
                                 .collect()
                         } else {
                             // Damage tracking disabled - use full frame
                             damage_source = "disabled";
-                            vec![DamageRegion::full_frame(frame.width, frame.height)]
+                            vec![DamageRegion::full_frame(frame_width, frame_height)]
                         };
 
                         // Prepend damage from previously consumed-but-unsent
@@ -2823,8 +3134,8 @@ impl LamcoDisplayHandler {
 
                         let damage_ratio = pipeline_decisions::compute_damage_ratio(
                             &damage_regions,
-                            frame.width,
-                            frame.height,
+                            frame_width,
+                            frame_height,
                         );
 
                         if adaptive_fps_enabled {
@@ -2943,15 +3254,15 @@ impl LamcoDisplayHandler {
                         // Frame from PipeWire may not be aligned (e.g., 800×600)
                         // Must align dimensions AND pad frame data
                         // (Transform already applied above, before the EGFX/bitmap fork)
-                        let aligned_width = align_to_16(frame.width);
-                        let aligned_height = align_to_16(frame.height);
+                        let aligned_width = align_to_16(frame_width);
+                        let aligned_height = align_to_16(frame_height);
 
                         let frame_data =
-                            if aligned_width != frame.width || aligned_height != frame.height {
+                            if aligned_width != frame_width || aligned_height != frame_height {
                                 Self::pad_frame_to_aligned(
                                     &pixel_data,
-                                    frame.width,
-                                    frame.height,
+                                    frame_width,
+                                    frame_height,
                                     aligned_width,
                                     aligned_height,
                                 )
@@ -3015,8 +3326,16 @@ impl LamcoDisplayHandler {
                                                 &data,
                                                 aligned_width as u16,
                                                 aligned_height as u16,
-                                                frame.width as u16,
-                                                frame.height as u16,
+                                                // Resolution support: the
+                                                // EGFX SURFACE geometry must be DESKTOP
+                                                // space (what the client negotiated),
+                                                // not the capture size. A
+                                                // capture-sized surface blits a
+                                                // taller/wider bitmap into it and
+                                                // shows only the top-left
+                                                // portion ("zoomed-in partial desktop").
+                                                frame_width as u16,
+                                                frame_height as u16,
                                                 &damage_regions,
                                                 timestamp_ms as u32,
                                             )
@@ -3029,8 +3348,12 @@ impl LamcoDisplayHandler {
                                                 aux.as_deref(), // Option<Vec<u8>> → Option<&[u8]>
                                                 aligned_width as u16,
                                                 aligned_height as u16,
-                                                frame.width as u16,
-                                                frame.height as u16,
+                                                // Same resolution-support
+                                                // requirement as the
+                                                // Single arm: surface geometry in
+                                                // desktop space.
+                                                frame_width as u16,
+                                                frame_height as u16,
                                                 &damage_regions,
                                                 timestamp_ms as u32,
                                             )
@@ -3131,13 +3454,13 @@ impl LamcoDisplayHandler {
                         // little-endian: the 32-bit value 0xXXRRGGBB stores as [BB,GG,RR,XX].
                         // No pixel format conversion needed.
                         let timestamp_ms = (frame.pts / 1_000_000) as u32;
+                        // Capture == desktop (kwin-virtual): send the frame
+                        // unscaled at its own geometry.
+                        let (unc_w, unc_h) = (frame.width as u16, frame.height as u16);
+                        let unc_scaled: std::sync::Arc<Vec<u8>> =
+                            std::sync::Arc::clone(pixel_bytes);
                         match sender
-                            .send_uncompressed_frame(
-                                pixel_bytes,
-                                frame.width as u16,
-                                frame.height as u16,
-                                timestamp_ms,
-                            )
+                            .send_uncompressed_frame(&unc_scaled, unc_w, unc_h, timestamp_ms)
                             .await
                         {
                             Ok(frame_id) => {
@@ -3150,7 +3473,7 @@ impl LamcoDisplayHandler {
                                 if egfx_frames_sent <= 3 || egfx_frames_sent.is_multiple_of(30) {
                                     info!(
                                         "EGFX uncompressed: sent frame {} ({}x{})",
-                                        frame_id, frame.width, frame.height
+                                        frame_id, unc_w, unc_h
                                     );
                                 }
                             }
@@ -3167,15 +3490,19 @@ impl LamcoDisplayHandler {
                     // AVC420 support (e.g., rdpdo, ironrdp-web, minimal clients).
                     if needs_init {
                         use crate::egfx::align_to_16;
-                        let aligned_width = align_to_16(frame.width) as u16;
-                        let aligned_height = align_to_16(frame.height) as u16;
+                        // Resolution support: V8 surface in DESKTOP space —
+                        // the uncompressed arm below sends the frame at its
+                        // own geometry. Read the desktop size directly
+                        // (capture dims can be stale during stream
+                        // renegotiation windows).
+                        let (v8_fw, v8_fh): (u32, u32) = {
+                            let s = handler.size.read().await;
+                            (s.width as u32, s.height as u32)
+                        };
+                        let aligned_width = align_to_16(v8_fw) as u16;
+                        let aligned_height = align_to_16(v8_fh) as u16;
                         if let Some(sender) = handler
-                            .setup_egfx_surface(
-                                frame.width,
-                                frame.height,
-                                aligned_width,
-                                aligned_height,
-                            )
+                            .setup_egfx_surface(v8_fw, v8_fh, aligned_width, aligned_height)
                             .await
                         {
                             egfx_sender = Some(sender);
@@ -3199,13 +3526,13 @@ impl LamcoDisplayHandler {
 
                         // PipeWire BGRx = RDP XRGB_8888 on little-endian. No conversion needed.
                         let timestamp_ms = (frame.pts / 1_000_000) as u32;
+                        // Capture == desktop (kwin-virtual): V8
+                        // WireToSurface1 sends the frame unscaled.
+                        let (v8s_w, v8s_h) = (frame.width as u16, frame.height as u16);
+                        let v8s_scaled: std::sync::Arc<Vec<u8>> =
+                            std::sync::Arc::clone(pixel_bytes);
                         match sender
-                            .send_uncompressed_frame(
-                                pixel_bytes,
-                                frame.width as u16,
-                                frame.height as u16,
-                                timestamp_ms,
-                            )
+                            .send_uncompressed_frame(&v8s_scaled, v8s_w, v8s_h, timestamp_ms)
                             .await
                         {
                             Ok(frame_id) => {
@@ -3218,7 +3545,7 @@ impl LamcoDisplayHandler {
                                 if egfx_frames_sent <= 3 || egfx_frames_sent.is_multiple_of(30) {
                                     info!(
                                         "EGFX V8 uncompressed: sent frame {} ({}x{})",
-                                        frame_id, frame.width, frame.height
+                                        frame_id, v8s_w, v8s_h
                                     );
                                 }
                             }
@@ -3413,6 +3740,87 @@ impl RdpServerDisplay for LamcoDisplayHandler {
         *size
     }
 
+    /// Called by IronRDP during capability set processing.
+    ///
+    /// ADOPT the client's requested desktop size. With the kwin-virtual
+    /// strategy the compositor-side virtual output is recreated at exactly
+    /// this size (elastic capture), so capture == desktop by construction.
+    async fn request_initial_size(&mut self, client_size: DesktopSize) -> DesktopSize {
+        let current = {
+            let s = self.size.read().await;
+            *s
+        };
+
+        if client_size == current {
+            info!(
+                "request_initial_size: client requested {}x{} — matches current desktop",
+                client_size.width, client_size.height
+            );
+            return current;
+        }
+
+        // Elastic capture (kwin-virtual): recreate the compositor-side virtual
+        // output at the client's EXACT requested size. No mode list, no
+        // kscreen-doctor, no scaling — capture == desktop by construction.
+        {
+            let hook = self.elastic_capture.read().clone();
+            if let Some(session) = hook {
+                info!(
+                    "request_initial_size: elastic capture — recreating virtual output at {}x{}",
+                    client_size.width, client_size.height
+                );
+                match session
+                    .resize_capture_source(client_size.width, client_size.height)
+                    .await
+                {
+                    Some((w, h)) => {
+                        // Rebind the PipeWire stream to the (new) node of the
+                        // resized virtual output before the first frame flows.
+                        let streams = session.streams();
+                        if let Some(s) = streams.first() {
+                            let old_node =
+                                self.capture_node.load(std::sync::atomic::Ordering::Relaxed);
+                            self.rebind_capture_node(old_node, s.node_id, s.width, s.height)
+                                .await;
+                        }
+                        // Adopt the client's size WITHOUT signaling a
+                        // resize: the activation is being negotiated at
+                        // exactly this size (see adopt_size_silently).
+                        self.adopt_size_silently(client_size.width, client_size.height)
+                            .await;
+                        info!(
+                            "request_initial_size: adopted client desktop {}x{} via elastic capture (source delivers {}x{})",
+                            client_size.width, client_size.height, w, h
+                        );
+                        return client_size;
+                    }
+                    None => {
+                        warn!(
+                            "Elastic capture failed at {}x{} — keeping current desktop size",
+                            client_size.width, client_size.height
+                        );
+                        // Fall through: adopt the client's size as the RDP
+                        // desktop anyway. The per-frame capture-size tracking
+                        // records what the source actually delivers.
+                    }
+                }
+            }
+        }
+
+        // Same silent adoption on the plain path — a queued resize during
+        // capability processing tears the fresh activation down (see
+        // adopt_size_silently).
+        self.adopt_size_silently(client_size.width, client_size.height)
+            .await;
+
+        info!(
+            "request_initial_size: adopted client desktop {}x{} (capture truth deferred to first frame)",
+            client_size.width, client_size.height
+        );
+
+        client_size
+    }
+
     /// Called once per connection to establish the update stream.
     /// If a previous connection consumed the receiver, we create a fresh channel
     /// to allow reconnection without requiring server restart.
@@ -3524,7 +3932,6 @@ impl RdpServerDisplay for LamcoDisplayHandler {
 
         Ok(Box::new(DisplayUpdatesStream::new(receiver)))
     }
-
     fn request_layout(&mut self, layout: ironrdp_displaycontrol::pdu::DisplayControlMonitorLayout) {
         use ironrdp_displaycontrol::pdu::MonitorLayoutEntry;
 
@@ -3667,6 +4074,7 @@ impl Clone for LamcoDisplayHandler {
                     .unwrap_or(Instant::now()),
             ),
             client_active: Arc::clone(&self.client_active),
+            display_suppressed: parking_lot::RwLock::new(self.display_suppressed.read().clone()),
             capture_node: Arc::clone(&self.capture_node),
             saw_real_disconnect: Arc::clone(&self.saw_real_disconnect),
             cursor_theme: self.cursor_theme.clone(),
@@ -3676,7 +4084,9 @@ impl Clone for LamcoDisplayHandler {
             fps_state: Arc::clone(&self.fps_state),
             stream_active_flag: parking_lot::RwLock::new(self.stream_active_flag.read().clone()),
             direct_channel_mode: self.direct_channel_mode,
-            use_dmabuf: std::sync::Arc::clone(&self.use_dmabuf),
+            use_dmabuf: Arc::clone(&self.use_dmabuf),
+            capture_size: Arc::clone(&self.capture_size),
+            elastic_capture: parking_lot::RwLock::new(self.elastic_capture.read().clone()),
         }
     }
 }

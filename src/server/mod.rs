@@ -1026,6 +1026,15 @@ impl LamcoRdpServer {
                         None
                     })
                     .with_sound_factory(Some(Box::new(sound_factory)))
+                    // Resolution support: honor the client's requested desktop
+                    // size (dialog choice), clamped to 3840x2160. The display
+                    // handler adopts the requested desktop size (elastic
+                    // capture recreates the compositor source to match).
+                    // BuilderDone-phase method (same phase as sound factory).
+                    .with_honor_client_desktop_size(Some(ironrdp_server::DesktopSize {
+                        width: 3840,
+                        height: 2160,
+                    }))
                     .build()
             } else {
                 // ScreenCast-only: view-only, no input
@@ -1054,6 +1063,12 @@ impl LamcoRdpServer {
                         None
                     })
                     .with_sound_factory(Some(Box::new(sound_factory)))
+                    // Resolution support (view-only too): same honor flag
+                    // and adoption semantics as the input path above.
+                    .with_honor_client_desktop_size(Some(ironrdp_server::DesktopSize {
+                        width: 3840,
+                        height: 2160,
+                    }))
                     .build()
             };
 
@@ -1573,6 +1588,14 @@ impl LamcoRdpServer {
                 None
             })
             .with_sound_factory(Some(Box::new(sound_factory)))
+            // Resolution support: honor the client's requested desktop size
+            // (dialog choice), clamped to 3840x2160. The display handler
+            // adopts the requested desktop size (elastic capture recreates
+            // the compositor source to match).
+            .with_honor_client_desktop_size(Some(ironrdp_server::DesktopSize {
+                width: 3840,
+                height: 2160,
+            }))
             .build();
 
         display_handler
