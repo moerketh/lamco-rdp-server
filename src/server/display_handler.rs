@@ -1310,6 +1310,15 @@ impl LamcoDisplayHandler {
 
             let mut frames_skipped_damage = 0u64; // Frames skipped due to no damage
 
+            // === DAMAGE ACCUMULATION (artifact prevention) ===
+            // Compositor damage hints are one-shot: if a frame is consumed but
+            // NOT encoded (latency governor skip/wait, or empty-damage skip
+            // after the detector reference was already updated), its regions
+            // are lost forever — the client never receives them, leaving
+            // stale pixels ("artifacts persist until drawn over"). Accumulate
+            // unsent regions and prepend them to the next encoded frame.
+            let mut accumulated_damage: Vec<DamageRegion> = Vec::new();
+
             // === FRAME STALL DETECTION ===
             // Track when we last received a frame from PipeWire. If the stream
             // is active but no frames arrive for 3+ seconds, report degradation
@@ -2604,11 +2613,8 @@ impl LamcoDisplayHandler {
                         // hints differ in reported granularity between e.g. wlr-screencopy
                         // and ext-image-copy-capture-v1; see adaptive_fps.rs module docs).
                         let mut damage_source = "forced";
-                        // Periodic pixel-diff cross-check against compositor-hint damage,
-                        // populated only on the same 60-frame cadence as the debug log below.
-                        let mut compositor_vs_pixel_diff: Option<f32> = None;
 
-                        let damage_regions = if force_full_frame {
+                        let mut damage_regions = if force_full_frame {
                             // Force full frame - either periodic IDR or first frame after init
                             if periodic_idr_due {
                                 debug!(
@@ -2616,47 +2622,45 @@ impl LamcoDisplayHandler {
                                 );
                             }
                             vec![DamageRegion::full_frame(frame.width, frame.height)]
+                        } else if let Some(ref mut detector) = damage_detector_opt {
+                            // Pixel-diff damage detection (SIMD, ~1.9ms at 1080p).
+                            //
+                            // Pixel diff is PREFERRED over compositor hints:
+                            // hints can substantially under-report actual
+                            // change on individual frames. Trusting hints
+                            // then leaves stale regions on
+                            // the client permanently — "artifacts persist until drawn
+                            // over". Over-reporting (hints larger than diff) is common
+                            // and harmless; under-reporting is user-visible breakage.
+                            // detect() also keeps the reference frame synchronized.
+                            damage_source = "pixel-diff";
+                            detector.detect(&pixel_data, frame.width, frame.height)
                         } else if !frame.damage_regions.is_empty() {
-                            // Compositor-provided damage (authoritative, zero CPU cost).
-                            // Use PipeWire damage hints from wlr-screencopy or ext-image-copy-capture.
+                            // No detector available — fall back to compositor hints
+                            // (zero CPU cost, but susceptible to under-reporting).
                             damage_source = "compositor-hint";
-                            if let Some(ref mut detector) = damage_detector_opt {
-                                if should_log_telemetry {
-                                    // Calibration probe: run the real pixel-diff detector
-                                    // instead of the cheap reference-only update, so we can
-                                    // log how far this protocol's damage hints diverge from
-                                    // an actual pixel diff. detect() updates the reference
-                                    // frame as a side effect, same as update_reference()
-                                    // would have -- this is not extra drift, just a ~2-3ms
-                                    // probe once every 60 frames.
-                                    let probe_regions =
-                                        detector.detect(&pixel_data, frame.width, frame.height);
-                                    compositor_vs_pixel_diff =
-                                        Some(pipeline_decisions::compute_damage_ratio(
-                                            &probe_regions,
-                                            frame.width,
-                                            frame.height,
-                                        ));
-                                } else {
-                                    // Keep DamageDetector reference frame synchronized for
-                                    // seamless fallback, without the cost of a full diff.
-                                    detector.update_reference(&pixel_data);
-                                }
-                            }
                             frame
                                 .damage_regions
                                 .iter()
                                 .map(|r| DamageRegion::from(*r))
                                 .collect()
-                        } else if let Some(ref mut detector) = damage_detector_opt {
-                            // Fallback: pixel-diff damage detection (SIMD, ~2-3ms at 1080p)
-                            damage_source = "pixel-diff";
-                            detector.detect(&pixel_data, frame.width, frame.height)
                         } else {
                             // Damage tracking disabled - use full frame
                             damage_source = "disabled";
                             vec![DamageRegion::full_frame(frame.width, frame.height)]
                         };
+
+                        // Prepend damage from previously consumed-but-unsent
+                        // frames so no region is ever lost (see comment at
+                        // accumulated_damage declaration).
+                        if !accumulated_damage.is_empty() {
+                            if damage_regions.is_empty() {
+                                damage_source = "accumulated";
+                            }
+                            let mut combined = accumulated_damage.clone();
+                            combined.extend(damage_regions);
+                            damage_regions = combined;
+                        }
 
                         let damage_ratio = pipeline_decisions::compute_damage_ratio(
                             &damage_regions,
@@ -2677,9 +2681,15 @@ impl LamcoDisplayHandler {
                             match encoding_decision {
                                 EncodingDecision::Skip => {
                                     frames_dropped += 1;
+                                    if !damage_regions.is_empty() {
+                                        accumulated_damage.extend(damage_regions);
+                                    }
                                     continue;
                                 }
                                 EncodingDecision::WaitForMore => {
+                                    if !damage_regions.is_empty() {
+                                        accumulated_damage.extend(damage_regions);
+                                    }
                                     continue;
                                 }
                                 EncodingDecision::EncodeNow
@@ -2707,23 +2717,42 @@ impl LamcoDisplayHandler {
                             continue;
                         }
 
+                        // This frame will be encoded and its regions sent:
+                        // the accumulation debt is cleared (it was merged into
+                        // damage_regions above).
+                        accumulated_damage.clear();
+
                         if should_log_telemetry {
                             last_telemetry_log = std::time::Instant::now();
                             if let Some(ref detector) = damage_detector_opt {
                                 let stats = detector.stats();
                                 debug!(
-                                    "🎯 Damage: {} regions, {:.1}% of frame, avg {:.1}ms detection, source={damage_source}",
+                                    "🎯 Damage: {} regions, {:.1}% of frame, avg {:.1}ms detection, source={damage_source}, accumulated_pending={}",
                                     damage_regions.len(),
                                     damage_ratio * 100.0,
-                                    stats.avg_detection_time_ms
+                                    stats.avg_detection_time_ms,
+                                    accumulated_damage.len()
                                 );
                             }
-                            if let Some(pixel_diff_ratio) = compositor_vs_pixel_diff {
-                                let delta_pct = (damage_ratio - pixel_diff_ratio) * 100.0;
+                            let hint_ratio = if frame.damage_regions.is_empty() {
+                                None
+                            } else {
+                                Some(pipeline_decisions::compute_damage_ratio(
+                                    &frame
+                                        .damage_regions
+                                        .iter()
+                                        .map(|r| DamageRegion::from(*r))
+                                        .collect::<Vec<_>>(),
+                                    frame.width,
+                                    frame.height,
+                                ))
+                            };
+                            if let Some(h) = hint_ratio {
+                                let delta_pct = (damage_ratio - h) * 100.0;
                                 debug!(
-                                    "🎯 Damage source cross-check: compositor-hint={:.1}% pixel-diff={:.1}% delta={delta_pct:+.1}pp",
+                                    "🎯 Damage source cross-check: pixel-diff={:.1}% compositor-hint={:.1}% delta={delta_pct:+.1}pp",
                                     damage_ratio * 100.0,
-                                    pixel_diff_ratio * 100.0
+                                    h * 100.0
                                 );
                             }
                             if adaptive_fps_enabled {
@@ -2893,6 +2922,10 @@ impl LamcoDisplayHandler {
                                             }
                                         }
                                         frames_dropped += 1;
+                                        // Client never received this content;
+                                        // re-queue regions for the next frame
+                                        // (artifact prevention).
+                                        accumulated_damage.extend(damage_regions.iter().copied());
                                         continue; // Drop frame, don't fall through to RemoteFX
                                     }
                                 }
@@ -2900,6 +2933,7 @@ impl LamcoDisplayHandler {
                             Ok(None) => {
                                 trace!("H.264 encoder skipped frame");
                                 frames_dropped += 1;
+                                accumulated_damage.extend(damage_regions.iter().copied());
                                 continue;
                             }
                             Err(e) => {
@@ -2909,6 +2943,7 @@ impl LamcoDisplayHandler {
                                     e
                                 );
                                 frames_dropped += 1;
+                                accumulated_damage.extend(damage_regions.iter().copied());
                                 continue; // Drop frame, don't fall through to RemoteFX
                             }
                         }
