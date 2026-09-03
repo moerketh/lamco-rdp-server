@@ -55,6 +55,7 @@ mod color_space;
 pub(crate) mod encode_diagnostics;
 mod yuv444_packing;
 
+pub mod dmabuf_access;
 #[cfg(any(feature = "vaapi", feature = "nvenc"))]
 pub mod hardware;
 

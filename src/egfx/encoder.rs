@@ -28,8 +28,12 @@ use thiserror::Error;
 use tracing::{debug, info, trace, warn};
 
 use super::color_space::ColorSpaceConfig;
+use super::dmabuf_access;
 #[cfg(feature = "h264")]
 use super::openh264_compat;
+
+#[cfg(feature = "h264")]
+pub(crate) use dmabuf_access::dmabuf_stats;
 
 /// Errors that can occur during H.264 encoding
 #[derive(Debug, Error)]
@@ -567,11 +571,17 @@ impl Avc420Encoder {
             ));
         }
 
+        // The flat copy below is only correct for linear layouts.
+        dmabuf_access::ensure_linear(desc.modifier)
+            .map_err(|e| EncoderError::EncodeFailed(e.to_owned()))?;
+
         let plane = &desc.planes[0];
         let size = (desc.height * plane.stride) as usize;
 
         // SAFETY: plane.fd is a valid OwnedFd from the PipeWire dup path.
         // mmap is read-only, we copy into a Vec immediately, then munmap.
+        // dma_buf_mmap requires pgoff == 0 (plane data lives at map start);
+        // plane.offset is a data offset *within* the mapping, not an mmap offset.
         let data = unsafe {
             use std::{num::NonZeroUsize, os::fd::BorrowedFd};
 
@@ -587,17 +597,34 @@ impl Avc420Encoder {
                 ProtFlags::PROT_READ,
                 MapFlags::MAP_SHARED,
                 borrowed,
-                plane.offset as i64,
+                // dma-buf mmap offset must be 0; skip plane bytes via offset
+                0,
             )
             .map_err(|e| EncoderError::EncodeFailed(format!("DMA-BUF mmap failed: {e}")))?;
 
+            // Bracket the CPU read with the dma-buf sync ioctl so the
+            // exporter makes the mapping coherent (see dmabuf_access docs).
+            let _sync = dmabuf_access::DmaBufSyncGuard::begin_read(&plane.fd);
+
+            let src = ptr.as_ptr().add(plane.offset as usize) as *const u8;
             let mut vec = Vec::with_capacity(size);
-            std::ptr::copy_nonoverlapping(ptr.as_ptr() as *const u8, vec.as_mut_ptr(), size);
+            std::ptr::copy_nonoverlapping(src, vec.as_mut_ptr(), size);
             vec.set_len(size);
 
+            drop(_sync);
             let _ = munmap(ptr, size);
             vec
         };
+
+        let nonzero = dmabuf_stats::record(&data);
+        if !nonzero {
+            tracing::debug!(
+                width = desc.width,
+                height = desc.height,
+                modifier = desc.modifier,
+                "encode_dmabuf: mapped frame is all-zero"
+            );
+        }
 
         self.encode_bgra(&data, desc.width, desc.height, timestamp_ms)
     }
