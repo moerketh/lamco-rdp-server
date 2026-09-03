@@ -240,6 +240,25 @@ impl AcceptDeployment for WlrDirectDeployment {
                 };
                 match session.establish_for_client().await {
                     Ok((streams, reestablished)) => {
+                        // Per-connection strategies (kwin-virtual) start with
+                        // no stream geometry; the display handler (and through
+                        // its re-sync, the input transformer) must learn the
+                        // established stream layout before clicks can map.
+                        // Portal-style strategies re-report the same layout —
+                        // an idempotent refresh.
+                        let portal_streams: Vec<crate::portal::StreamInfo> = streams
+                            .iter()
+                            .map(|s| crate::portal::StreamInfo {
+                                node_id: s.node_id,
+                                position: (s.position_x, s.position_y),
+                                size: (s.width, s.height),
+                                source_type: crate::portal::SourceType::Monitor,
+                                // No portal stream to read a mapping id from
+                                // (kwin-virtual / Mutter-direct sources).
+                                mapping_id: None,
+                            })
+                            .collect();
+                        dh.set_stream_info(portal_streams).await;
                         // Rebind capture only when the session was actually
                         // re-established. The compositor can reuse the node id
                         // for a brand-new stream, so rebind unconditionally in
