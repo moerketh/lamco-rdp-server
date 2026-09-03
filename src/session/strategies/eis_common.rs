@@ -258,34 +258,24 @@ pub async fn eis_pointer_motion_absolute(
     y: f64,
     stream_offset: Option<(f64, f64)>,
 ) -> Result<()> {
-    // Incoming (x, y) are relative to the captured stream. Map them into the
-    // EIS absolute (compositor-layout) space by adding the captured stream's
-    // layout position — the authoritative source the caller resolves from the
-    // ScreenCast stream. Fall back to the EIS device-region heuristic (the prior
-    // KDE-tested path: pick the region with a non-zero offset) only when the
-    // stream position is unknown, so no previously-working case regresses.
-    let (offset_x, offset_y) = match stream_offset {
-        Some(offset) => offset,
-        None => {
-            let abs_device = devices.pointer_absolute.lock().await;
-            if let Some(ref dev) = *abs_device {
-                let devs = devices.all.lock().await;
-                if let Some(data) = devs.get(dev) {
-                    data.regions
-                        .iter()
-                        .find(|r| r.x > 0 || r.y > 0)
-                        .map_or((0.0, 0.0), |r| (r.x as f64, r.y as f64))
-                } else {
-                    (0.0, 0.0)
-                }
-            } else {
-                (0.0, 0.0)
-            }
-        }
+    // Offset policy depends on the caller:
+    //
+    // - `Some(offset)`: the caller resolved the captured stream's layout
+    //   position (portal paths) — incoming (x, y) are stream-relative and
+    //   must be mapped into EIS absolute (compositor-layout) space by
+    //   adding the stream position.
+    //
+    // - `None`: the caller's coordinate transformer already emits GLOBAL
+    //   compositor coordinates (kwin-virtual: StreamInfo.position feeds the
+    //   transformer's monitor layout, so RDP desktop coords map straight to
+    //   global space). No offset is applied — not even the EIS device-region
+    //   heuristic, which would double-offset and land clicks outside the
+    //   desktop (live-validated on KWin: motion_absolute is global; see
+    //   PointerInputRedirection::processMotionAbsolute).
+    let (abs_x, abs_y) = match stream_offset {
+        Some((offset_x, offset_y)) => (x + offset_x, y + offset_y),
+        None => (x, y),
     };
-
-    let abs_x = x + offset_x;
-    let abs_y = y + offset_y;
 
     with_device_interface::<ei::PointerAbsolute>(
         context,

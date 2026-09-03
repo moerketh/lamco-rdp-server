@@ -234,6 +234,33 @@ impl SessionStrategySelector {
             }
         }
 
+        // PRIORITY 1.5: KWin zkde-screencast virtual output (KDE only, zero
+        // VIDEO dialogs — output created per connection at the client's exact
+        // requested size; input via libei below).
+        //
+        // Native-resolution capture with a fully interactive desktop.
+        // Selected BEFORE the portal path so KDE
+        // gets native resolutions; the libei strategy's portal-RemoteDesktop
+        // input session is composed in (input consent remains, one-time).
+        #[cfg(feature = "kwin-virtual")]
+        if matches!(
+            caps.compositor,
+            crate::compositor::CompositorType::Kde { .. }
+        ) && crate::session::strategies::KwinVirtualStrategy::is_available().await
+        {
+            info!("✅ Selected: KWin virtual output strategy (zkde-screencast)");
+            info!("   Native per-connection virtual display at the client's size");
+            info!("   Compositor: {}", caps.compositor);
+            info!("   Video: dialog-free (compositor-level virtual output)");
+            info!("   Input: Portal RemoteDesktop + EIS (one-time consent)");
+
+            return Ok(Box::new(
+                crate::session::strategies::KwinVirtualStrategy::new(Some(
+                    self.token_manager.clone(),
+                )),
+            ));
+        }
+
         // PRIORITY 2: portal-generic embedded (wlroots/Smithay — video + input + clipboard)
         //
         // Two ways in:

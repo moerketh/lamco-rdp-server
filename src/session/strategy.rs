@@ -430,6 +430,8 @@ pub enum SessionType {
     Libei,
     /// Embedded portal-generic backend (wlroots native video + input + clipboard)
     PortalGeneric,
+    /// KWin zkde-screencast virtual output (KDE native video, libei input)
+    KwinVirtual,
     /// ScreenCast-only (view-only, no input injection)
     /// Used when view-only mode is configured, or as fallback when no input strategy is available
     ScreenCastOnly,
@@ -443,6 +445,7 @@ impl std::fmt::Display for SessionType {
             SessionType::WlrDirect => write!(f, "wlr-direct"),
             SessionType::Libei => write!(f, "libei/EIS"),
             SessionType::PortalGeneric => write!(f, "portal-generic (embedded)"),
+            SessionType::KwinVirtual => write!(f, "kwin-virtual (zkde-screencast)"),
             SessionType::ScreenCastOnly => write!(f, "ScreenCast-only (view-only)"),
         }
     }

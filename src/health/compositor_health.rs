@@ -145,7 +145,8 @@ pub fn compositor_health_source(
         SessionType::Portal
         | SessionType::Libei
         | SessionType::ScreenCastOnly
-        | SessionType::WlrDirect => Box::new(DbusNameWatcher::portal()),
+        | SessionType::WlrDirect
+        | SessionType::KwinVirtual => Box::new(DbusNameWatcher::portal()),
         SessionType::PortalGeneric => Box::new(WaylandConnectionHealth),
     }
 }

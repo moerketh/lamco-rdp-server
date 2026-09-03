@@ -26,6 +26,11 @@ fn compositor_bus_names(session_type: SessionType) -> Vec<&'static str> {
             // wlr-direct uses Portal ScreenCast for video capture
             vec!["org.freedesktop.portal.Desktop"]
         }
+        SessionType::KwinVirtual => {
+            // Video is Wayland-native (zkde-screencast), but input goes
+            // through Portal RemoteDesktop — watch the portal daemon.
+            vec!["org.freedesktop.portal.Desktop"]
+        }
         SessionType::PortalGeneric => {
             // Wayland-native strategy, no D-Bus runtime dependency
             vec![]
