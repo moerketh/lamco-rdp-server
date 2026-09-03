@@ -949,6 +949,16 @@ pub struct EgfxConfig {
     /// - "avc444": Prefer AVC444 (4:4:4 chroma) for superior text/UI rendering
     pub codec: String,
 
+    /// Software encoder backend for AVC420: "auto", "openh264", "x264"
+    /// - "auto": Use x264 if compiled in and libx264.so is available, else OpenH264
+    /// - "openh264": Always use OpenH264 (default, patent-covered Cisco binary)
+    /// - "x264": Use x264 (2-3× faster, requires libx264.so installed)
+    ///
+    /// Only affects AVC420. AVC444 always uses OpenH264 (x264 doesn't support 4:4:4).
+    /// When AVC444 is negotiated, this setting is ignored.
+    #[serde(default = "default_encoder_backend")]
+    pub encoder_backend: String,
+
     /// Quality parameter range
     pub qp_min: u8,
     pub qp_max: u8,
@@ -1032,6 +1042,10 @@ fn default_avc444_aux_ratio() -> f32 {
     0.5
 }
 
+fn default_encoder_backend() -> String {
+    "auto".to_string()
+}
+
 fn default_aux_interval() -> u32 {
     30 // 1 second @ 30fps
 }
@@ -1071,6 +1085,7 @@ impl Default for EgfxConfig {
             frame_ack_timeout: 5000,
             periodic_idr_interval: 5, // Force IDR every 5 seconds to clear artifacts
             codec: "auto".to_string(), // Use best available (AVC444 if supported, else AVC420)
+            encoder_backend: "auto".to_string(), // Auto: prefer x264 if available, else OpenH264
             qp_min: 10,
             qp_max: 40,
             qp_default: 23,
