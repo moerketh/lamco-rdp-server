@@ -1523,6 +1523,15 @@ impl LamcoDisplayHandler {
             let mut compositor_hint_distrusted = false;
             let mut consecutive_high_divergence = 0u32;
 
+            // === DAMAGE ACCUMULATION (artifact prevention) ===
+            // Compositor damage hints are one-shot: if a frame is consumed but
+            // NOT encoded (latency governor skip/wait, or empty-damage skip
+            // after the detector reference was already updated), its regions
+            // are lost forever — the client never receives them, leaving
+            // stale pixels ("artifacts persist until drawn over"). Accumulate
+            // unsent regions and prepend them to the next encoded frame.
+            let mut accumulated_damage: Vec<DamageRegion> = Vec::new();
+
             // === FRAME STALL DETECTION ===
             // Track when we last received a frame from PipeWire. If the stream
             // is active but no frames arrive for 3+ seconds, report degradation
@@ -3194,7 +3203,7 @@ impl LamcoDisplayHandler {
                         // populated only on the same 60-frame cadence as the debug log below.
                         let mut compositor_vs_pixel_diff: Option<f32> = None;
 
-                        let damage_regions = if force_full_frame {
+                        let mut damage_regions = if force_full_frame {
                             // Force full frame - either periodic IDR or first frame after init
                             if periodic_idr_due {
                                 debug!(
@@ -3289,11 +3298,32 @@ impl LamcoDisplayHandler {
                                 "pixel-diff"
                             };
                             detector.detect(&pixel_data, frame.width, frame.height)
+                        } else if !frame.damage_regions.is_empty() {
+                            // No detector configured and compositor hints present:
+                            // hints alone, with no trust instrumentation possible.
+                            damage_source = "compositor-hint-no-detector";
+                            frame
+                                .damage_regions
+                                .iter()
+                                .map(|r| DamageRegion::from(*r))
+                                .collect()
                         } else {
                             // Damage tracking disabled - use full frame
                             damage_source = "disabled";
                             vec![DamageRegion::full_frame(frame.width, frame.height)]
                         };
+
+                        // Prepend damage from previously consumed-but-unsent
+                        // frames so no region is ever lost (see comment at
+                        // accumulated_damage declaration).
+                        if !accumulated_damage.is_empty() {
+                            if damage_regions.is_empty() {
+                                damage_source = "accumulated";
+                            }
+                            let mut combined = accumulated_damage.clone();
+                            combined.extend(damage_regions);
+                            damage_regions = combined;
+                        }
 
                         let damage_ratio = pipeline_decisions::compute_damage_ratio(
                             &damage_regions,
@@ -3314,9 +3344,15 @@ impl LamcoDisplayHandler {
                             match encoding_decision {
                                 EncodingDecision::Skip => {
                                     frames_dropped += 1;
+                                    if !damage_regions.is_empty() {
+                                        accumulated_damage.extend(damage_regions);
+                                    }
                                     continue;
                                 }
                                 EncodingDecision::WaitForMore => {
+                                    if !damage_regions.is_empty() {
+                                        accumulated_damage.extend(damage_regions);
+                                    }
                                     continue;
                                 }
                                 EncodingDecision::EncodeNow
@@ -3344,23 +3380,42 @@ impl LamcoDisplayHandler {
                             continue;
                         }
 
+                        // This frame will be encoded and its regions sent:
+                        // the accumulation debt is cleared (it was merged into
+                        // damage_regions above).
+                        accumulated_damage.clear();
+
                         if should_log_telemetry {
                             last_telemetry_log = std::time::Instant::now();
                             if let Some(ref detector) = damage_detector_opt {
                                 let stats = detector.stats();
                                 debug!(
-                                    "🎯 Damage: {} regions, {:.1}% of frame, avg {:.1}ms detection, source={damage_source}",
+                                    "🎯 Damage: {} regions, {:.1}% of frame, avg {:.1}ms detection, source={damage_source}, accumulated_pending={}",
                                     damage_regions.len(),
                                     damage_ratio * 100.0,
-                                    stats.avg_detection_time_ms
+                                    stats.avg_detection_time_ms,
+                                    accumulated_damage.len()
                                 );
                             }
-                            if let Some(pixel_diff_ratio) = compositor_vs_pixel_diff {
-                                let delta_pct = (damage_ratio - pixel_diff_ratio) * 100.0;
+                            let hint_ratio = if frame.damage_regions.is_empty() {
+                                None
+                            } else {
+                                Some(pipeline_decisions::compute_damage_ratio(
+                                    &frame
+                                        .damage_regions
+                                        .iter()
+                                        .map(|r| DamageRegion::from(*r))
+                                        .collect::<Vec<_>>(),
+                                    frame.width,
+                                    frame.height,
+                                ))
+                            };
+                            if let Some(h) = hint_ratio {
+                                let delta_pct = (damage_ratio - h) * 100.0;
                                 debug!(
-                                    "🎯 Damage source cross-check: compositor-hint={:.1}% pixel-diff={:.1}% delta={delta_pct:+.1}pp",
+                                    "🎯 Damage source cross-check: pixel-diff={:.1}% compositor-hint={:.1}% delta={delta_pct:+.1}pp",
                                     damage_ratio * 100.0,
-                                    pixel_diff_ratio * 100.0
+                                    h * 100.0
                                 );
                             }
                             if adaptive_fps_enabled {
@@ -3530,6 +3585,10 @@ impl LamcoDisplayHandler {
                                             }
                                         }
                                         frames_dropped += 1;
+                                        // Client never received this content;
+                                        // re-queue regions for the next frame
+                                        // (artifact prevention).
+                                        accumulated_damage.extend(damage_regions.iter().copied());
                                         continue; // Drop frame, don't fall through to RemoteFX
                                     }
                                 }
@@ -3537,6 +3596,7 @@ impl LamcoDisplayHandler {
                             Ok(None) => {
                                 trace!("H.264 encoder skipped frame");
                                 frames_dropped += 1;
+                                accumulated_damage.extend(damage_regions.iter().copied());
                                 continue;
                             }
                             Err(e) => {
@@ -3546,6 +3606,7 @@ impl LamcoDisplayHandler {
                                     e
                                 );
                                 frames_dropped += 1;
+                                accumulated_damage.extend(damage_regions.iter().copied());
                                 continue; // Drop frame, don't fall through to RemoteFX
                             }
                         }
