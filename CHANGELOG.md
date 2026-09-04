@@ -9,6 +9,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Add entries here as work lands; retitle to the release version and date when the release is cut.
 
+## [1.4.5-hyperv.2] - 2026-09-05
+
+Visual-fidelity and damage-tracking fixes for the Hyper-V / KDE line.
+All changes are relative to `1.4.4-hyperv.1`; the Cargo.toml version stays
+1.4.4 and the `-hyperv.N` suffix identifies this fork's release lineage.
+
+### Added
+
+**Damage-tracking method presets** (`[damage_tracking] method`)
+- `"recommended"` (new default): compositor hints as primary damage source,
+  periodic pixel-diff calibration with automatic distrust fallback
+- `"pixel-diff-exact"`: pixel-diff as the sole damage source — highest
+  fidelity, higher CPU (aliases: `"diff"`, empty)
+- `"pipewire"`: PipeWire damage hints only (unchanged)
+- `Config::validate()` and `example-config.toml` updated accordingly
+
+### Changed
+
+- Compositor-hint distrust defaults tightened from 15.0pp / 3 samples to
+  **3.0pp / 2 samples**: live KDE/zkde measurements showed hint misses of
+  2-5pp producing visible drag-trail artifacts the old threshold never
+  tripped on
+- Eager calibration: the pixel-diff probe runs on every frame for the
+  first 30 frames after connect, so distrust engages within seconds
+  instead of after several periodic probe cycles
+
+### Fixed
+
+- **Permanent artifacts after damage misses**: periodic full-frame IDR
+  (keyframe) every `periodic_idr_interval` seconds lets the client
+  self-heal any accumulated reference-frame desynchronization
+- **Probe-union send set**: probe-only regions (areas the compositor hint
+  missed) were previously discarded when the probe frame raced ahead of
+  the client-acknowledged reference frame; they are now unioned into the
+  send set via `pipeline_decisions::subtract_regions()` (axis-aligned
+  region subtraction)
+
 ## [1.4.5] - 2026-09-02
 
 ### Added

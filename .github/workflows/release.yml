@@ -77,6 +77,31 @@ jobs:
           # Same script local builds use (scripts/build-release-artifacts.sh).
           bash scripts/build-release-artifacts.sh --version "$PKG_VERSION"
 
+      - name: Provenance guard — embedded commit must match the tagged commit
+        run: |
+          set -euo pipefail
+          # build.rs embeds `git rev-parse --short HEAD` as GIT_HASH; the
+          # startup banner prints it as "Commit: <hash>". A binary built from
+          # any other commit must never be published under this tag.
+          # NOTE: substring match — the compiler pools the hash literal with
+          # adjacent strings (no null boundary), so `grep -x` never matches.
+          EXPECTED="$(git rev-parse --short HEAD)"
+          fail=0
+          for BIN in target/release/lamco-rdp-server target/release/lamco-rdp-server-gui; do
+            if [[ ! -x "$BIN" ]]; then
+              echo "::error::expected binary missing: $BIN" >&2
+              fail=1
+              continue
+            fi
+            if strings -n 4 "$BIN" | grep -q "$EXPECTED"; then
+              echo "provenance OK: $BIN embeds commit $EXPECTED"
+            else
+              echo "::error::$BIN does not embed the tagged commit ($EXPECTED) — refusing to publish" >&2
+              fail=1
+            fi
+          done
+          exit $fail
+
       - name: Smoke test — binaries run and report versions
         run: |
           set -euo pipefail
