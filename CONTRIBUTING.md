@@ -70,7 +70,7 @@ sudo dnf install nasm openssl-devel pipewire-devel libva-devel \
 ### Clone and Build
 
 ```bash
-git clone https://github.com/lamco-admin/lamco-rdp-server
+git clone https://github.com/moerketh/lamco-rdp-server
 cd lamco-rdp-server
 
 # Build

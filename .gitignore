@@ -2,6 +2,14 @@
 /target
 Cargo.lock
 
+# Release artifacts (scripts/build-release-artifacts.sh output)
+/dist/
+
+# OpenH264 binary license — build-time only, fetched by
+# scripts/build-release-artifacts.sh from the openh264-sys2 crate.
+# Never commit (upstream lamco-admin's responsibility, not this fork's).
+/licenses/OpenH264-BINARY_LICENSE.txt
+
 # Claude Code session artifacts
 .claude/
 

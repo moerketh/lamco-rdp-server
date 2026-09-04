@@ -1,10 +1,10 @@
 #!/bin/bash
-# Generate self-signed certificates for wrd-server
+# Generate self-signed certificates for lamco-rdp-server
 
 set -e
 
-CERT_DIR="${1:-/etc/wrd-server}"
-COMMON_NAME="${2:-wrd-server}"
+CERT_DIR="${1:-/etc/lamco-rdp-server}"
+COMMON_NAME="${2:-lamco-rdp-server}"
 VALIDITY_DAYS="${3:-365}"
 
 echo "Generating self-signed certificate..."
