@@ -19,9 +19,9 @@ description: |
 license: BUSL-1.1
 icon: snap/gui/icon.png
 website: https://www.lamco.ai
-source-code: https://github.com/lamco-admin/lamco-rdp-server
-issues: https://github.com/lamco-admin/lamco-rdp-server/issues
-contact: https://github.com/lamco-admin/lamco-rdp-server/issues
+source-code: https://github.com/moerketh/lamco-rdp-server
+issues: https://github.com/moerketh/lamco-rdp-server/issues
+contact: https://github.com/moerketh/lamco-rdp-server/issues
 base: core24
 grade: stable
 confinement: strict
@@ -76,7 +76,7 @@ parts:
 
   lamco-rdp-server:
     plugin: rust
-    source: https://github.com/lamco-admin/lamco-rdp-server/releases/download/v1.4.4/lamco-rdp-server-1.4.4.tar.xz
+    source: https://github.com/moerketh/lamco-rdp-server/releases/download/v1.4.4/lamco-rdp-server-1.4.4.tar.xz
     # Vendored tarball includes .cargo/config.toml + vendor/
     rust-cargo-parameters:
       - --frozen

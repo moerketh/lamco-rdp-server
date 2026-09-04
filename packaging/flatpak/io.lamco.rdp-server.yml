@@ -54,5 +54,5 @@ modules:
 
     sources:
       - type: archive
-        url: https://github.com/lamco-admin/lamco-rdp-server/releases/download/v1.4.4/lamco-rdp-server-1.4.4.tar.xz
+        url: https://github.com/moerketh/lamco-rdp-server/releases/download/v1.4.4/lamco-rdp-server-1.4.4.tar.xz
         sha256: 6246e10b6ea6e24b712fc3f812431446c7792d04593ae8426682b12e3e83a51d
