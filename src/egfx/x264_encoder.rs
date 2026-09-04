@@ -103,6 +103,15 @@ pub struct X264Encoder {
     width: u32,
     height: u32,
     force_idr: bool,
+    /// Periodic IDR interval in seconds (0 = disabled). Every interval, the
+    /// next encode is forced to a keyframe AND the caller (display pipeline)
+    /// treats it as a full-frame update — the self-heal for stale regions:
+    /// if a compositor damage hint under-reported a changed area (window
+    /// drag trails), the periodic full-frame repaint erases the artifact
+    /// within one interval. Without this, a damage miss is permanent.
+    periodic_idr_interval_secs: u32,
+    /// Instant of the last periodic IDR (None before the first).
+    last_periodic_idr: Option<std::time::Instant>,
     /// Reusable contiguous Y/U/V buffer (Y then U then V, densely packed).
     /// Restored on resolution change; never re-allocated per frame.
     #[cfg(any(feature = "x264", feature = "h264"))]
@@ -123,6 +132,8 @@ impl X264Encoder {
             width: 0,
             height: 0,
             force_idr: true,
+            periodic_idr_interval_secs: 0,
+            last_periodic_idr: None,
             #[cfg(any(feature = "x264", feature = "h264"))]
             yuv: Vec::new(),
             diagnostics: None,
@@ -301,6 +312,34 @@ impl X264Encoder {
     pub fn force_keyframe(&mut self) {
         self.force_idr = true;
         debug!("x264: forced keyframe on next encode");
+    }
+
+    /// Configure the periodic IDR interval in seconds (0 disables). See the
+    /// `periodic_idr_interval_secs` field docs for why the x264/AVC420 path
+    /// needs this exactly as much as AVC444: without a periodic full-frame
+    /// repaint, any damage-hint miss becomes a permanent artifact.
+    pub fn configure_periodic_idr(&mut self, interval_secs: u32) {
+        self.periodic_idr_interval_secs = interval_secs;
+        debug!("x264: periodic IDR interval set to {interval_secs}s");
+    }
+
+    /// Whether the periodic IDR interval has elapsed (non-consuming on the
+    /// force flag itself — the caller decides how to react; the x264 encode
+    /// consumes it via `force_idr` when the pipeline encodes the frame).
+    pub fn is_periodic_idr_due(&self) -> bool {
+        if self.periodic_idr_interval_secs == 0 {
+            return false;
+        }
+        match self.last_periodic_idr {
+            None => true,
+            Some(t) => t.elapsed().as_secs() >= u64::from(self.periodic_idr_interval_secs),
+        }
+    }
+
+    /// Record that a periodic IDR was issued now (called by the pipeline
+    /// when it turns a due periodic IDR into a full-frame send).
+    pub fn mark_periodic_idr_sent(&mut self) {
+        self.last_periodic_idr = Some(std::time::Instant::now());
     }
 
     pub fn stats(&self) -> super::encoder::EncoderStats {
