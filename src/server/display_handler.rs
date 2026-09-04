@@ -257,7 +257,25 @@ impl VideoEncoder {
             VideoEncoder::Avc420(_) => false, // AVC420 doesn't have periodic IDR
             VideoEncoder::Avc444(encoder) => encoder.is_periodic_idr_due(),
             #[cfg(feature = "x264")]
-            VideoEncoder::X264(_) => false, // x264 doesn't have periodic IDR
+            VideoEncoder::X264(encoder) => encoder.is_periodic_idr_due(),
+        }
+    }
+
+    /// Consume a due periodic IDR: marks it sent and arms the encoder's
+    /// keyframe flag. The caller has already decided (via
+    /// `is_periodic_idr_due`) that this frame is the periodic full-frame.
+    /// AVC444 handles this internally in its own is-due/encode flow; x264
+    /// needs the explicit arm because its `force_idr` is the only keyframe
+    /// lever the FFI encode call honors.
+    fn begin_periodic_idr(&mut self) {
+        match self {
+            VideoEncoder::Avc420(_) => {}
+            VideoEncoder::Avc444(_) => {}
+            #[cfg(feature = "x264")]
+            VideoEncoder::X264(encoder) => {
+                encoder.force_keyframe();
+                encoder.mark_periodic_idr_sent();
+            }
         }
     }
 }
@@ -3264,6 +3282,11 @@ impl LamcoDisplayHandler {
                                                     encoder.set_diagnostics(
                                                         encoder_diagnostics.clone(),
                                                     );
+                                                    encoder.configure_periodic_idr(
+                                                        self.config
+                                                            .egfx
+                                                            .periodic_idr_interval,
+                                                    );
                                                     video_encoder =
                                                         Some(VideoEncoder::X264(encoder));
                                                     info!(
@@ -3353,6 +3376,12 @@ impl LamcoDisplayHandler {
                                 match X264Encoder::new(config.clone()) {
                                     Ok(mut encoder) => {
                                         encoder.set_diagnostics(encoder_diagnostics.clone());
+                                        // Periodic full-frame IDR = the artifact
+                                        // self-heal for damage-hint misses
+                                        // (window-drag trails on zkde hints).
+                                        encoder.configure_periodic_idr(
+                                            self.config.egfx.periodic_idr_interval,
+                                        );
                                         video_encoder = Some(VideoEncoder::X264(encoder));
                                         info!(
                                             "✅ x264 AVC420 encoder initialized for {}×{} (ultrafast/zerolatency)",
@@ -3617,6 +3646,13 @@ impl LamcoDisplayHandler {
                         // 2. First frame after initialization (reconnecting clients need immediate display)
                         let periodic_idr_due = encoder.is_periodic_idr_due();
                         let force_full_frame = periodic_idr_due || force_first_frame;
+                        if periodic_idr_due && !force_first_frame {
+                            // Arm the keyframe flag + reset the interval clock
+                            // (AVC444 folds this into its encode; x264 needs
+                            // the explicit arm before the encode below).
+                            encoder.begin_periodic_idr();
+                            debug!("Periodic IDR due — sending full frame (artifact self-heal)");
+                        }
 
                         if force_first_frame {
                             info!("📺 Forcing first frame after init (IDR will be sent)");
