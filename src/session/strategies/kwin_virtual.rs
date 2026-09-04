@@ -982,12 +982,16 @@ impl crate::session::strategy::SessionStrategy for KwinVirtualStrategy {
     async fn create_session(&self) -> Result<Arc<dyn SessionHandle>> {
         info!("[kwin-virtual] creating session (zkde-screencast video + libei input)");
 
-        // Input: reuse the libei machinery verbatim (Portal RemoteDesktop +
-        // EIS, restore token, persistent event consumer). The concrete
-        // handle lets us delegate input directly.
+        // Input: reuse the libei machinery (Portal RemoteDesktop + EIS,
+        // restore token, persistent event consumer) — but INPUT-ONLY:
+        // kwin-virtual provides its own video via zkde-screencast. Attaching
+        // the libei ScreenCast here would give xdp-kde a monitor dependency
+        // that kills the whole RemoteDesktop session the moment the output
+        // guard disables the physical output (Session.Closed → ConnectToEIS
+        // fails → dead keyboard/mouse for the client).
         let libei_strategy =
             crate::session::strategies::libei::LibeiStrategy::new(None, self.token_manager.clone());
-        let libei_impl = libei_strategy.create_session_concrete().await?;
+        let libei_impl = libei_strategy.create_session_concrete(false).await?;
 
         // NOTE: the output-layout guard is NOT engaged here. It engages on
         // establish_for_client (per connection) and drops on
