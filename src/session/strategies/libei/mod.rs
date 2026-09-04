@@ -103,8 +103,24 @@ impl LibeiStrategy {
     /// `LibeiSessionHandleImpl` to delegate input calls without an extra
     /// trait-object hop. The trait's `create_session` delegates here and
     /// coerces the result.
-    pub async fn create_session_concrete(&self) -> Result<Arc<LibeiSessionHandleImpl>> {
-        info!("libei: Creating session with Portal RemoteDesktop + EIS");
+    ///
+    /// `attach_screencast`: whether to attach ScreenCast video to the
+    /// RemoteDesktop session (upstream #51). The standalone libei strategy
+    /// wants this — one portal session, one dialog, video+input under one
+    /// restore token. Composing strategies that provide their OWN video
+    /// (kwin-virtual: zkde-screencast compositor-side virtual output) must
+    /// pass `false`: xdg-desktop-portal-kde terminates the ENTIRE
+    /// RemoteDesktop session when its attached ScreenCast has no monitors
+    /// to capture — and kwin-virtual disables the physical output by design
+    /// while its virtual output is live, so the attach would kill the EIS
+    /// input path 1-2 seconds into every connection (observed live:
+    /// Session.Closed immediately after the output guard engages, then
+    /// "ConnectToEIS failed" and dead keyboard/mouse for the client).
+    pub async fn create_session_concrete(&self, attach_screencast: bool) -> Result<Arc<LibeiSessionHandleImpl>> {
+        info!(
+            attach_screencast,
+            "libei: Creating session with Portal RemoteDesktop + EIS"
+        );
 
         let remote_desktop = RemoteDesktop::new()
             .await
@@ -161,31 +177,36 @@ impl LibeiStrategy {
         // under the same restore token as input. Replaces the former standalone
         // ScreenCast session (server/mod.rs) that hardcoded PersistMode::DoNot and
         // re-prompted for screen sharing on every start.
-        let screencast = Screencast::new()
-            .await
-            .context("Failed to create ScreenCast proxy for libei video")?;
-        let cursor_mode = {
-            let available = screencast
-                .available_cursor_modes()
+        //
+        // SKIPPED for composing strategies (attach_screencast=false): see the
+        // create_session_concrete doc comment — an attached ScreenCast that loses
+        // its monitor kills the whole RemoteDesktop session on xdp-kde.
+        let mut screencast: Option<Screencast> = None;
+        if attach_screencast {
+            let sc = Screencast::new()
                 .await
-                .context("Failed to query ScreenCast cursor modes")?;
-            if available.contains(CursorMode::Metadata) {
-                CursorMode::Metadata
-            } else if available.contains(CursorMode::Embedded) {
-                CursorMode::Embedded
-            } else {
-                CursorMode::Hidden
-            }
-        };
-        // Persistence for the combined session is owned once, at the
-        // RemoteDesktop::select_devices() call above — this attached
-        // ScreenCast inherits it and must not set its own persist_mode.
-        // Newer xdg-desktop-portal-kde builds (6.6.4, Fedora 44 beta) reject
-        // a redundant persist_mode here with "Remote desktop sessions cannot
-        // persist"; 6.6.3 (the version #51 was fixed against) tolerated it.
-        use ashpd::desktop::screencast::SelectSourcesOptions;
-        screencast
-            .select_sources(
+                .context("Failed to create ScreenCast proxy for libei video")?;
+            let cursor_mode = {
+                let available = sc
+                    .available_cursor_modes()
+                    .await
+                    .context("Failed to query ScreenCast cursor modes")?;
+                if available.contains(CursorMode::Metadata) {
+                    CursorMode::Metadata
+                } else if available.contains(CursorMode::Embedded) {
+                    CursorMode::Embedded
+                } else {
+                    CursorMode::Hidden
+                }
+            };
+            // Persistence for the combined session is owned once, at the
+            // RemoteDesktop::select_devices() call above — this attached
+            // ScreenCast inherits it and must not set its own persist_mode.
+            // Newer xdg-desktop-portal-kde builds (6.6.4, Fedora 44 beta) reject
+            // a redundant persist_mode here with "Remote desktop sessions cannot
+            // persist"; 6.6.3 (the version #51 was fixed against) tolerated it.
+            use ashpd::desktop::screencast::SelectSourcesOptions;
+            sc.select_sources(
                 &session,
                 SelectSourcesOptions::default()
                     .set_cursor_mode(cursor_mode)
@@ -194,6 +215,8 @@ impl LibeiStrategy {
             )
             .await
             .context("Failed to select ScreenCast sources on libei session")?;
+            screencast = Some(sc);
+        }
 
         // Without a restore token the portal shows a permission dialog here and
         // Start() does not return until someone answers it. The RDP listener is
@@ -233,47 +256,58 @@ impl LibeiStrategy {
 
         info!("libei: Portal session ready (EIS deferred until client connects)");
 
-        // Video streams from the same session (ScreenCast sources selected above).
-        let video_streams: Vec<StreamInfo> = selected
-            .streams()
-            .iter()
-            .map(|s| {
-                let (w, h) = s.size().unwrap_or((0, 0));
-                let (x, y) = s.position().unwrap_or((0, 0));
-                StreamInfo {
-                    node_id: s.pipe_wire_node_id(),
-                    width: w as u32,
-                    height: h as u32,
-                    position_x: x,
-                    position_y: y,
-                }
-            })
-            .collect();
-        if video_streams.is_empty() {
-            return Err(anyhow::anyhow!(
-                "libei: RemoteDesktop session returned no ScreenCast streams"
-            ));
-        }
-        let video_fd = {
-            use std::os::fd::AsRawFd;
-            let fd = screencast
-                .open_pipe_wire_remote(
-                    &session,
-                    ashpd::desktop::screencast::OpenPipeWireRemoteOptions::default(),
-                )
-                .await
-                .context("Failed to open PipeWire remote for libei video")?;
-            let raw = fd.as_raw_fd();
-            // Ownership transfers to the display pipeline downstream (from_raw_fd);
-            // forget here so this scope does not close it.
-            std::mem::forget(fd);
-            raw
+        // Video streams + fd: only for handles that attached ScreenCast.
+        // Input-only handles (kwin-virtual composition) report none — the
+        // composing strategy provides video itself.
+        let (video_streams, video_fd): (Vec<StreamInfo>, Option<i32>) = if screencast.is_some() {
+            let streams: Vec<StreamInfo> = selected
+                .streams()
+                .iter()
+                .map(|s| {
+                    let (w, h) = s.size().unwrap_or((0, 0));
+                    let (x, y) = s.position().unwrap_or((0, 0));
+                    StreamInfo {
+                        node_id: s.pipe_wire_node_id(),
+                        width: w as u32,
+                        height: h as u32,
+                        position_x: x,
+                        position_y: y,
+                    }
+                })
+                .collect();
+            if streams.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "libei: RemoteDesktop session returned no ScreenCast streams"
+                ));
+            }
+            let fd = {
+                use std::os::fd::AsRawFd;
+                let sc = screencast.as_ref().expect("checked is_some above");
+                let fd = sc
+                    .open_pipe_wire_remote(
+                        &session,
+                        ashpd::desktop::screencast::OpenPipeWireRemoteOptions::default(),
+                    )
+                    .await
+                    .context("Failed to open PipeWire remote for libei video")?;
+                let raw = fd.as_raw_fd();
+                // Ownership transfers to the display pipeline downstream (from_raw_fd);
+                // forget here so this scope does not close it.
+                std::mem::forget(fd);
+                raw
+            };
+            info!(
+                fd,
+                streams = streams.len(),
+                "libei: acquired video via ScreenCast on the RemoteDesktop session"
+            );
+            (streams, Some(fd))
+        } else {
+            info!(
+                "libei: input-only session (no ScreenCast attached — the composing strategy provides video)"
+            );
+            (Vec::new(), None)
         };
-        info!(
-            fd = video_fd,
-            streams = video_streams.len(),
-            "libei: acquired video via ScreenCast on the RemoteDesktop session"
-        );
 
         let portal_session = Arc::new(RwLock::new(session));
 
@@ -361,7 +395,8 @@ impl SessionStrategy for LibeiStrategy {
     }
 
     async fn create_session(&self) -> Result<Arc<dyn SessionHandle>> {
-        let handle = self.create_session_concrete().await?;
+        // The STANDALONE libei strategy attaches ScreenCast (#51 behavior).
+        let handle = self.create_session_concrete(true).await?;
         Ok(handle as Arc<dyn SessionHandle>)
     }
 
@@ -397,10 +432,12 @@ pub struct LibeiSessionHandleImpl {
     seats: Arc<Mutex<HashMap<ei::Seat, SeatData>>>,
     /// Input devices (populated by event loop after activation)
     devices: Arc<EisDevices>,
-    /// Video streams from ScreenCast on this same RemoteDesktop session (#51)
+    /// Video streams from ScreenCast on this same RemoteDesktop session (#51).
+    /// Empty for input-only handles (composing strategies).
     streams: Arc<Mutex<Vec<StreamInfo>>>,
-    /// PipeWire FD for the video streams, opened on this session (#51)
-    video_fd: std::os::fd::RawFd,
+    /// PipeWire FD for the video streams, opened on this session (#51).
+    /// None for input-only handles.
+    video_fd: Option<std::os::fd::RawFd>,
     health_reporter: std::sync::OnceLock<HealthReporter>,
     /// Whether EIS has been activated (ConnectToEIS called)
     eis_activated: Arc<std::sync::atomic::AtomicBool>,
@@ -841,7 +878,21 @@ impl SessionHandle for LibeiSessionHandleImpl {
 
     fn pipewire_access(&self) -> PipeWireAccess {
         // Video is acquired via ScreenCast on this same RemoteDesktop session (#51).
-        PipeWireAccess::FileDescriptor(self.video_fd)
+        // Input-only handles (kwin-virtual composition) carry no fd — the
+        // composing strategy provides video through its own source, and THIS
+        // handle is never consulted for video (the composed outer handle
+        // implements pipewire_access itself). Reachable only via the
+        // standalone strategy path, where the fd is always Some.
+        match self.video_fd {
+            Some(fd) => PipeWireAccess::FileDescriptor(fd),
+            None => {
+                warn!("libei: pipewire_access on an input-only handle — falling back to a daemon connection");
+                match crate::mutter::connect_to_pipewire_daemon() {
+                    Ok(fd) => PipeWireAccess::FileDescriptor(fd),
+                    Err(_) => PipeWireAccess::NodeId(0),
+                }
+            }
+        }
     }
 
     fn streams(&self) -> Vec<StreamInfo> {
