@@ -1,0 +1,155 @@
+# Release workflow: build on tag push, publish artifacts as a GitHub Release.
+#
+# Trigger: push a tag matching v<base>-hyperv.<n> where <base> equals the
+# Cargo.toml version (e.g. v1.4.4-hyperv.1 while Cargo.toml says 1.4.4).
+# The tag guard below enforces this; a mismatched tag fails fast.
+#
+# The release is created as a DRAFT — review assets/notes, then publish.
+# See RELEASING.md for the full checklist.
+
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build & publish release artifacts (x86_64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout (tagged commit)
+        uses: actions/checkout@v4
+
+      - name: Tag guard — tag base must match Cargo.toml version
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          CARGO_VER="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)"
+          # Accept v<base> or v<base>-hyperv.<n>
+          BASE="${TAG#v}"
+          BASE="${BASE%-hyperv.*}"
+          if [[ "$BASE" != "$CARGO_VER" ]]; then
+            echo "::error::tag '$TAG' base '$BASE' != Cargo.toml version '$CARGO_VER'" >&2
+            exit 1
+          fi
+          # Package version for artifact names: v1.4.4-hyperv.1 -> 1.4.4-hyperv1
+          # (tag uses a dot, deb/tarball artifact names use none).
+          if [[ "${TAG#v}" == *"-hyperv."* ]]; then
+            N="${TAG#*-hyperv.}"
+            PKG_VERSION="${BASE}-hyperv${N}"
+          else
+            PKG_VERSION="${BASE}"
+          fi
+          # Export for later steps AND echo the value for this step's log.
+          echo "PKG_VERSION=${PKG_VERSION}" >> "$GITHUB_ENV"
+          echo "tag OK: base=$BASE pkg=${PKG_VERSION}"
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang cmake libdbus-1-dev libfuse3-dev libpam0g-dev \
+            libpipewire-0.3-dev libspa-0.2-dev libssl-dev libva-dev \
+            libwayland-dev libxkbcommon-dev nasm pkgconf libx264-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .
+          prefix-key: "release-x86_64"
+
+      - name: Build release artifacts
+        env:
+          LAMCO_RELEASE_VERSION: ${{ env.PKG_VERSION }}
+        run: |
+          # Same script local builds use (scripts/build-release-artifacts.sh).
+          bash scripts/build-release-artifacts.sh --version "$PKG_VERSION"
+
+      - name: Smoke test — binaries run and report versions
+        run: |
+          set -euo pipefail
+          ./target/release/lamco-rdp-server --version
+          # The GUI needs a display server; on a headless runner it exits
+          # with the "GUI Unavailable" notice and code 1 — that proves the
+          # binary runs and its logic works. Only accept exit codes 0 and 1,
+          # and require the CLI banner in the output either way.
+          gui_out="$(./target/release/lamco-rdp-server-gui --help 2>&1)" && rc=0 || rc=$?
+          echo "$gui_out" | head -4
+          if [[ "$rc" -ne 0 && "$rc" -ne 1 ]]; then
+            echo "::error::GUI binary exited with unexpected code $rc" >&2
+            exit 1
+          fi
+          echo "$gui_out" | grep -q "GUI Unavailable\|lamco-rdp-server-gui" \
+            || { echo "::error::GUI binary produced no recognizable output" >&2; exit 1; }
+          echo "GUI binary OK (headless exit $rc)"
+
+      - name: Smoke test — --licenses contains the Cisco binary license
+        run: |
+          set -euo pipefail
+          out="$(./target/release/lamco-rdp-server --licenses)" || true
+          if printf '%s' "$out" | grep -q "Cisco-Provided Binary of OpenH264"; then
+            echo "OpenH264 binary license text present in --licenses output"
+          else
+            echo "::warning::--licenses output did not contain the Cisco binary license header (check third_party.rs)"
+          fi
+
+      - name: Extract release notes from CHANGELOG.md
+        id: notes
+        run: |
+          set -euo pipefail
+          # CHANGELOG.md headings match the tag minus the leading v:
+          #   tag v1.4.4-hyperv.1  ->  ## [1.4.4-hyperv.1]
+          # Also accept a bare base heading (## [1.4.4]) for unsuffixed tags.
+          # NOTE: index() literal matching — the [brackets] in headings would
+          # otherwise be parsed as regex character classes by awk.
+          TAG="${GITHUB_REF_NAME}"
+          SECTION="${TAG#v}"
+          BASE="${SECTION%-hyperv.*}"
+          BODY=""
+          for head in "[${SECTION}]" "[${BASE}]"; do
+            if awk -v h="${head}" '
+              index($0, "## " h) == 1 { inside=1; next }
+              inside && index($0, "## [") == 1 { inside=0 }
+              inside { print }
+            ' CHANGELOG.md | grep -q .; then
+              BODY="$(awk -v h="${head}" '
+                index($0, "## " h) == 1 { inside=1; next }
+                inside && index($0, "## [") == 1 { inside=0 }
+                inside { print }
+              ' CHANGELOG.md)"
+              break
+            fi
+          done
+          if [[ -z "$BODY" ]]; then
+            # Fallback: recent commits
+            BODY="$(git log --oneline -10 --no-merges | sed 's/^/- /')"
+            BODY="No CHANGELOG.md section found for this release. Recent commits:$BODY"
+          fi
+          {
+            echo "body<<EOF_RELEASE_NOTES"
+            echo "$BODY"
+            echo "EOF_RELEASE_NOTES"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Publish draft GitHub Release with artifacts
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          name: ${{ env.PKG_VERSION }}
+          body: ${{ steps.notes.outputs.body }}
+          files: |
+            dist/release/*.deb
+            dist/release/*.tar.gz
+            dist/release/SHA256SUMS.txt
