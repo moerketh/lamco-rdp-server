@@ -51,6 +51,18 @@ BUILD_PROFILE_OVERRIDES=(
 OPENH264_LICENSE_SHA256="bd9f363c5ea11ef723d0304cddacb5273c43c0e1194097c7a045d05273635418"
 LICENSE_FILE="licenses/OpenH264-BINARY_LICENSE.txt"
 
+# The systemd user unit shipped in the package. Upstream v1.4.5 renamed the
+# user unit to app-io.lamco.rdp-server.service so xdg-desktop-portal's
+# sd_pid_get_user_unit() app-id derivation resolves io.lamco.rdp-server
+# (portal restore-token scoping keys on it); older trees kept the
+# package-name unit. Prefer the app- unit, fall back to the old name so the
+# script keeps working on pre-rename checkouts.
+if [[ -f "$REPO_ROOT/packaging/systemd/app-io.lamco.rdp-server.service" ]]; then
+  LAMCO_USER_UNIT="$REPO_ROOT/packaging/systemd/app-io.lamco.rdp-server.service"
+else
+  LAMCO_USER_UNIT="$REPO_ROOT/packaging/systemd/lamco-rdp-server.service"
+fi
+
 usage() {
   cat <<EOF
 Usage: $0 [--version <ver>] [--features <csv>] [--skip-build] [--skip-deb] [--skip-tarball] [--audit-secrets]
@@ -328,7 +340,7 @@ stage_install_set() {  # $1 = destination root
   local dest="$1"
   install -Dm755 target/release/lamco-rdp-server     "$dest/usr/bin/lamco-rdp-server"
   install -Dm755 target/release/lamco-rdp-server-gui "$dest/usr/bin/lamco-rdp-server-gui"
-  install -Dm644 packaging/systemd/lamco-rdp-server.service "$dest/usr/lib/systemd/user/lamco-rdp-server.service"
+  install -Dm644 "$LAMCO_USER_UNIT" "$dest/usr/lib/systemd/user/${LAMCO_USER_UNIT##*/}"
   install -Dm644 packaging/dbus/io.lamco.RdpServer.service "$dest/usr/share/dbus-1/services/io.lamco.RdpServer.service"
   install -Dm644 packaging/dbus/io.lamco.RdpServer.System.conf "$dest/usr/share/dbus-1/system.d/io.lamco.RdpServer.System.conf"
   install -Dm644 packaging/polkit/io.lamco.RdpServer.policy "$dest/usr/share/polkit-1/actions/io.lamco.RdpServer.policy"
@@ -434,7 +446,7 @@ build_tarball() {
   mv "$stage/$tar_root/root/usr/bin" "$stage/$tar_root/bin"
   mv "$stage/$tar_root/root/usr/lib" "$stage/$tar_root/lib" 2>/dev/null || true
   mkdir -p "$stage/$tar_root/lib/systemd/user"
-  install -Dm644 packaging/systemd/lamco-rdp-server.service "$stage/$tar_root/lib/systemd/user/lamco-rdp-server.service"
+  install -Dm644 "$LAMCO_USER_UNIT" "$stage/$tar_root/lib/systemd/user/${LAMCO_USER_UNIT##*/}"
   mv "$stage/$tar_root/root/etc" "$stage/$tar_root/etc"
   mkdir -p "$stage/$tar_root/share"
   mv "$stage/$tar_root/root/usr/share/"* "$stage/$tar_root/share/" 2>/dev/null || true
