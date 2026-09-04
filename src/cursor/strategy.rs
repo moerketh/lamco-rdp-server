@@ -569,6 +569,12 @@ mod tests {
             auto_mode: false,
             predictive_latency_threshold_ms: 42,
             cursor_update_fps: 30,
+            // Console-cursor theme fields are consumed by the display
+            // handler's CursorThemeManager, not the client-cursor strategy;
+            // defaults are fine here.
+            session_scoped_cursor_theme: false,
+            console_cursor_theme: String::new(),
+            transparent_cursor_theme: String::new(),
             predictor: crate::config::types::CursorPredictorConfig {
                 history_size: 3,
                 lookahead_ms: 10.0,

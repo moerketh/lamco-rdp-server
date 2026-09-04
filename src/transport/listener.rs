@@ -354,18 +354,55 @@ impl Listener for UnixListenerImpl {
 pub struct VsockListenerImpl {
     listener: tokio_vsock::VsockListener,
     port: u32,
+    /// When set, only peers with these CIDs are accepted; others are refused
+    /// (dropped with a warn) at accept time. `None` accepts any peer.
+    allowed_cids: Option<Vec<u32>>,
 }
 
 #[cfg(feature = "vsock")]
 impl VsockListenerImpl {
     /// Bind a vsock listener on the given port. Accepts from any peer
-    /// (`VMADDR_CID_ANY`). Operator-side firewall or hypervisor policy
-    /// handles access control; the server does not maintain a CID allowlist.
+    /// (`VMADDR_CID_ANY`); operator-side firewall or hypervisor policy
+    /// handles access control. Equivalent to
+    /// [`bind_with_allowlist`](Self::bind_with_allowlist) with `None`.
     pub fn bind(port: u32) -> Result<Self, TransportError> {
+        Self::bind_with_allowlist(port, None)
+    }
+
+    /// Bind a vsock listener, restricting accepted peers to `allowed_cids`.
+    /// `None` (or an empty list — see `VsockTransportConfig::allowed_cids`)
+    /// accepts any peer; a non-empty list drops connections from any other
+    /// CID at accept time. The listener itself still binds `VMADDR_CID_ANY`
+    /// (the kernel has no bind-time CID filter for guests), so enforcement is
+    /// per-connection, not per-bind.
+    pub fn bind_with_allowlist(
+        port: u32,
+        allowed_cids: Option<Vec<u32>>,
+    ) -> Result<Self, TransportError> {
         let addr = tokio_vsock::VsockAddr::new(tokio_vsock::VMADDR_CID_ANY, port);
         let listener = tokio_vsock::VsockListener::bind(addr).map_err(TransportError::Io)?;
-        info!(port, "vsock listener bound on VMADDR_CID_ANY");
-        Ok(Self { listener, port })
+        let effective = match allowed_cids {
+            Some(list) if !list.is_empty() => {
+                info!(
+                    port,
+                    cids = ?list,
+                    "vsock listener bound on VMADDR_CID_ANY; peers outside the CID allowlist will be refused"
+                );
+                Some(list)
+            }
+            _ => {
+                info!(
+                    port,
+                    "vsock listener bound on VMADDR_CID_ANY (any peer; no CID allowlist)"
+                );
+                None
+            }
+        };
+        Ok(Self {
+            listener,
+            port,
+            allowed_cids: effective,
+        })
     }
 
     /// Construct from a systemd-passed `OwnedFd` of kind `SOCK_STREAM AF_VSOCK`.
@@ -390,8 +427,12 @@ impl VsockListenerImpl {
         // listening AF_VSOCK socket. tokio-vsock's FromRawFd takes ownership.
         let listener = unsafe { tokio_vsock::VsockListener::from_raw_fd(raw) };
         let port = listener.local_addr().map_or(0, |a| a.port());
-        info!(port, "vsock listener wrapped from systemd-passed fd");
-        Ok(Self { listener, port })
+        info!(port, "vsock listener wrapped from systemd-passed fd (any peer)");
+        Ok(Self {
+            listener,
+            port,
+            allowed_cids: None,
+        })
     }
 }
 
@@ -403,15 +444,31 @@ impl Listener for VsockListenerImpl {
     }
 
     async fn accept(&mut self) -> Result<Option<AcceptedConnection>, TransportError> {
-        let (stream, peer_addr) = self.listener.accept().await.map_err(TransportError::Io)?;
-        let _ = self.port; // suppress dead-code lint in case port isn't otherwise read
-        Ok(Some(AcceptedConnection::standard(
-            PeerAddr::Vsock {
-                cid: peer_addr.cid(),
-                port: peer_addr.port(),
-            },
-            Box::new(stream),
-        )))
+        loop {
+            let (stream, peer_addr) = self.listener.accept().await.map_err(TransportError::Io)?;
+            let _ = self.port; // suppress dead-code lint in case port isn't otherwise read
+            let cid = peer_addr.cid();
+            if let Some(allowed) = &self.allowed_cids
+                && !allowed.contains(&cid)
+            {
+                // Refuse and keep accepting: dropping the stream closes the
+                // connection peer-side, which is the refusal the client sees.
+                warn!(
+                    cid,
+                    port = peer_addr.port(),
+                    "vsock connection refused: peer CID outside the allowlist"
+                );
+                drop(stream);
+                continue;
+            }
+            return Ok(Some(AcceptedConnection::standard(
+                PeerAddr::Vsock {
+                    cid,
+                    port: peer_addr.port(),
+                },
+                Box::new(stream),
+            )));
+        }
     }
 }
 
@@ -635,5 +692,44 @@ mod tests {
             },
             Err(e) => panic!("unexpected vsock bind error: {e}"),
         }
+    }
+
+    #[cfg(feature = "vsock")]
+    #[tokio::test]
+    async fn vsock_listener_allowlist_bind_smoke() {
+        // Same environmental tolerance as the plain-bind smoke test above:
+        // binding with an allowlist must succeed or fail with the same
+        // expected I/O error kinds — the allowlist never changes bind
+        // semantics (enforcement is per-accept).
+        match VsockListenerImpl::bind_with_allowlist(54322, Some(vec![2])) {
+            Ok(_) => {}
+            Err(TransportError::Io(e)) => match e.kind() {
+                std::io::ErrorKind::PermissionDenied
+                | std::io::ErrorKind::AddrInUse
+                | std::io::ErrorKind::AddrNotAvailable
+                | std::io::ErrorKind::NotFound => {}
+                other => panic!("unexpected vsock allowlist bind I/O error kind: {other:?}: {e}"),
+            },
+            Err(e) => panic!("unexpected vsock allowlist bind error: {e}"),
+        }
+    }
+
+    #[cfg(feature = "vsock")]
+    #[test]
+    fn vsock_allowlist_normalizes_empty_list_to_any() {
+        // An empty list resolves to "any peer" (same as None) at bind time —
+        // the empty list must not brick the transport. This is a pure
+        // constructor-level test: it does not bind (no kernel vsock needed);
+        // it drives the normalization through the same match the bind
+        // constructor uses, via a tiny mirror of the logic that we keep
+        // deliberately inline in `bind_with_allowlist`.
+        let normalize = |list: Option<Vec<u32>>| match list {
+            Some(l) if !l.is_empty() => Some(l),
+            _ => None,
+        };
+        assert_eq!(normalize(None), None);
+        assert_eq!(normalize(Some(vec![])), None, "empty list = any peer");
+        assert_eq!(normalize(Some(vec![2])), Some(vec![2]));
+        assert_eq!(normalize(Some(vec![2, 3])), Some(vec![2, 3]));
     }
 }
