@@ -156,6 +156,25 @@ impl KwinVirtualSessionHandle {
             "[kwin-virtual] virtual output '{}' @ {width}x{height} streaming on node {node_id}",
             OUTPUT_NAME
         );
+        // Ensure the fresh output is ENABLED — after EVERY create, not just
+        // the first (a resize recreate can be born disabled exactly like the
+        // initial one; see establish_for_client). A disabled output never
+        // gets rendered into: the screencast buffers stay untouched
+        // (all-zero, alpha 0x00) — the black-screen signature. Enable is
+        // idempotent.
+        let enabled =
+            tokio::task::spawn_blocking(move || enable_output(VIRTUAL_OUTPUT_KSCREEN_NAME))
+                .await
+                .unwrap_or(false);
+        if enabled {
+            info!("[kwin-virtual] virtual output '{}' enabled", OUTPUT_NAME);
+        } else {
+            warn!(
+                "[kwin-virtual] virtual output '{}' could NOT be enabled — \
+                 session may show a black screen",
+                OUTPUT_NAME
+            );
+        }
         Ok(node_id)
     }
 }
@@ -246,14 +265,40 @@ impl SessionHandle for KwinVirtualSessionHandle {
         // same size), else a sensible default. `request_initial_size` follows
         // immediately after with the client's actual request and resizes via
         // resize_capture_source, so this initial size only needs to be valid.
-        let (w, h) = {
+        // IDEMPOTENT: REUSE a live stream instead of recreating it. Every
+        // accepted socket runs this -- including vmconnect's throwaway
+        // pre-connect probes (connect, zero bytes, gone), which arrive in
+        // pairs right before the real client. Each recreate destroys the
+        // current virtual output before the new one exists, and with the
+        // physical output already disabled by the layout guard that
+        // destroy-to-created window leaves ZERO enabled outputs --
+        // plasmashell reacts by switching to its placeholder screen and
+        // (field-observed 2026-09-04) never re-latches onto the replacement
+        // output, so the session streams untouched all-zero buffers
+        // forever: black screen on a fully healthy pipeline. Probes must
+        // not churn the desktop. The stream is recreated only after
+        // release_after_client (per-connection lifecycle) or when
+        // resize_capture_source changes the size.
+        {
             let s = self.streams.read().await;
-            s.first()
-                .map_or((1920, 1200), |st| (st.width as u16, st.height as u16))
-        };
+            if let Some(first) = s.first() {
+                info!(
+                    "[kwin-virtual] reusing live stream (node {}, {}x{})",
+                    first.node_id, first.width, first.height
+                );
+                return Ok((s.clone(), false));
+            }
+        }
 
-        // CREATE the virtual output FIRST, then make sure it is ENABLED,
-        // then disable the physical one. Order matters twice over:
+        // Fresh establish (no live stream): sensible default size.
+        // `request_initial_size` follows immediately with the client's
+        // actual request and resizes via resize_capture_source, so this
+        // initial size only needs to be valid.
+        let (w, h) = (1920u16, 1200u16);
+
+        // CREATE the virtual output FIRST (recreate_stream also ensures it
+        // is ENABLED), then disable the physical one. Order matters twice
+        // over:
         //
         // 1. zkde's stream_virtual_output can create the output in a
         //    DISABLED state — notably when a previous manual
@@ -268,12 +313,9 @@ impl SessionHandle for KwinVirtualSessionHandle {
         //    (same guard, for the born-enabled case before the virtual is
         //    up).
         //
-        // So: create → explicitly enable (position/mode are already right
-        // from creation; enable is idempotent) → disable physical.
+        // So: create (→ enabled inside recreate_stream; position/mode
+        // are already right from creation) → disable physical.
         let _node = self.recreate_stream(w, h).await?;
-        let _ = tokio::task::spawn_blocking(move || enable_output(VIRTUAL_OUTPUT_KSCREEN_NAME))
-            .await
-            .unwrap_or(false);
 
         if self.layout_guard.read().await.is_none() {
             let guard = OutputLayoutGuard::engage().await;
@@ -305,9 +347,9 @@ impl SessionHandle for KwinVirtualSessionHandle {
         // this is the whole point of the strategy (no DRM mode list).
         //
         // Short-circuit when the size already matches: establish_for_client
-        // creates the stream and request_initial_size follows immediately
-        // with the client's request — recreating at the SAME size churns
-        // the output (close+create+rebind) on every connect for nothing.
+        // creates (or reuses) the stream and request_initial_size follows
+        // immediately with the client's request — recreating at the SAME
+        // size would swap the output (close+create+rebind) for nothing.
         {
             let cur = self.streams.read().await;
             if let Some(s) = cur.first() {
@@ -422,6 +464,15 @@ fn wayland_thread(rx: std::sync::mpsc::Receiver<WlCommand>) {
             ZkdeScreencastStreamUnstableV1,
             Option<tokio::sync::oneshot::Sender<Result<u32, String>>>,
         )>,
+        /// The PREVIOUS stream's proxy, kept alive while its replacement is
+        /// being created (create-before-close). Destroying it only AFTER the
+        /// replacement's `created` event guarantees the enabled-output set
+        /// never empties mid-session — a zero-outputs window sends
+        /// plasmashell to its placeholder screen (field-observed: it does
+        /// not re-latch — black screen). Restored as the active stream when
+        /// the replacement fails, so the caller's "keep the current
+        /// stream" fallback stays truthful.
+        retiring: Option<ZkdeScreencastStreamUnstableV1>,
         /// Stream request state machine (conclusive-event bookkeeping).
         stream_sm: StreamRequestMachine,
     }
@@ -495,9 +546,44 @@ fn wayland_thread(rx: std::sync::mpsc::Receiver<WlCommand>) {
             // stream destruction; dropping the proxy early leaves a zombie
             // output that wedges all reconnects).
             if let Some(outcome) = state.stream_sm.transition(&event) {
+                // Deliver the reply, then finalize the swap: the retiring
+                // stream is destroyed only now (replacement live) or handed
+                // back (replacement failed).
                 if let Some(pending) = state.pending.as_mut() {
                     if let Some(reply) = pending.1.take() {
-                        let _ = reply.send(outcome);
+                        let _ = reply.send(outcome.clone());
+                    }
+                }
+                match &outcome {
+                    Ok(_) => {
+                        // Replacement is live: destroy the previous stream
+                        // NOW — this close removes the old virtual output,
+                        // and it happens only AFTER the new one exists, so
+                        // the enabled-output set never empties mid-session
+                        // (a zero-outputs window sends plasmashell to its
+                        // placeholder screen — field-observed to never
+                        // re-latch: black screen). The main loop flushes
+                        // before its next poll, which delivers the close
+                        // promptly enough for a removal.
+                        if let Some(old) = state.retiring.take() {
+                            old.close();
+                            info!("[kwin-virtual] previous stream destroyed after swap");
+                        }
+                    }
+                    Err(_) => {
+                        // Replacement failed: hand the previous stream back
+                        // as the active one — its output never died, so the
+                        // session keeps working and the caller's "keep the
+                        // current stream" fallback stays truthful. The
+                        // failed proxy is simply dropped — `Failed` means
+                        // no output was ever created, so nothing lingers
+                        // server-side.
+                        if let Some(old) = state.retiring.take() {
+                            state.pending = Some((old, None));
+                            info!(
+                                "[kwin-virtual] replacement failed — previous stream restored"
+                            );
+                        }
                     }
                 }
             }
@@ -538,6 +624,7 @@ fn wayland_thread(rx: std::sync::mpsc::Receiver<WlCommand>) {
     let mut state = State {
         screencast: None,
         pending: None,
+        retiring: None,
         stream_sm: StreamRequestMachine::new(),
     };
 
@@ -626,13 +713,25 @@ fn wayland_thread(rx: std::sync::mpsc::Receiver<WlCommand>) {
                         let _ = reply.send(Err("zkde_screencast global not bound".into()));
                         continue;
                     };
-                    // One stream at a time: destroy any previous stream (the
-                    // proxy is RETAINED here even after the request concluded,
-                    // because KWin keeps the virtual output alive until the
-                    // stream object is destroyed — dropping it early leaves a
-                    // zombie output that wedges all reconnects).
+                    // CREATE-BEFORE-CLOSE: the previous stream (if any)
+                    // moves to `retiring` — kept alive, NOT destroyed yet —
+                    // so the enabled-output set never empties while the
+                    // replacement is being created (see `retiring`). It is
+                    // destroyed only after the replacement's `created`
+                    // event, or restored if the replacement fails.
+                    //
+                    // An abandoned swap (a create whose reply timed out
+                    // against a wedged KWin, followed by another create) is
+                    // cleaned up here: destroy the orphaned previous proxy
+                    // so it cannot linger as a zombie output.
+                    if let Some(orphan) = state.retiring.take() {
+                        warn!(
+                            "[kwin-virtual] destroying orphaned stream left by an abandoned swap"
+                        );
+                        orphan.close();
+                    }
                     if let Some((prev, _)) = state.pending.take() {
-                        prev.close();
+                        state.retiring = Some(prev);
                     }
                     state.stream_sm.reset();
                     let stream = screencast.stream_virtual_output(
@@ -657,9 +756,18 @@ fn wayland_thread(rx: std::sync::mpsc::Receiver<WlCommand>) {
                     // The ONLY place the stream is destroyed — this is what
                     // makes KWin remove the virtual output (the proxy was
                     // retained past the concluded request for exactly this
-                    // call).
+                    // call). A mid-swap retirement goes too: release means
+                    // NO virtual output may survive.
+                    let mut destroyed = false;
                     if let Some((stream, _)) = state.pending.take() {
                         stream.close();
+                        destroyed = true;
+                    }
+                    if let Some(old) = state.retiring.take() {
+                        old.close();
+                        destroyed = true;
+                    }
+                    if destroyed {
                         state.stream_sm.reset();
                         if let Err(e) = conn.flush() {
                             warn!("[kwin-virtual] flush failed: {e}");
@@ -925,12 +1033,26 @@ fn disable_output(name: &str) -> bool {
 }
 
 fn enable_output(name: &str) -> bool {
-    std::process::Command::new("kscreen-doctor")
+    match std::process::Command::new("kscreen-doctor")
         .arg(format!("output.{name}.enable"))
         .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    {
+        Ok(o) if o.status.success() => true,
+        Ok(o) => {
+            // kscreen-doctor prints its locale nag to stdout; the actual
+            // error is the last stderr line.
+            let err = String::from_utf8_lossy(&o.stderr);
+            let err = err.lines().last().unwrap_or("").trim();
+            warn!("[kwin-virtual] kscreen-doctor failed to enable '{name}': {err}");
+            false
+        }
+        Err(e) => {
+            warn!("[kwin-virtual] could not run kscreen-doctor: {e}");
+            false
+        }
+    }
 }
 
 /// Session strategy: KWin zkde-screencast virtual output.
