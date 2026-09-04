@@ -4,7 +4,66 @@ Quick reference for installing lamco-rdp-server on various Linux distributions.
 
 ---
 
-## Flatpak (Universal - Recommended)
+## GitHub Releases (Recommended for this fork)
+
+Prebuilt x86_64 packages are attached to each release on
+[moerketh/lamco-rdp-server/releases](https://github.com/moerketh/lamco-rdp-server/releases).
+Two formats are provided; pick one.
+
+### Debian / Ubuntu / Parrot (`.deb`)
+
+```bash
+# Download the .deb from the release page, then:
+sudo apt-get install -y ./lamco-rdp-server_1.4.4-hyperv1_amd64.deb
+
+# Verify checksums (SHA256SUMS.txt from the same release)
+sha256sum -c SHA256SUMS.txt
+```
+
+This installs both binaries (`/usr/bin/lamco-rdp-server`,
+`/usr/bin/lamco-rdp-server-gui`), the systemd user unit, desktop entry,
+icons, D-Bus service, and docs. apt resolves runtime dependencies
+automatically.
+
+### Any distro (portable tarball)
+
+```bash
+tar xzf lamco-rdp-server-1.4.4-hyperv1-linux-x86_64.tar.gz
+cd lamco-rdp-server-1.4.4-hyperv1-linux-x86_64
+sudo ./install.sh          # default prefix /usr/local
+```
+
+`install.sh` copies binaries to `/usr/local/bin`, the systemd unit to
+`/usr/local/lib/systemd/user`, icons/desktop/metainfo under `/usr/local/share`,
+and prints the next steps.
+
+### Post-install (both formats)
+
+```bash
+# 1. Generate TLS certificates (one-time)
+sudo lamco-rdp-server-setup-certs
+#    (or: lamco-rdp-server --generate-certs)
+
+# 2. Grant portal permissions (one-time, per user, inside your desktop session)
+lamco-rdp-server --grant-permission
+
+# 3. Enable the user service
+systemctl --user enable --now lamco-rdp-server.service
+```
+
+**Encoders:** the release ships both OpenH264 and x264 AVC420 support.
+OpenH264 loads Cisco's prebuilt binary (`libopenh264-7` on Debian/Ubuntu).
+x264 (2-3x faster, AVC420 only) is used automatically when `libx264`
+(`libx264-164`) is installed; otherwise the server falls back to OpenH264.
+AVC444 always uses OpenH264. See `lamco-rdp-server --licenses` for the
+Cisco OpenH264 binary license terms.
+
+**Hyper-V Enhanced Session** and **WebSocket/RDCleanPath** transports are
+opt-in via `[server.transports]` in the config — absent means off.
+
+---
+
+## Flatpak (Universal)
 
 **Works on:** All Linux distributions with Flatpak support
 
@@ -87,7 +146,7 @@ sudo pacman -S rust nasm openssl pipewire libva
 
 ```bash
 # Clone repository
-git clone https://github.com/lamco-admin/lamco-rdp-server
+git clone https://github.com/moerketh/lamco-rdp-server
 cd lamco-rdp-server
 
 # Build (software encoding)
