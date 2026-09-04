@@ -85,7 +85,7 @@ RestrictSUIDSGID=yes
 RestrictNamespaces=yes
 
 # Network: only TCP (RDP listening) and Unix (D-Bus, Wayland)
-RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_VSOCK
 
 # Syscall filtering: allow system-service baseline plus mount/umount for FUSE clipboard
 SystemCallFilter=@system-service

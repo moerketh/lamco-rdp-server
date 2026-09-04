@@ -80,8 +80,11 @@ RestrictSUIDSGID=yes
 # Restrict namespace creation
 RestrictNamespaces=yes
 
-# Network: only TCP (RDP listening)
-RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# Network: TCP (RDP listening) + AF_VSOCK for the Hyper-V/Linux vsock
+# transport (transport = "vsock"/"both" in config.toml). Without AF_VSOCK
+# here, systemd's seccomp filter makes socket(AF_VSOCK) fail with
+# EAFNOSUPPORT — the vsock listener can never bind inside the sandbox.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_VSOCK
 
 # Syscall filtering: allow system-service baseline plus mount/umount for FUSE clipboard
 SystemCallFilter=@system-service
