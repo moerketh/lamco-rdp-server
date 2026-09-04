@@ -35,6 +35,21 @@ pub(crate) struct WlrDirectDeployment {
     /// Session handle whose lifecycle policy drives per-connect establishment
     /// and per-disconnect release (see `build_handler`).
     session_handle: Arc<dyn SessionHandle>,
+    /// True when the server built a second plain-RDP server for vsock
+    /// (per-transport security routing). Set at deployment construction by
+    /// the server; gates the "vsock + non-plain mode" warning in
+    /// `build_listeners` (the dual path handles vsock by construction) and
+    /// tells `on_server_routed` a swap is meaningful.
+    dual_server_routing: bool,
+    /// The plain server's event sender, captured at construction for
+    /// `on_server_routed` to install into the display handler when a vsock
+    /// connection routes to it. The display handler's event sender is a
+    /// single command channel into the SERVING server; a stale one would
+    /// drop EGFX/cursor/rdpsnd commands into the idle server.
+    plain_event_sender:
+        Option<tokio::sync::mpsc::UnboundedSender<ironrdp_server::ServerEvent>>,
+    primary_event_sender:
+        tokio::sync::mpsc::UnboundedSender<ironrdp_server::ServerEvent>,
 }
 
 impl WlrDirectDeployment {
@@ -46,6 +61,7 @@ impl WlrDirectDeployment {
         pam_validator: Option<Arc<PamValidator>>,
         shutdown_broadcast: Arc<broadcast::Sender<()>>,
         session_handle: Arc<dyn SessionHandle>,
+        servers: &crate::transport::ServerPair,
     ) -> Self {
         Self {
             config,
@@ -55,6 +71,9 @@ impl WlrDirectDeployment {
             pam_validator,
             shutdown_broadcast,
             session_handle,
+            dual_server_routing: servers.has_plain(),
+            plain_event_sender: servers.plain_event_sender().cloned(),
+            primary_event_sender: servers.primary_event_sender().clone(),
         }
     }
 }
@@ -69,6 +88,40 @@ impl AcceptDeployment for WlrDirectDeployment {
         "desktop"
     }
 
+    /// Per-transport routing hook: retarget the display handler's event
+    /// sender at the serving server. The sender is a single command channel
+    /// (EGFX/cursor/rdpsnd/quit) into whichever server serves; leaving it
+    /// pointed at the previous server after a route switch would silently
+    /// drop commands into the idle one. `set_server_event_sender` is async,
+    /// but the handler stores it in a tokio RwLock whose writer side is only
+    /// contended at startup — a blocking write here is the same pattern the
+    /// sync cursor/clipboard paths already use.
+    fn on_server_routed(&mut self, route: crate::transport::ServerRoute) {
+        if !self.dual_server_routing {
+            return;
+        }
+        let sender = match route {
+            crate::transport::ServerRoute::Plain => {
+                debug_assert!(
+                    self.plain_event_sender.is_some(),
+                    "Plain route implies a plain server was built"
+                );
+                self.plain_event_sender.clone()
+            }
+            crate::transport::ServerRoute::Primary => Some(self.primary_event_sender.clone()),
+        };
+        if let Some(sender) = sender {
+            let dh = Arc::clone(&self.display_handler);
+            let set = dh.set_server_event_sender_blocking(sender);
+            if set {
+                tracing::debug!(
+                    route = ?route,
+                    "display handler event sender re-pointed at the serving server"
+                );
+            }
+        }
+    }
+
     async fn build_listeners(&mut self) -> Result<Vec<Box<dyn Listener>>> {
         let transports = self
             .config
@@ -81,6 +134,11 @@ impl AcceptDeployment for WlrDirectDeployment {
         // RDP Security is plaintext and only appropriate on isolated transports;
         // Hyper-V ESM (vsock) conversely *requires* it because VMConnect never does
         // a TLS handshake.
+        //
+        // With per-transport routing (dual server), the vsock warning below
+        // only fires when the deployment did NOT build a plain server — i.e.
+        // security_mode="rdp"-equivalent single-server setups on a non-plain
+        // mode would break vsock; the dual path handles it by construction.
         let security_mode = self.config.security.security_mode.as_str();
         if is_standard_rdp_security(security_mode) {
             if let Some(tcp) = transports.tcp.as_ref()
@@ -93,7 +151,7 @@ impl AcceptDeployment for WlrDirectDeployment {
                      [server.transports.tcp] or bind it to 127.0.0.1."
                 );
             }
-        } else if transports.vsock.is_some() {
+        } else if transports.vsock.is_some() && !self.dual_server_routing {
             tracing::warn!(
                 "vsock transport active (Hyper-V Enhanced Session Mode) but security_mode=\
                  \"{security_mode}\". VMConnect speaks Standard RDP Security and will fail the TLS \
