@@ -116,7 +116,10 @@ impl LibeiStrategy {
     /// input path 1-2 seconds into every connection (observed live:
     /// Session.Closed immediately after the output guard engages, then
     /// "ConnectToEIS failed" and dead keyboard/mouse for the client).
-    pub async fn create_session_concrete(&self, attach_screencast: bool) -> Result<Arc<LibeiSessionHandleImpl>> {
+    pub async fn create_session_concrete(
+        &self,
+        attach_screencast: bool,
+    ) -> Result<Arc<LibeiSessionHandleImpl>> {
         info!(
             attach_screencast,
             "libei: Creating session with Portal RemoteDesktop + EIS"
@@ -886,7 +889,9 @@ impl SessionHandle for LibeiSessionHandleImpl {
         match self.video_fd {
             Some(fd) => PipeWireAccess::FileDescriptor(fd),
             None => {
-                warn!("libei: pipewire_access on an input-only handle — falling back to a daemon connection");
+                warn!(
+                    "libei: pipewire_access on an input-only handle — falling back to a daemon connection"
+                );
                 match crate::mutter::connect_to_pipewire_daemon() {
                     Ok(fd) => PipeWireAccess::FileDescriptor(fd),
                     Err(_) => PipeWireAccess::NodeId(0),

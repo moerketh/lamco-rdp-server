@@ -46,10 +46,8 @@ pub(crate) struct WlrDirectDeployment {
     /// connection routes to it. The display handler's event sender is a
     /// single command channel into the SERVING server; a stale one would
     /// drop EGFX/cursor/rdpsnd commands into the idle server.
-    plain_event_sender:
-        Option<tokio::sync::mpsc::UnboundedSender<ironrdp_server::ServerEvent>>,
-    primary_event_sender:
-        tokio::sync::mpsc::UnboundedSender<ironrdp_server::ServerEvent>,
+    plain_event_sender: Option<tokio::sync::mpsc::UnboundedSender<ironrdp_server::ServerEvent>>,
+    primary_event_sender: tokio::sync::mpsc::UnboundedSender<ironrdp_server::ServerEvent>,
 }
 
 impl WlrDirectDeployment {

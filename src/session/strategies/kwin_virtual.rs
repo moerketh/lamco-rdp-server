@@ -580,9 +580,7 @@ fn wayland_thread(rx: std::sync::mpsc::Receiver<WlCommand>) {
                         // server-side.
                         if let Some(old) = state.retiring.take() {
                             state.pending = Some((old, None));
-                            info!(
-                                "[kwin-virtual] replacement failed — previous stream restored"
-                            );
+                            info!("[kwin-virtual] replacement failed — previous stream restored");
                         }
                     }
                 }

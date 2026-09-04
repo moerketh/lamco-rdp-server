@@ -197,7 +197,9 @@ impl ServerPair {
     /// The primary's ErrorInfo disconnect handle (client-visible graceful
     /// disconnect). `error_info_disconnect_handle` is `&self` on the
     /// RdpServer.
-    pub fn primary_error_info_disconnect_handle(&self) -> ironrdp_server::ErrorInfoDisconnectHandle {
+    pub fn primary_error_info_disconnect_handle(
+        &self,
+    ) -> ironrdp_server::ErrorInfoDisconnectHandle {
         self.primary.error_info_disconnect_handle()
     }
 }
@@ -309,9 +311,7 @@ impl AcceptDispatcher {
                     deployment.on_server_routed(route);
                     let rdp_server = servers.server_for(route);
                     let conn_result = match mode {
-                        AcceptorMode::Standard => {
-                            rdp_server.run_connection(stream).await
-                        }
+                        AcceptorMode::Standard => rdp_server.run_connection(stream).await,
                         AcceptorMode::PreAuthenticated => {
                             // Stream is already TLS-terminated (typically WSS); skip the
                             // IronRDP-managed TLS upgrade. Upstream PR #1281 reshaped this
