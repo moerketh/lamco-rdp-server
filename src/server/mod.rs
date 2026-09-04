@@ -149,7 +149,7 @@ pub struct LamcoRdpServer {
     config: Arc<Config>,
 
     /// IronRDP server instance
-    rdp_server: RdpServer,
+    rdp_server: crate::transport::ServerPair,
 
     /// Portal manager for Wayland access (kept for resource cleanup).
     /// None in ScreenCast-only (view-only) mode where no RemoteDesktop session exists.
@@ -1077,7 +1077,8 @@ impl LamcoRdpServer {
                 });
             }
 
-            let mut rdp_server = if is_wlr_direct || is_portal_generic || is_kwin_virtual {
+            let mut rdp_server: crate::transport::ServerPair =
+                if is_wlr_direct || is_portal_generic || is_kwin_virtual {
                 // wlr-direct/portal-generic: input via session handle (native Wayland protocols).
                 // kwin-virtual: input via the strategy's libei session handle
                 // (Portal RemoteDesktop + EIS — the same machinery the kwin-virtual
@@ -1152,12 +1153,22 @@ impl LamcoRdpServer {
                 let rdpei_factory: Option<RdpeiFactory> = config.input.enable_touch.then(|| {
                     Box::new(create_rdpei_factory(input_handler.input_sender())) as RdpeiFactory
                 });
+                // The input sender is captured BEFORE the input handler moves
+                // into a server builder — the primary's RDPEI factory (built
+                // after the plain server consumed the original) is rebuilt
+                // from this clone.
+                let input_sender_for_primary = config
+                    .input
+                    .enable_touch
+                    .then(|| input_handler.input_sender());
 
                 info!("wlr-direct input handler created (virtual keyboard + pointer)");
 
-                // Resolve security. Standard RDP Security (no TLS) is required by
-                // Hyper-V Enhanced Session Mode; otherwise Hybrid if configured and a
-                // public key is available, else TLS.
+                // Security profile for the primary server: Standard RDP
+                // Security (no TLS) only when the WHOLE server is plain
+                // (security_mode = "rdp"); otherwise Hybrid if configured and
+                // a public key is available, else TLS. The per-transport
+                // plain server (vsock) is built separately below.
                 let addr_builder = RdpServer::builder().with_addr(listen_addr);
                 let handler_builder = if is_standard_rdp_security(&config.security.security_mode) {
                     warn!(
@@ -1177,20 +1188,103 @@ impl LamcoRdpServer {
                     addr_builder.with_tls(tls_acceptor)
                 };
 
-                handler_builder
+                // Per-transport security (C1): when vsock is resolved and the
+                // primary is NOT already plain (security_mode = "rdp" makes
+                // the primary itself plain — nothing secondary to build),
+                // build a second server speaking Standard RDP Security for
+                // host-relayed vsock connections. vmms terminates TLS/CredSSP
+                // on the host and relays plaintext RDP over the
+                // hypervisor-isolated vsock; a TLS-configured server fails
+                // that with "received corrupt message ... InvalidContentType"
+                // (upstream #52).
+                //
+                // Build order: the PLAIN server consumes the single-use
+                // factory objects first; the primary then rebuilds its own
+                // cheaply from the same Arc'd sources (clipboard
+                // orchestrator, keyboard handler state, codec table, sound
+                // config). `LamcoGfxFactory::share_state_with` gives the
+                // plain server the same EGFX state/server handles.
+                let vsock_active = {
+                    #[cfg(feature = "vsock")]
+                    {
+                        config
+                            .server
+                            .transports
+                            .resolve(&config.server.listen_addr)
+                            .map(|t| t.vsock.is_some())
+                            .unwrap_or(false)
+                    }
+                    #[cfg(not(feature = "vsock"))]
+                    {
+                        false
+                    }
+                };
+                let plain_server = if vsock_active
+                    && !is_standard_rdp_security(&config.security.security_mode)
+                {
+                    info!(
+                        "Security: vsock transport active — building a second server with \
+                         Standard RDP Security for Hyper-V Enhanced Session (vmconnect) \
+                         connections; TCP/Unix/WebSocket keep their configured security"
+                    );
+                    Some(
+                        RdpServer::builder()
+                            .with_addr(listen_addr)
+                            .with_no_security()
+                            .with_input_handler(input_handler.clone())
+                            .with_display_handler((*display_handler).clone())
+                            .with_bitmap_codecs(codecs)
+                            .with_cliprdr_factory(wlr_clipboard_factory)
+                            .with_gfx_factory(if egfx_enabled {
+                                Some(Box::new(gfx_factory.share_state_with()))
+                            } else {
+                                None
+                            })
+                            .with_sound_factory(Some(Box::new(sound_factory)))
+                            .with_rdpei_factory(rdpei_factory)
+                            .with_autodetect_rtt_handle(Arc::clone(&autodetect_rtt))
+                            .with_connection_handler(Some(Box::new(keyboard_layout_handler)))                            .with_honor_client_desktop_size(Some(ironrdp_server::DesktopSize {
+                                width: 3840,
+                                height: 2160,
+                            }))
+                            .build(),
+                    )
+                } else {
+                    None
+                };
+
+                // Primary server: rebuilt factories over the same shared
+                // state (the plain build above consumed the originals). The
+                // keyboard handler Arc is captured before `input_handler`
+                // moves into the builder below.
+                let primary_keyboard_handler = Arc::clone(&input_handler.keyboard_handler);
+                let primary = handler_builder
                     .with_input_handler(input_handler)
                     .with_display_handler((*display_handler).clone())
-                    .with_bitmap_codecs(codecs)
-                    .with_cliprdr_factory(wlr_clipboard_factory)
+                    .with_bitmap_codecs(
+                        server_codecs_capabilities(&["remotefx"])
+                            .map_err(|e| anyhow::anyhow!("Failed to create codec capabilities: {e}"))?,
+                    )
+                    .with_cliprdr_factory(wlr_clipboard_manager.as_ref().map(|mgr| {
+                        Box::new(LamcoCliprdrFactory::new(Arc::clone(mgr)))
+                            as Box<dyn ironrdp_server::CliprdrServerFactory>
+                    }))
                     .with_gfx_factory(if egfx_enabled {
                         Some(Box::new(gfx_factory))
                     } else {
                         None
                     })
-                    .with_sound_factory(Some(Box::new(sound_factory)))
-                    .with_rdpei_factory(rdpei_factory)
+                    .with_sound_factory(Some(Box::new(create_sound_factory(
+                        &config.audio,
+                        None,
+                    ))))
+                    .with_rdpei_factory(input_sender_for_primary.map(|sender| {
+                        Box::new(create_rdpei_factory(sender)) as RdpeiFactory
+                    }))
                     .with_autodetect_rtt_handle(Arc::clone(&autodetect_rtt))
-                    .with_connection_handler(Some(Box::new(keyboard_layout_handler)))
+                    .with_connection_handler(Some(Box::new(
+                        KeyboardLayoutConnectionHandler::new(primary_keyboard_handler),
+                    )))
                     // Resolution support: honor the client's requested desktop
                     // size (dialog choice), clamped to 3840x2160. The display
                     // handler adopts the requested desktop size (elastic
@@ -1199,7 +1293,12 @@ impl LamcoRdpServer {
                         width: 3840,
                         height: 2160,
                     }))
-                    .build()
+                    .build();
+
+                match plain_server {
+                    Some(plain) => crate::transport::ServerPair::dual(primary, plain),
+                    None => crate::transport::ServerPair::single(primary),
+                }
             } else {
                 // ScreenCast-only: view-only, no input
                 let addr_builder = RdpServer::builder().with_addr(listen_addr);
@@ -1221,6 +1320,7 @@ impl LamcoRdpServer {
                     addr_builder.with_tls(tls_acceptor)
                 };
 
+                crate::transport::ServerPair::single(
                 handler_builder
                     .with_no_input()
                     .with_display_handler((*display_handler).clone())
@@ -1240,20 +1340,25 @@ impl LamcoRdpServer {
                         height: 2160,
                     }))
                     .build()
+                )
             };
 
+            // Post-build wiring targets the PRIMARY server: it serves all
+            // non-vsock connections and is the initial serving server. The
+            // deployment's on_server_routed retargets the event sender when
+            // a vsock connection routes to the plain server.
             display_handler
-                .set_server_event_sender(rdp_server.event_sender().clone())
+                .set_server_event_sender(rdp_server.primary_event_sender().clone())
                 .await;
 
             // Phase 3: drive server-side auto-detect for this session.
-            // The RTT handle was already shared with the EGFX flow controller
+            // The RTT handle was already shared with the EGIX flow controller
             // pre-build (see autodetect_rtt above) — its freshness-floor
             // policy consumes it via `effective_rtt`.
-            rdp_server.enable_autodetect();
+            rdp_server.primary_mut().enable_autodetect();
             if let Some(probe_state) = autodetect_probe_state.as_ref() {
                 spawn_autodetect_probe(
-                    rdp_server.event_sender().clone(),
+                    rdp_server.primary_event_sender().clone(),
                     Arc::clone(probe_state),
                     shutdown_broadcast.subscribe(),
                 );
@@ -1261,7 +1366,11 @@ impl LamcoRdpServer {
             // SuppressOutput frame gate: share the RDP server's authoritative
             // "client cannot present frames" flag (mstsc minimized) with the
             // pipeline so it stops encoding while suppressed.
-            display_handler.set_display_suppressed_flag(rdp_server.display_suppressed_handle());
+            display_handler.set_display_suppressed_flag(
+                rdp_server
+                    .primary_mut()
+                    .display_suppressed_handle(),
+            );
 
             let _ = event_tx.send(ServerEvent::SessionTypeChanged {
                 session_type: session_handle.session_type().to_string(),
@@ -1796,13 +1905,17 @@ impl LamcoRdpServer {
             addr_builder.with_tls(tls_acceptor)
         };
 
-        let mut rdp_server = handler_builder
-            .with_input_handler(input_handler)
-            .with_display_handler((*display_handler).clone())
-            .with_bitmap_codecs(codecs)
-            .with_cliprdr_factory(Some(Box::new(clipboard_factory)))
-            .with_gfx_factory(if egfx_enabled {
-                Some(Box::new(gfx_factory))
+        // This path (Portal Token strategy) builds a single server: per-transport
+        // dual-server routing is implemented on the self-sufficient-strategies
+        // path above; the portal path keeps upstream v1.4.5 single-server shape.
+        let mut rdp_server = crate::transport::ServerPair::single(
+            handler_builder
+                .with_input_handler(input_handler)
+                .with_display_handler((*display_handler).clone())
+                .with_bitmap_codecs(codecs)
+                .with_cliprdr_factory(Some(Box::new(clipboard_factory)))
+                .with_gfx_factory(if egfx_enabled {
+                    Some(Box::new(gfx_factory))
             } else {
                 None
             })
@@ -1818,23 +1931,25 @@ impl LamcoRdpServer {
                 width: 3840,
                 height: 2160,
             }))
-            .build();
+            .build(),
+        );
 
         display_handler
-            .set_server_event_sender(rdp_server.event_sender().clone())
+            .set_server_event_sender(rdp_server.primary_event_sender().clone())
             .await;
         info!("Server event sender configured in display handler");
 
         // Phase 3: drive server-side auto-detect for this session.
-        rdp_server.enable_autodetect();
+        rdp_server.primary_mut().enable_autodetect();
         spawn_autodetect_probe(
-            rdp_server.event_sender().clone(),
+            rdp_server.primary_event_sender().clone(),
             autodetect_probe_state,
             shutdown_broadcast.subscribe(),
         );
         // SuppressOutput frame gate — see the identical block in the
         // view-only/wlr path above for rationale.
-        display_handler.set_display_suppressed_flag(rdp_server.display_suppressed_handle());
+        display_handler
+            .set_display_suppressed_flag(rdp_server.primary_mut().display_suppressed_handle());
 
         let _ = event_tx.send(ServerEvent::SessionTypeChanged {
             session_type: session_handle_for_clipboard.session_type().to_string(),
@@ -1965,12 +2080,16 @@ impl LamcoRdpServer {
                 creds.username
             );
         }
-        self.rdp_server.set_credentials(initial_creds);
+        // Credentials apply to the primary (the only server that ever does
+        // CredSSP — the plain vsock server speaks Standard RDP Security and
+        // the host relay already authenticated the user).
+        self.rdp_server.primary_mut().set_credentials(initial_creds);
 
         // Set up PAM credential validator if auth_method=pam
         let pam_validator = if effective_auth_method == "pam" {
             let validator = std::sync::Arc::new(crate::security::PamValidator::new(None));
             self.rdp_server
+                .primary_mut()
                 .set_credential_validator(Some(validator.clone()));
             info!("PAM credential validator attached to RDP server");
             Some(validator)
@@ -2041,6 +2160,7 @@ impl LamcoRdpServer {
             pam_validator.clone(),
             self.shutdown_broadcast.clone(),
             Arc::clone(&self.session_handle),
+            &self.rdp_server,
         );
 
         let result =
@@ -2104,7 +2224,11 @@ impl LamcoRdpServer {
     /// lifetime.
     #[must_use]
     pub fn error_info_disconnect_handle(&self) -> ironrdp_server::ErrorInfoDisconnectHandle {
-        self.rdp_server.error_info_disconnect_handle()
+        // The primary is the initial serving server and the common case;
+        // a vsock-served client is disconnected by its own server when its
+        // connection ends, and process-level shutdown also drops the vsock
+        // listener, so the primary's handle suffices for the signal path.
+        self.rdp_server.primary_error_info_disconnect_handle()
     }
 
     /// Signal graceful shutdown. Actual cleanup happens in cleanup_resources().
@@ -2117,7 +2241,6 @@ impl LamcoRdpServer {
         info!("Initiating graceful shutdown");
         use ironrdp_pdu::rdp::server_error_info::{ErrorInfo, ProtocolIndependentCode};
         if self
-            .rdp_server
             .error_info_disconnect_handle()
             .disconnect(ErrorInfo::ProtocolIndependentCode(
                 ProtocolIndependentCode::RpcInitiatedDisconnect,
