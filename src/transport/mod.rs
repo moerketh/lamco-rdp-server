@@ -32,7 +32,9 @@ pub use config::TransportsConfig;
 use futures::stream::{FuturesUnordered, StreamExt};
 pub use handler::LamcoConnectionHandler;
 use ironrdp_server::{PostConnectionAction, RdpServer};
-pub use listener::{AcceptedConnection, AsyncRdpStream, Listener, PeerAddr, TransportError};
+pub use listener::{
+    AcceptedConnection, AcceptorMode, AsyncRdpStream, Listener, PeerAddr, TransportError,
+};
 pub use proxy_auth::{AllowAllInsecure, DenyAll, ProxyAuthValidator, SharedSecretValidator};
 pub use socket_activation::{ActivatedFds, ActivationError};
 use tracing::{debug, error, info, warn};
@@ -61,6 +63,16 @@ pub trait AcceptDeployment: Send {
     /// qemu), and Cargo-feature gating.
     async fn build_listeners(&mut self) -> Result<Vec<Box<dyn Listener>>>;
 
+    /// Called when a connection's serving server is chosen (per-transport
+    /// security routing). Default: no-op (single-server deployments).
+    ///
+    /// Dual-server deployments retarget per-server wiring here — most
+    /// importantly the display handler's event sender, which is a single
+    /// `mpsc` command channel into the serving server (EGFX/cursor/rdpsnd
+    /// commands go to whichever server actually serves; a stale sender would
+    /// silently drop them into the idle server).
+    fn on_server_routed(&mut self, _route: ServerRoute) {}
+
     /// Construct the per-connection handler with deployment-appropriate
     /// wiring (event sink, PAM validator, portal-validity closure). Called
     /// once.
@@ -80,6 +92,130 @@ pub trait AcceptDeployment: Send {
 /// WebSocket+RDCleanPath — all without changing this entry point.
 pub struct AcceptDispatcher;
 
+/// Per-transport security routing (Hyper-V Enhanced Session).
+///
+/// `security_mode = "rdp"` keeps the single plain-RDP server and upstream
+/// v1.4.5 behavior exactly (all connections unencrypted). Otherwise, when
+/// the vsock transport is resolved, the desktop deployment builds a SECOND
+/// server configured `with_no_security`: vmms terminates TLS and CredSSP on
+/// the host and relays plaintext Standard RDP Security over the
+/// hypervisor-isolated vsock, which no TLS-configured server can accept
+/// ("received corrupt message ... InvalidContentType", upstream #52).
+/// TCP/Unix/WSS connections keep the primary server's TLS/Hybrid security.
+///
+/// The pair is serial-use: exactly one server serves a connection at a time
+/// (the dispatcher's accept loop is serial), so the desktop deployment
+/// re-points the display handler's event sender at whichever server just
+/// accepted — see `on_server_routed`.
+#[derive(Debug, Clone, Copy)]
+pub enum ServerRoute {
+    /// Serve on the primary server (TLS/Hybrid per `security_mode`).
+    /// All non-vsock transports.
+    Primary,
+    /// Serve on the plain-RDP server (Standard RDP Security, no TLS).
+    /// vsock only, and only when a secondary server exists.
+    Plain,
+}
+
+/// The one-or-two servers a deployment runs, with per-transport routing.
+///
+/// `plain` is `None` unless the vsock transport is active and
+/// `security_mode != "rdp"` (in which case the primary IS the plain server
+/// and there is nothing secondary to build).
+pub struct ServerPair {
+    primary: RdpServer,
+    plain: Option<RdpServer>,
+}
+
+impl ServerPair {
+    /// Single-server pair (upstream v1.4.5 shape).
+    pub fn single(server: RdpServer) -> Self {
+        Self {
+            primary: server,
+            plain: None,
+        }
+    }
+
+    /// Two-server pair: `primary` (TLS/Hybrid) + `plain` (no security) for
+    /// host-relayed vsock connections.
+    pub fn dual(primary: RdpServer, plain: RdpServer) -> Self {
+        Self {
+            primary,
+            plain: Some(plain),
+        }
+    }
+
+    /// True when a secondary plain-RDP server exists (vsock active,
+    /// security_mode != "rdp").
+    pub fn has_plain(&self) -> bool {
+        self.plain.is_some()
+    }
+
+    /// Decide which server serves a connection, by transport and acceptor
+    /// mode. vsock routes to the plain server when one exists; everything
+    /// else stays on the primary. A vsock connection with no plain server
+    /// (security_mode = "rdp": primary already speaks Standard RDP Security)
+    /// routes to the primary — identical wire behavior.
+    pub fn route(&self, transport: &str, mode: AcceptorMode) -> ServerRoute {
+        route_connection(transport, mode, self.has_plain())
+    }
+
+    /// Mutable access to the server a route selects — the dispatcher hands
+    /// it to `run_connection` / `run_connection_with`.
+    pub fn server_for(&mut self, route: ServerRoute) -> &mut RdpServer {
+        match route {
+            ServerRoute::Primary => &mut self.primary,
+            ServerRoute::Plain => self
+                .plain
+                .as_mut()
+                .expect("ServerRoute::Plain implies plain server exists"),
+        }
+    }
+
+    /// Mutable access to the primary (upstream single-server call sites).
+    pub fn primary_mut(&mut self) -> &mut RdpServer {
+        &mut self.primary
+    }
+
+    /// The primary server's event-sender channel (inbound command channel —
+    /// Quit/Disconnect/Egfx/Rdpsnd/AutoDetectRttRequest). The desktop
+    /// deployment installs this into the display handler at startup and
+    /// re-points it per route via `on_server_routed`.
+    pub fn primary_event_sender(
+        &self,
+    ) -> &tokio::sync::mpsc::UnboundedSender<ironrdp_server::ServerEvent> {
+        self.primary.event_sender()
+    }
+
+    /// The plain server's event sender, when a plain server exists.
+    pub fn plain_event_sender(
+        &self,
+    ) -> Option<&tokio::sync::mpsc::UnboundedSender<ironrdp_server::ServerEvent>> {
+        self.plain.as_ref().map(|s| s.event_sender())
+    }
+
+    /// The primary's ErrorInfo disconnect handle (client-visible graceful
+    /// disconnect). `error_info_disconnect_handle` is `&self` on the
+    /// RdpServer.
+    pub fn primary_error_info_disconnect_handle(&self) -> ironrdp_server::ErrorInfoDisconnectHandle {
+        self.primary.error_info_disconnect_handle()
+    }
+}
+
+/// Pure routing decision: vsock routes to the plain server iff one exists;
+/// every other transport (and every vsock connection on a single-server
+/// setup) routes to the primary. The `AcceptorMode` is accepted for future
+/// per-mode routing but currently does not influence the decision — WSS
+/// PreAuthenticated connections still belong on the primary (their TLS was
+/// terminated by the WSS layer, but the RDP security negotiation is the
+/// primary's).
+fn route_connection(transport: &str, _mode: AcceptorMode, has_plain: bool) -> ServerRoute {
+    match transport {
+        "vsock" if has_plain => ServerRoute::Plain,
+        _ => ServerRoute::Primary,
+    }
+}
+
 impl AcceptDispatcher {
     /// Build everything from the deployment and run the accept loop.
     ///
@@ -88,7 +224,7 @@ impl AcceptDispatcher {
     /// starts.
     pub async fn run(
         mut deployment: impl AcceptDeployment,
-        rdp_server: &mut RdpServer,
+        servers: &mut ServerPair,
     ) -> Result<()> {
         let dep_name = deployment.name();
         let mut listeners = deployment.build_listeners().await?;
@@ -166,11 +302,17 @@ impl AcceptDispatcher {
                     }
 
                     let start = Instant::now();
+                    // Per-transport security routing: pick the serving server
+                    // BEFORE the connection runs, and let the deployment
+                    // retarget per-server wiring (event sender) at it.
+                    let route = servers.route(transport_name, mode);
+                    deployment.on_server_routed(route);
+                    let rdp_server = servers.server_for(route);
                     let conn_result = match mode {
-                        crate::transport::listener::AcceptorMode::Standard => {
+                        AcceptorMode::Standard => {
                             rdp_server.run_connection(stream).await
                         }
-                        crate::transport::listener::AcceptorMode::PreAuthenticated => {
+                        AcceptorMode::PreAuthenticated => {
                             // Stream is already TLS-terminated (typically WSS); skip the
                             // IronRDP-managed TLS upgrade. Upstream PR #1281 reshaped this
                             // from a dedicated run_connection_pre_authenticated method into
@@ -273,6 +415,40 @@ mod tests {
     struct MockListener {
         stream: Option<Box<dyn AsyncRdpStream>>,
         peer: PeerAddr,
+    }
+
+    #[test]
+    fn routes_vsock_to_plain_only_when_plain_exists() {
+        use crate::transport::listener::AcceptorMode;
+        // Dual-server (vsock active, security_mode != rdp): vsock → Plain.
+        assert!(matches!(
+            route_connection("vsock", AcceptorMode::Standard, true),
+            ServerRoute::Plain
+        ));
+        // Single-server (security_mode = rdp): vsock → Primary (which IS
+        // plain — identical wire behavior).
+        assert!(matches!(
+            route_connection("vsock", AcceptorMode::Standard, false),
+            ServerRoute::Primary
+        ));
+        // All other transports stay on the primary regardless.
+        for transport in ["tcp", "unix", "websocket"] {
+            assert!(matches!(
+                route_connection(transport, AcceptorMode::Standard, true),
+                ServerRoute::Primary
+            ));
+            assert!(matches!(
+                route_connection(transport, AcceptorMode::PreAuthenticated, true),
+                ServerRoute::Primary
+            ));
+        }
+        // WSS (PreAuthenticated) stays primary even on the dual setup: its
+        // TLS was terminated by the WSS listener, and the RDP security
+        // negotiation belongs to the primary.
+        assert!(matches!(
+            route_connection("websocket", AcceptorMode::PreAuthenticated, true),
+            ServerRoute::Primary
+        ));
     }
 
     #[async_trait::async_trait]

@@ -266,6 +266,31 @@ impl LamcoGfxFactory {
         }
     }
 
+    /// Build a second factory sharing this one's live state.
+    ///
+    /// For per-transport dual-server deployments (vsock plain-RDP server
+    /// beside the TLS primary): both factories expose the SAME
+    /// `handler_state` (EGFX readiness atomics) and the SAME `server_handle`
+    /// slot, so whichever server serves a connection, the display pipeline
+    /// sees one coherent EGFX state. The accept dispatcher is serial —
+    /// exactly one server serves at a time — so the shared handles are never
+    /// used concurrently by two live connections. `build_server_with_handle`
+    /// re-populates the server_handle on the serving factory's connection.
+    pub fn share_state_with(&self) -> Self {
+        Self {
+            width: self.width,
+            height: self.height,
+            handler_state: Arc::clone(&self.handler_state),
+            server_handle: Arc::clone(&self.server_handle),
+            force_avc420_only: self.force_avc420_only,
+            max_frames_in_flight: self.max_frames_in_flight,
+            compression_mode: self.compression_mode,
+            metrics: self.metrics.clone(),
+            egfx_snapshot: self.egfx_snapshot.clone(),
+            health_reporter: self.health_reporter.clone(),
+        }
+    }
+
     /// Attach a MetricsCollector and EGFX snapshot for performance monitoring.
     /// Called from server setup to enable metric recording in the handler.
     pub fn set_monitoring(
