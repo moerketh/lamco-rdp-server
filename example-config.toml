@@ -336,8 +336,13 @@ severe_queue_threshold = 6
 [damage_tracking]
 # Enable damage tracking (highly recommended)
 enabled = true
-# Method: "pipewire", "diff", "hybrid"
-method = "diff"
+# Method preset:
+# - "recommended": compositor hints as primary, periodic pixel-diff probes for
+#   calibration and coverage verification, automatic distrust fallback
+# - "pixel-diff-exact": pixel-diff as the sole damage source (highest fidelity,
+#   higher CPU); aliases: "diff", ""
+# - "pipewire": PipeWire damage hints only
+method = "recommended"
 # Tile size for damage detection
 tile_size = 16
 # Difference threshold to trigger update
@@ -351,10 +356,10 @@ min_region_area = 64
 # Percentage-point divergence between a compositor's damage-region hint and
 # the periodic pixel-diff calibration probe above which one sample counts
 # as "high divergence"
-compositor_hint_distrust_threshold_pp = 15.0
+compositor_hint_distrust_threshold_pp = 3.0
 # Consecutive high-divergence samples before compositor damage hints are
 # distrusted for the rest of the connection (falls back to pixel-diff)
-compositor_hint_distrust_consecutive_samples = 3
+compositor_hint_distrust_consecutive_samples = 2
 
 # =============================================================================
 # Hardware Encoding Configuration

@@ -1175,11 +1175,22 @@ pub struct DamageTrackingConfig {
     /// significantly reducing bandwidth for static content.
     pub enabled: bool,
 
-    /// Detection method: "pipewire", "diff", "hybrid"
+    /// Detection method: "pipewire", "diff", "hybrid", or a preset name
     ///
-    /// - "diff": CPU-based pixel differencing (most compatible)
+    /// Presets (override the individual knobs below):
+    /// - "recommended": compositor hints with a fast-distrust pixel-diff
+    ///   fallback — zero-cost hints while they're accurate, automatic
+    ///   switch to pixel-diff when a compositor under/over-reports
+    /// - "pixel-diff-exact": always pixel-diff (never trust compositor
+    ///   hints) — exact damage at ~1-3ms/frame CPU cost
+    ///
+    /// Explicit methods (fine-grained control):
+    /// - "diff": CPU-based pixel differencing (same as pixel-diff-exact)
     /// - "pipewire": Use PipeWire damage hints if available
     /// - "hybrid": Combine both methods
+    ///
+    /// Presets map onto the same machinery: "recommended" keeps hints with
+    /// calibration; "pixel-diff-exact" distrusts hints from the first frame.
     pub method: String,
 
     /// Tile size for differencing (pixels)
@@ -1275,18 +1286,50 @@ fn default_min_region_area() -> u64 {
 }
 
 fn default_compositor_hint_distrust_threshold_pp() -> f32 {
-    15.0
+    // 3.0pp: tuned live on KDE/zkde (2026-09-05) where hint misses of 2-5pp
+    // produced visible drag-trail artifacts that the previous 15.0pp default
+    // never tripped on. 3.0 sits just above the rounding/granularity noise
+    // floor of well-behaved compositors.
+    3.0
 }
 
 fn default_compositor_hint_distrust_consecutive_samples() -> u32 {
-    3
+    // 2 consecutive samples: engages distrust within ~2 probe cycles instead
+    // of 3, while still requiring corroboration rather than one noisy probe.
+    2
+}
+
+impl DamageTrackingConfig {
+    /// Resolve the `method` field into the effective damage-source policy.
+    ///
+    /// Returns `(use_pixel_diff_exclusive, effective_method)`:
+    /// - `true` → never consult compositor hints; pixel-diff from frame one
+    /// - `effective_method` → canonical method name for logging/UI
+    ///
+    /// Presets ("recommended" / "pixel-diff-exact") map onto the same
+    /// machinery as the explicit methods; they exist so a single config
+    /// knob expresses the deployment-relevant policy.
+    #[must_use]
+    pub fn resolve_method(&self) -> (bool, String) {
+        match self.method.as_str() {
+            // Presets
+            "recommended" | "hybrid" => (false, "recommended".to_string()),
+            "pixel-diff-exact" | "diff" | "" => (true, "pixel-diff-exact".to_string()),
+            "pipewire" => (false, "pipewire".to_string()),
+            other => {
+                // Unknown method string: fall back to the recommended path so
+                // a typo degrades to working behavior, not to disabled damage.
+                (false, format!("recommended ({other})"))
+            }
+        }
+    }
 }
 
 impl Default for DamageTrackingConfig {
     fn default() -> Self {
         Self {
             enabled: true, // Enable by default for bandwidth savings
-            method: "diff".to_string(),
+            method: "recommended".to_string(),
             tile_size: default_tile_size(),
             diff_threshold: default_diff_threshold(),
             pixel_threshold: default_pixel_threshold(),

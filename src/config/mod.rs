@@ -455,7 +455,7 @@ impl Config {
         }
 
         match self.damage_tracking.method.as_str() {
-            "pipewire" | "diff" | "hybrid" => {}
+            "pipewire" | "diff" | "hybrid" | "recommended" | "pixel-diff-exact" | "" => {}
             _ => anyhow::bail!(
                 "Invalid damage tracking method: {}",
                 self.damage_tracking.method

@@ -1124,7 +1124,10 @@ impl LamcoDisplayHandler {
     /// non-async call sites (per-transport routing in the accept dispatcher's
     /// `on_server_routed`). Sound because the RwLock's writers are rare
     /// (startup + per-route) and the accept loop is serial.
-    pub fn set_server_event_sender_blocking(&self, sender: mpsc::UnboundedSender<ServerEvent>) -> bool {
+    pub fn set_server_event_sender_blocking(
+        &self,
+        sender: mpsc::UnboundedSender<ServerEvent>,
+    ) -> bool {
         match self.server_event_tx.try_write() {
             Ok(mut guard) => {
                 *guard = Some(sender);
@@ -1783,6 +1786,26 @@ impl LamcoDisplayHandler {
                 None
             };
 
+            // Resolve the damage-method preset once per connection.
+            // "pixel-diff-exact" (or legacy "diff") starts distrustED: hints
+            // are never consulted, pixel-diff is the primary from frame one.
+            // "recommended" (default) starts trusted and relies on the
+            // calibration probe to distrust quickly when a compositor
+            // misbehaves (eager early probing below shortens that window).
+            let (pixel_diff_exclusive, effective_method) =
+                self.config.damage_tracking.resolve_method();
+            if pixel_diff_exclusive {
+                info!(
+                    "🎯 Damage method '{effective_method}': pixel-diff exclusive from frame one \
+                     (compositor hints never consulted for this connection)"
+                );
+            } else {
+                info!(
+                    "🎯 Damage method '{effective_method}': compositor hints trusted until the \
+                     calibration probe proves otherwise"
+                );
+            }
+
             let mut frames_skipped_damage = 0u64; // Frames skipped due to no damage
 
             // Compositor-hint trust state (see the damage-source-selection
@@ -1792,7 +1815,7 @@ impl LamcoDisplayHandler {
             // it keeps feeding frames through this same shared pipeline
             // (lamco_pipewire::frame::RawFrameData) rather than a parallel
             // encode/damage path.
-            let mut compositor_hint_distrusted = false;
+            let mut compositor_hint_distrusted = pixel_diff_exclusive;
             let mut consecutive_high_divergence = 0u32;
 
             // === DAMAGE ACCUMULATION (artifact prevention) ===
@@ -1857,6 +1880,18 @@ impl LamcoDisplayHandler {
             // interval elapses, independent of skip patterns.
             let mut last_telemetry_log = std::time::Instant::now();
             let telemetry_log_interval = std::time::Duration::from_secs(2);
+
+            // Eager calibration window: probe EVERY frame for the first N
+            // frames of a connection, then fall back to the telemetry cadence.
+            // At connect we know nothing about this compositor's damage-hint
+            // fidelity; zkde (KDE) has been observed both over-reporting idle
+            // frames (~5% claimed vs 0.1% real) and under-reporting drag
+            // trails. Probing every frame (~1-3ms each) lets distrust engage
+            // within the first second instead of after 2+ probe intervals
+            // (~4-6s), which is the difference between a visible artifact
+            // at connect and none.
+            const EAGER_PROBE_FRAMES: u64 = 30;
+            let mut frames_since_connect: u64 = 0;
 
             // Zero-frame detection: if we never receive ANY frame within 10 seconds
             // of session start, something is fundamentally wrong (e.g., ext-capture
@@ -3283,9 +3318,7 @@ impl LamcoDisplayHandler {
                                                         encoder_diagnostics.clone(),
                                                     );
                                                     encoder.configure_periodic_idr(
-                                                        self.config
-                                                            .egfx
-                                                            .periodic_idr_interval,
+                                                        self.config.egfx.periodic_idr_interval,
                                                     );
                                                     video_encoder =
                                                         Some(VideoEncoder::X264(encoder));
@@ -3337,15 +3370,17 @@ impl LamcoDisplayHandler {
                             //   openh264  -> OpenH264 software only
                             // AVC444 is unaffected by this ladder: x264 has no
                             // 4:4:4 support, so that path always uses OpenH264.
-                            let backend_pref =
-                                self.config.egfx.encoder_backend.to_lowercase();
+                            let backend_pref = self.config.egfx.encoder_backend.to_lowercase();
 
                             // 1. VA-API hardware (auto only — an explicit
                             //    backend selection never upgrades to hardware).
                             #[cfg(feature = "vaapi")]
-                            let mut avc420_result: Result<Avc420Encoder, _> = Err(
-                                crate::egfx::EncoderError::InitFailed("not attempted".into()),
-                            );
+                            let mut avc420_result: Result<
+                                Avc420Encoder,
+                                _,
+                            > = Err(crate::egfx::EncoderError::InitFailed(
+                                "not attempted".into(),
+                            ));
                             #[cfg(feature = "vaapi")]
                             if backend_pref == "auto" && self.config.hardware_encoding.enabled {
                                 avc420_result = match Avc420Encoder::new_hardware(
@@ -3663,8 +3698,15 @@ impl LamcoDisplayHandler {
                         // below, so the compositor-hint probe and the log block it
                         // feeds agree on the same frame. See last_telemetry_log's
                         // declaration for why this is time- not frame-count-gated.
-                        let should_log_telemetry =
+                        // The eager-connect window (first EAGER_PROBE_FRAMES frames)
+                        // probes every frame regardless of the cadence.
+                        frames_since_connect += 1;
+                        let cadence_elapsed =
                             last_telemetry_log.elapsed() >= telemetry_log_interval;
+                        let in_eager_window = frames_since_connect <= EAGER_PROBE_FRAMES;
+                        let should_probe =
+                            cadence_elapsed || (in_eager_window && !compositor_hint_distrusted);
+                        let should_log_telemetry = cadence_elapsed || in_eager_window;
 
                         // Which source produced damage_regions this frame — logged
                         // periodically below so activity-classification behavior can be
@@ -3697,15 +3739,26 @@ impl LamcoDisplayHandler {
                                 .iter()
                                 .map(|r| DamageRegion::from(*r))
                                 .collect();
+                            // Probe regions that the hints MISSED, to be unioned into
+                            // this frame's send set below. The probe advances the
+                            // detector's reference frame; if the missed pixels were
+                            // not also sent to the client, the reference runs ahead
+                            // of the client and pixel-diff can never re-detect them
+                            // — they persist until the next periodic IDR. Unioning
+                            // them costs at most a few extra tiles per probed frame
+                            // and eliminates the entire "reference-ahead-of-client"
+                            // desync class during the compositor-hint phase.
+                            let mut probe_missed_regions: Vec<DamageRegion> = Vec::new();
                             if let Some(ref mut detector) = damage_detector_opt {
-                                if should_log_telemetry {
+                                if should_probe {
                                     // Calibration probe: run the real pixel-diff detector
                                     // instead of the cheap reference-only update, so we can
                                     // measure how far this compositor's damage hints diverge
                                     // from an actual pixel diff. detect() updates the
                                     // reference frame as a side effect, same as
                                     // update_reference() would have -- this is not extra
-                                    // drift, just a ~2-3ms probe once every ~2s.
+                                    // drift, just a ~2-3ms probe once every ~2s (every
+                                    // frame during the eager connect window).
                                     let probe_regions =
                                         detector.detect(&pixel_data, frame_width, frame_height);
                                     let pixel_diff_ratio = pipeline_decisions::compute_damage_ratio(
@@ -3719,6 +3772,18 @@ impl LamcoDisplayHandler {
                                         frame_height,
                                     );
                                     compositor_vs_pixel_diff = Some(pixel_diff_ratio);
+
+                                    // Regions the pixel-diff saw but the hints did not
+                                    // cover are queued for the send set. (compute a
+                                    // subtractive difference: probe minus hint coverage.)
+                                    if !probe_regions.is_empty() {
+                                        probe_missed_regions = pipeline_decisions::subtract_regions(
+                                            &probe_regions,
+                                            &hint_regions,
+                                            frame_width,
+                                            frame_height,
+                                        );
+                                    }
 
                                     let divergence_pp = (hint_ratio - pixel_diff_ratio) * 100.0;
                                     let eval = pipeline_decisions::evaluate_compositor_trust(
@@ -3762,7 +3827,22 @@ impl LamcoDisplayHandler {
                                     detector.update_reference(&pixel_data);
                                 }
                             }
-                            hint_regions
+                            // Union the probe-missed regions into the hint set. A
+                            // probe frame's send set is then hint ∪ (probe − hint):
+                            // everything the client needs so its surface matches the
+                            // detector's post-probe reference exactly.
+                            if probe_missed_regions.is_empty() {
+                                hint_regions
+                            } else {
+                                debug!(
+                                    "🎯 Probe-union: hints missed {} region(s) the pixel-diff \
+                                     saw — adding them to this frame's send set",
+                                    probe_missed_regions.len()
+                                );
+                                let mut combined = hint_regions;
+                                combined.extend(probe_missed_regions);
+                                combined
+                            }
                         } else if let Some(ref mut detector) = damage_detector_opt {
                             // Fallback: pixel-diff damage detection (SIMD, ~2-3ms at 1080p).
                             // Reached either because the compositor sent no hint at all, or

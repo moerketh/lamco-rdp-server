@@ -427,7 +427,10 @@ impl VsockListenerImpl {
         // listening AF_VSOCK socket. tokio-vsock's FromRawFd takes ownership.
         let listener = unsafe { tokio_vsock::VsockListener::from_raw_fd(raw) };
         let port = listener.local_addr().map_or(0, |a| a.port());
-        info!(port, "vsock listener wrapped from systemd-passed fd (any peer)");
+        info!(
+            port,
+            "vsock listener wrapped from systemd-passed fd (any peer)"
+        );
         Ok(Self {
             listener,
             port,

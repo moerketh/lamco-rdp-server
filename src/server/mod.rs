@@ -1077,8 +1077,10 @@ impl LamcoRdpServer {
                 });
             }
 
-            let mut rdp_server: crate::transport::ServerPair =
-                if is_wlr_direct || is_portal_generic || is_kwin_virtual {
+            let mut rdp_server: crate::transport::ServerPair = if is_wlr_direct
+                || is_portal_generic
+                || is_kwin_virtual
+            {
                 // wlr-direct/portal-generic: input via session handle (native Wayland protocols).
                 // kwin-virtual: input via the strategy's libei session handle
                 // (Portal RemoteDesktop + EIS — the same machinery the kwin-virtual
@@ -1219,39 +1221,39 @@ impl LamcoRdpServer {
                         false
                     }
                 };
-                let plain_server = if vsock_active
-                    && !is_standard_rdp_security(&config.security.security_mode)
-                {
-                    info!(
-                        "Security: vsock transport active — building a second server with \
+                let plain_server =
+                    if vsock_active && !is_standard_rdp_security(&config.security.security_mode) {
+                        info!(
+                            "Security: vsock transport active — building a second server with \
                          Standard RDP Security for Hyper-V Enhanced Session (vmconnect) \
                          connections; TCP/Unix/WebSocket keep their configured security"
-                    );
-                    Some(
-                        RdpServer::builder()
-                            .with_addr(listen_addr)
-                            .with_no_security()
-                            .with_input_handler(input_handler.clone())
-                            .with_display_handler((*display_handler).clone())
-                            .with_bitmap_codecs(codecs)
-                            .with_cliprdr_factory(wlr_clipboard_factory)
-                            .with_gfx_factory(if egfx_enabled {
-                                Some(Box::new(gfx_factory.share_state_with()))
-                            } else {
-                                None
-                            })
-                            .with_sound_factory(Some(Box::new(sound_factory)))
-                            .with_rdpei_factory(rdpei_factory)
-                            .with_autodetect_rtt_handle(Arc::clone(&autodetect_rtt))
-                            .with_connection_handler(Some(Box::new(keyboard_layout_handler)))                            .with_honor_client_desktop_size(Some(ironrdp_server::DesktopSize {
-                                width: 3840,
-                                height: 2160,
-                            }))
-                            .build(),
-                    )
-                } else {
-                    None
-                };
+                        );
+                        Some(
+                            RdpServer::builder()
+                                .with_addr(listen_addr)
+                                .with_no_security()
+                                .with_input_handler(input_handler.clone())
+                                .with_display_handler((*display_handler).clone())
+                                .with_bitmap_codecs(codecs)
+                                .with_cliprdr_factory(wlr_clipboard_factory)
+                                .with_gfx_factory(if egfx_enabled {
+                                    Some(Box::new(gfx_factory.share_state_with()))
+                                } else {
+                                    None
+                                })
+                                .with_sound_factory(Some(Box::new(sound_factory)))
+                                .with_rdpei_factory(rdpei_factory)
+                                .with_autodetect_rtt_handle(Arc::clone(&autodetect_rtt))
+                                .with_connection_handler(Some(Box::new(keyboard_layout_handler)))
+                                .with_honor_client_desktop_size(Some(ironrdp_server::DesktopSize {
+                                    width: 3840,
+                                    height: 2160,
+                                }))
+                                .build(),
+                        )
+                    } else {
+                        None
+                    };
 
                 // Primary server: rebuilt factories over the same shared
                 // state (the plain build above consumed the originals). The
@@ -1262,8 +1264,9 @@ impl LamcoRdpServer {
                     .with_input_handler(input_handler)
                     .with_display_handler((*display_handler).clone())
                     .with_bitmap_codecs(
-                        server_codecs_capabilities(&["remotefx"])
-                            .map_err(|e| anyhow::anyhow!("Failed to create codec capabilities: {e}"))?,
+                        server_codecs_capabilities(&["remotefx"]).map_err(|e| {
+                            anyhow::anyhow!("Failed to create codec capabilities: {e}")
+                        })?,
                     )
                     .with_cliprdr_factory(wlr_clipboard_manager.as_ref().map(|mgr| {
                         Box::new(LamcoCliprdrFactory::new(Arc::clone(mgr)))
@@ -1274,17 +1277,15 @@ impl LamcoRdpServer {
                     } else {
                         None
                     })
-                    .with_sound_factory(Some(Box::new(create_sound_factory(
-                        &config.audio,
-                        None,
-                    ))))
-                    .with_rdpei_factory(input_sender_for_primary.map(|sender| {
-                        Box::new(create_rdpei_factory(sender)) as RdpeiFactory
-                    }))
+                    .with_sound_factory(Some(Box::new(create_sound_factory(&config.audio, None))))
+                    .with_rdpei_factory(
+                        input_sender_for_primary
+                            .map(|sender| Box::new(create_rdpei_factory(sender)) as RdpeiFactory),
+                    )
                     .with_autodetect_rtt_handle(Arc::clone(&autodetect_rtt))
-                    .with_connection_handler(Some(Box::new(
-                        KeyboardLayoutConnectionHandler::new(primary_keyboard_handler),
-                    )))
+                    .with_connection_handler(Some(Box::new(KeyboardLayoutConnectionHandler::new(
+                        primary_keyboard_handler,
+                    ))))
                     // Resolution support: honor the client's requested desktop
                     // size (dialog choice), clamped to 3840x2160. The display
                     // handler adopts the requested desktop size (elastic
@@ -1321,25 +1322,25 @@ impl LamcoRdpServer {
                 };
 
                 crate::transport::ServerPair::single(
-                handler_builder
-                    .with_no_input()
-                    .with_display_handler((*display_handler).clone())
-                    .with_bitmap_codecs(codecs)
-                    .with_cliprdr_factory(None)
-                    .with_gfx_factory(if egfx_enabled {
-                        Some(Box::new(gfx_factory))
-                    } else {
-                        None
-                    })
-                    .with_sound_factory(Some(Box::new(sound_factory)))
-                    .with_autodetect_rtt_handle(Arc::clone(&autodetect_rtt))
-                    // Resolution support (view-only too): same honor flag
-                    // and adoption semantics as the input path above.
-                    .with_honor_client_desktop_size(Some(ironrdp_server::DesktopSize {
-                        width: 3840,
-                        height: 2160,
-                    }))
-                    .build()
+                    handler_builder
+                        .with_no_input()
+                        .with_display_handler((*display_handler).clone())
+                        .with_bitmap_codecs(codecs)
+                        .with_cliprdr_factory(None)
+                        .with_gfx_factory(if egfx_enabled {
+                            Some(Box::new(gfx_factory))
+                        } else {
+                            None
+                        })
+                        .with_sound_factory(Some(Box::new(sound_factory)))
+                        .with_autodetect_rtt_handle(Arc::clone(&autodetect_rtt))
+                        // Resolution support (view-only too): same honor flag
+                        // and adoption semantics as the input path above.
+                        .with_honor_client_desktop_size(Some(ironrdp_server::DesktopSize {
+                            width: 3840,
+                            height: 2160,
+                        }))
+                        .build(),
                 )
             };
 
@@ -1366,11 +1367,8 @@ impl LamcoRdpServer {
             // SuppressOutput frame gate: share the RDP server's authoritative
             // "client cannot present frames" flag (mstsc minimized) with the
             // pipeline so it stops encoding while suppressed.
-            display_handler.set_display_suppressed_flag(
-                rdp_server
-                    .primary_mut()
-                    .display_suppressed_handle(),
-            );
+            display_handler
+                .set_display_suppressed_flag(rdp_server.primary_mut().display_suppressed_handle());
 
             let _ = event_tx.send(ServerEvent::SessionTypeChanged {
                 session_type: session_handle.session_type().to_string(),
@@ -1916,22 +1914,22 @@ impl LamcoRdpServer {
                 .with_cliprdr_factory(Some(Box::new(clipboard_factory)))
                 .with_gfx_factory(if egfx_enabled {
                     Some(Box::new(gfx_factory))
-            } else {
-                None
-            })
-            .with_sound_factory(Some(Box::new(sound_factory)))
-            .with_rdpei_factory(rdpei_factory)
-            .with_autodetect_rtt_handle(Arc::clone(&autodetect_rtt))
-            .with_connection_handler(Some(Box::new(keyboard_layout_handler)))
-            // Resolution support: honor the client's requested desktop size
-            // (dialog choice), clamped to 3840x2160. The display handler
-            // adopts the requested desktop size (elastic capture recreates
-            // the compositor source to match).
-            .with_honor_client_desktop_size(Some(ironrdp_server::DesktopSize {
-                width: 3840,
-                height: 2160,
-            }))
-            .build(),
+                } else {
+                    None
+                })
+                .with_sound_factory(Some(Box::new(sound_factory)))
+                .with_rdpei_factory(rdpei_factory)
+                .with_autodetect_rtt_handle(Arc::clone(&autodetect_rtt))
+                .with_connection_handler(Some(Box::new(keyboard_layout_handler)))
+                // Resolution support: honor the client's requested desktop size
+                // (dialog choice), clamped to 3840x2160. The display handler
+                // adopts the requested desktop size (elastic capture recreates
+                // the compositor source to match).
+                .with_honor_client_desktop_size(Some(ironrdp_server::DesktopSize {
+                    width: 3840,
+                    height: 2160,
+                }))
+                .build(),
         );
 
         display_handler

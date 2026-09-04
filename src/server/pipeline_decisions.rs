@@ -281,6 +281,86 @@ pub(crate) fn evaluate_compositor_trust(
     }
 }
 
+/// Subtract the coverage of `covered` from `regions`, returning the parts of
+/// `regions` NOT covered by `covered`.
+///
+/// Used by the damage-calibration probe: when the pixel-diff detector sees
+/// changed pixels that the compositor's hints did not report, those missed
+/// areas must still be sent to the client — the probe already advanced the
+/// detector's reference frame, so anything not sent would be invisible to
+/// every future diff (reference-ahead-of-client desync; persists until the
+/// next periodic IDR).
+///
+/// Exact rectangle subtraction with axis-aligned splitting: each input region
+/// is clipped against the covered area, producing up to 4 remainder rects per
+/// covered intersection. Output is not merged — callers merge downstream
+/// (`merge_regions` in the damage pipeline) or accept the coarse
+/// fragmentation, which the tile-aligned inputs keep small in practice.
+pub(crate) fn subtract_regions(
+    regions: &[DamageRegion],
+    covered: &[DamageRegion],
+    frame_width: u32,
+    frame_height: u32,
+) -> Vec<DamageRegion> {
+    // Fast paths: nothing to subtract from / by.
+    if regions.is_empty() || covered.is_empty() {
+        return regions.to_vec();
+    }
+    // A covered region spanning the whole frame erases everything.
+    let full_coverage = covered
+        .iter()
+        .any(|c| c.x == 0 && c.y == 0 && c.width >= frame_width && c.height >= frame_height);
+    if full_coverage {
+        return Vec::new();
+    }
+
+    let mut result: Vec<DamageRegion> = Vec::new();
+    for r in regions {
+        // Worklist of uncovered pieces of `r`.
+        let mut pieces = vec![*r];
+        for c in covered {
+            let mut next_pieces = Vec::new();
+            for p in pieces {
+                // Intersection of p and c (empty when disjoint).
+                let ix = p.x.max(c.x);
+                let iy = p.y.max(c.y);
+                let ix2 = (p.x + p.width).min(c.x + c.width);
+                let iy2 = (p.y + p.height).min(c.y + c.height);
+                if ix >= ix2 || iy >= iy2 {
+                    // Disjoint: p survives untouched.
+                    next_pieces.push(p);
+                    continue;
+                }
+                // Clip p against the intersection, emitting the 4 side bands.
+                // Left band.
+                if ix > p.x {
+                    next_pieces.push(DamageRegion::new(p.x, p.y, ix - p.x, p.height));
+                }
+                // Right band.
+                let p_x2 = p.x + p.width;
+                if ix2 < p_x2 {
+                    next_pieces.push(DamageRegion::new(ix2, p.y, p_x2 - ix2, p.height));
+                }
+                // Top band (between left/right clip).
+                if iy > p.y {
+                    next_pieces.push(DamageRegion::new(ix, p.y, ix2 - ix, iy - p.y));
+                }
+                // Bottom band (between left/right clip).
+                let p_y2 = p.y + p.height;
+                if iy2 < p_y2 {
+                    next_pieces.push(DamageRegion::new(ix, iy2, ix2 - ix, p_y2 - iy2));
+                }
+            }
+            pieces = next_pieces;
+            if pieces.is_empty() {
+                break;
+            }
+        }
+        result.extend(pieces);
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -452,5 +532,78 @@ mod tests {
         // over-reporting; divergence is compared by magnitude.
         let eval = evaluate_compositor_trust(-90.0, 0, 15.0, 3);
         assert_eq!(eval.new_consecutive_count, 1);
+    }
+
+    // === subtract_regions (probe-union support) ===
+
+    /// Total area of a region list, for asserting coverage conservation.
+    fn total_area(regions: &[DamageRegion]) -> u64 {
+        regions.iter().map(DamageRegion::area).sum()
+    }
+
+    #[test]
+    fn subtract_disjoint_regions_returned_unchanged() {
+        let regions = [DamageRegion::new(0, 0, 100, 100)];
+        let covered = [DamageRegion::new(500, 500, 100, 100)];
+        let out = subtract_regions(&regions, &covered, 1920, 1080);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0], regions[0]);
+    }
+
+    #[test]
+    fn subtract_fully_covered_region_erased() {
+        let regions = [DamageRegion::new(100, 100, 100, 100)];
+        let covered = [DamageRegion::new(0, 0, 1920, 1080)]; // whole frame
+        let out = subtract_regions(&regions, &covered, 1920, 1080);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn subtract_partial_coverage_conserves_area() {
+        // Region 200x200 at (0,0); covered is the left half 100x200.
+        // Remainder must be exactly the right half: area 20000.
+        let regions = [DamageRegion::new(0, 0, 200, 200)];
+        let covered = [DamageRegion::new(0, 0, 100, 200)];
+        let out = subtract_regions(&regions, &covered, 1920, 1080);
+        assert_eq!(total_area(&out), 20_000);
+        // Every remainder rect must start at x=100.
+        for r in &out {
+            assert_eq!(r.x, 100);
+            assert_eq!(r.width, 100);
+        }
+    }
+
+    #[test]
+    fn subtract_center_hole_produces_four_bands() {
+        // A covered rectangle in the middle of a region leaves 4 side bands
+        // whose total area is region − intersection.
+        let regions = [DamageRegion::new(0, 0, 300, 300)];
+        let covered = [DamageRegion::new(100, 100, 100, 100)];
+        let out = subtract_regions(&regions, &covered, 1920, 1080);
+        // 90000 − 10000 = 80000
+        assert_eq!(total_area(&out), 80_000);
+        // 4 bands: top, bottom, left, right
+        assert_eq!(out.len(), 4);
+    }
+
+    #[test]
+    fn subtract_multiple_covered_regions() {
+        // Two covered strips slicing a region into three columns.
+        let regions = [DamageRegion::new(0, 0, 300, 100)];
+        let covered = [
+            DamageRegion::new(100, 0, 10, 100),
+            DamageRegion::new(200, 0, 10, 100),
+        ];
+        let out = subtract_regions(&regions, &covered, 1920, 1080);
+        // 30000 − 2000 = 28000
+        assert_eq!(total_area(&out), 28_000);
+    }
+
+    #[test]
+    fn subtract_empty_inputs() {
+        assert!(subtract_regions(&[], &[DamageRegion::new(0, 0, 10, 10)], 100, 100).is_empty());
+        let regions = [DamageRegion::new(0, 0, 10, 10)];
+        let out = subtract_regions(&regions, &[], 100, 100);
+        assert_eq!(out.len(), 1);
     }
 }
