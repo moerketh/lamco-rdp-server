@@ -24,7 +24,7 @@ Connect to your Linux desktop from any RDP client (Windows, macOS, Linux, iOS, A
 
 ## Downloads
 
-Pre-built packages are available from [GitHub Releases](https://github.com/lamco-admin/lamco-rdp-server/releases) and [lamco.ai/download](https://www.lamco.ai/download/).
+Pre-built packages are available from [GitHub Releases](https://github.com/moerketh/lamco-rdp-server/releases) and [lamco.ai/download](https://www.lamco.ai/download/).
 
 ### Community Edition (free to use)
 

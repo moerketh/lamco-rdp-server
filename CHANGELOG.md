@@ -5,6 +5,50 @@ All notable changes to lamco-rdp-server will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.4-hyperv.1] - 2026-09-04
+
+Hyper-V Enhanced Session, KWin virtual outputs, and packaging for this fork.
+All changes are relative to upstream 1.4.4; the Cargo.toml version stays 1.4.4
+and the `-hyperv.N` suffix identifies this fork's release lineage.
+
+### Added
+
+**Hyper-V Enhanced Session transport** (opt-in)
+- AF_VSOCK listener under `[server.transports.vsock]` (`enabled = true`),
+  with a connection-ID allowlist for Hyper-V guests
+- Hyper-V auto-detection logs a hint when the transport is disabled
+- Pre-auth handshake deadline (X.224 / TLS / CredSSP) so a silent peer can
+  no longer park the single-connection accept loop
+
+**KWin virtual output sessions (`kwin-virtual`)**
+- Native per-connection virtual display at the client's requested resolution
+  on KDE Plasma 6+ via `zkde-screencast`; dialog-free, elastic resize
+- Wire input via the libei/EIS machinery with persistent event consumption
+
+**Client-visible cursor & shutdown improvements**
+- Guest cursor shape sent to the client (xrdp parity), session-scoped
+  transparent console cursor theme
+- Graceful disconnect via client-visible ErrorInfo instead of a bare quit
+
+**Encoders**
+- x264 AVC420 software encoder (2-3x faster than OpenH264) loaded at
+  runtime via dlopen — ships in this build; needs `libx264` on the target,
+  otherwise falls back to OpenH264 automatically. AVC444 always uses
+  OpenH264. x264 carries no patent grant; the exposure sits with whoever
+  installs libx264.
+
+**Packaging**
+- New `scripts/build-release-artifacts.sh` builds a prebuilt `.deb` and a
+  portable `tar.gz` with `install.sh` (single source of truth for local
+  and CI builds; GitHub Releases are published from tags `v1.4.4-hyperv.N`)
+
+### Fixed
+
+- 1366x768-class freezes caused by un-normalized padded capture strides
+- Damage regions consumed but never sent after an encoding-path stall
+- libei dead device handle after a resolution switch; region-offset
+  double-offset in multi-output sessions
+
 ## [1.0.0] - 2026-01-19
 
 ### Added
