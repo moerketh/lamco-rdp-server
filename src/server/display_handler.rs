@@ -1102,6 +1102,20 @@ impl LamcoDisplayHandler {
         info!("Server event sender configured for EGFX routing");
     }
 
+    /// Synchronous variant of [`Self::set_server_event_sender`] for
+    /// non-async call sites (per-transport routing in the accept dispatcher's
+    /// `on_server_routed`). Sound because the RwLock's writers are rare
+    /// (startup + per-route) and the accept loop is serial.
+    pub fn set_server_event_sender_blocking(&self, sender: mpsc::UnboundedSender<ServerEvent>) -> bool {
+        match self.server_event_tx.try_write() {
+            Ok(mut guard) => {
+                *guard = Some(sender);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
     /// Reset the display update channel for a new client connection
     ///
     /// Called when a client disconnects to allow the next client to claim
