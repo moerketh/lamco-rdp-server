@@ -34,6 +34,32 @@ use_portals = true
 # view_only = false
 
 # =============================================================================
+# Transport Configuration
+# =============================================================================
+# Additional transports beyond the TCP listener above. TCP always runs (see
+# server.listen_addr); the sections below add or tune the opt-in ones.
+[server.transports]
+# --- AF_VSOCK (Hyper-V Enhanced Session / host-guest transport) ---
+# [server.transports.vsock]
+# Tri-state enable:
+#   unset/absent — auto: enabled when Hyper-V is detected (DMI), else off
+#   enabled = true   — always on
+#   enabled = false  — always off
+# enabled = true
+# AF_VSOCK port. Defaults to 3389 (parallel to TCP).
+# port = 3389
+# Restrict accepted peers to these vsock CIDs. SECURITY: when the whole
+# [server.transports.vsock] subtable is ABSENT and Hyper-V auto-detection
+# enables the transport, this defaults to [2] (VMADDR_CID_HOST — the only
+# CID the host relay ever uses). When the subtable IS present but this key
+# is unset, any peer is accepted: Linux vsock loopback
+# (VMADDR_CID_LOCAL = 1 via vsock_loopback) then makes the listener reachable
+# from any local unprivileged process in the guest — and the plain-RDP server
+# serving vsock when security_mode != "rdp" performs NO authentication of its
+# own. Set an explicit allowlist unless you really mean "any".
+# allowed_cids = [2]
+
+# =============================================================================
 # Security Configuration
 # =============================================================================
 [security]
