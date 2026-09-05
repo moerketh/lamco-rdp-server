@@ -2162,7 +2162,7 @@ impl LamcoRdpServer {
         // Phase 1 of the unified transport accept layer, retrofit 2026-05-16
         // to use the AcceptDeployment trait pattern.
         //
-        // WlrDirectDeployment encapsulates the per-binary differences (TOML
+        // DesktopDeployment encapsulates the per-binary differences (TOML
         // transports config, mpsc D-Bus event sink, PAM validator, broadcast
         // shutdown, Portal-validity closure). AcceptDispatcher consumes the
         // trait and stays binary-agnostic.
@@ -2170,7 +2170,7 @@ impl LamcoRdpServer {
         // See:
         // - docs/design/transport/TRANSPORT-PHASE-1-SDS-2026-05-16.md
         // - docs/design/transport/TRANSPORT-PHASE-1-RETROFIT-SDS-2026-05-16.md
-        let deployment = deployment::WlrDirectDeployment::new(
+        let deployment = deployment::DesktopDeployment::new(
             self.config.clone(),
             self.display_handler.clone(),
             self.health_subscriber.clone(),

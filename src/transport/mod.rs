@@ -66,7 +66,7 @@ fn server_error_chain_contains_timed_out(err: &ironrdp_server::ServerError) -> b
 /// consumes this uniform interface and doesn't care which binary it's running
 /// inside.
 ///
-/// Implementors today: `crate::server::deployment::WlrDirectDeployment`, which
+/// Implementors today: `crate::server::deployment::DesktopDeployment`, which
 /// despite its name backs every desktop-sharing session strategy (Portal,
 /// Mutter Direct, libei, wlr-direct alike) — not just the wlr-direct one.
 /// Phase 2 adds `crate::qemu::deployment::QemuDeployment`.
