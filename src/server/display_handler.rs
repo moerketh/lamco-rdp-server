@@ -1825,7 +1825,9 @@ impl LamcoDisplayHandler {
             // are lost forever — the client never receives them, leaving
             // stale pixels ("artifacts persist until drawn over"). Accumulate
             // unsent regions and prepend them to the next encoded frame.
-            let mut accumulated_damage: Vec<DamageRegion> = Vec::new();
+            // See pipeline_decisions::DamageAccumulator for the invariants
+            // (replace-on-skip, merged+cap-bounded storage).
+            let mut accumulated_damage = pipeline_decisions::DamageAccumulator::new();
 
             // === FRAME STALL DETECTION ===
             // Track when we last received a frame from PipeWire. If the stream
@@ -2195,6 +2197,11 @@ impl LamcoDisplayHandler {
                                         detector.invalidate();
                                     }
 
+                                    // Any accumulated debt is in the OLD
+                                    // desktop's coordinate space; the resized
+                                    // stream gets a full first frame anyway.
+                                    accumulated_damage.clear();
+
                                     info!(
                                         "PipeWire stream recreated - deferring display update \
                                          until first frame confirms actual resolution"
@@ -2503,6 +2510,16 @@ impl LamcoDisplayHandler {
                             egfx_sender = None;
                             compositor_hint_distrusted = false;
                             consecutive_high_divergence = 0;
+                            // Re-arm the eager-probe calibration window: the
+                            // new client gets its own 30-frame probe-every-frame
+                            // phase (see EAGER_PROBE_FRAMES), rather than
+                            // inheriting the previous client's frame count.
+                            frames_since_connect = 0;
+                            // Stale debt is in the previous session's
+                            // coordinate space and the new client gets a full
+                            // first frame anyway — drop it rather than send
+                            // regions for content it never had.
+                            accumulated_damage.clear();
                             // New client needs fresh EGFX surface setup
                             handler
                                 .egfx_needs_init
@@ -2700,6 +2717,11 @@ impl LamcoDisplayHandler {
                             egfx_sender = None;
                             compositor_hint_distrusted = false;
                             consecutive_high_divergence = 0;
+                            // Mirror the Some(frame) reconnect block: re-arm
+                            // the eager-probe window and drop stale debt for
+                            // the new client.
+                            frames_since_connect = 0;
+                            accumulated_damage.clear();
                             handler
                                 .egfx_needs_init
                                 .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -3828,9 +3850,25 @@ impl LamcoDisplayHandler {
                                         }
                                     }
                                 } else {
-                                    // Keep DamageDetector reference frame synchronized for
-                                    // seamless fallback, without the cost of a full diff.
-                                    detector.update_reference(&pixel_data);
+                                    // Deliberately do NOT advance the detector's
+                                    // reference frame on non-probe frames. The
+                                    // probe-union comment above applies verbatim
+                                    // here: update_reference() bakes every pixel
+                                    // the compositor hint missed into the
+                                    // reference, and those pixels become
+                                    // permanently invisible to pixel-diff — the
+                                    // "reference-ahead-of-client" desync, applied
+                                    // to ~59 of every 60 frames. Window drags are
+                                    // the canonical hint-miss generator.
+                                    //
+                                    // Instead, leave the reference stale: the
+                                    // next calibration probe (≤2s away, every
+                                    // frame during the eager window) re-detects
+                                    // the accumulated miss and the probe-union
+                                    // sends it. Cost: a probe frame's send set
+                                    // covers everything missed since the last
+                                    // probe — strictly safer than the
+                                    // alternative (silent permanent loss).
                                 }
                             }
                             // Union the probe-missed regions into the hint set. A
@@ -3889,9 +3927,14 @@ impl LamcoDisplayHandler {
                             if damage_regions.is_empty() {
                                 damage_source = "accumulated";
                             }
-                            let mut combined = accumulated_damage.clone();
+                            let mut combined = accumulated_damage.take();
                             combined.extend(damage_regions);
-                            damage_regions = combined;
+                            // Merge the combined set: the debt and the fresh
+                            // regions frequently overlap (same area re-damaged
+                            // across skipped frames), and an unmerged set
+                            // double-counts area in compute_damage_ratio and
+                            // re-encodes the same pixels.
+                            damage_regions = crate::damage::merge_regions(combined, 0);
                         }
 
                         let damage_ratio = pipeline_decisions::compute_damage_ratio(
@@ -3914,13 +3957,17 @@ impl LamcoDisplayHandler {
                                 EncodingDecision::Skip => {
                                     frames_dropped += 1;
                                     if !damage_regions.is_empty() {
-                                        accumulated_damage.extend(damage_regions);
+                                        // REPLACE the debt with this frame's
+                                        // send set (prior debt + fresh): the
+                                        // set was already prepended above, so
+                                        // extending here would double it.
+                                        accumulated_damage.absorb(damage_regions);
                                     }
                                     continue;
                                 }
                                 EncodingDecision::WaitForMore => {
                                     if !damage_regions.is_empty() {
-                                        accumulated_damage.extend(damage_regions);
+                                        accumulated_damage.absorb(damage_regions);
                                     }
                                     continue;
                                 }
@@ -3953,7 +4000,6 @@ impl LamcoDisplayHandler {
                         // the accumulation debt is cleared (it was merged into
                         // damage_regions above).
                         accumulated_damage.clear();
-
                         if should_log_telemetry {
                             last_telemetry_log = std::time::Instant::now();
                             if let Some(ref detector) = damage_detector_opt {
@@ -4168,8 +4214,10 @@ impl LamcoDisplayHandler {
                                         frames_dropped += 1;
                                         // Client never received this content;
                                         // re-queue regions for the next frame
-                                        // (artifact prevention).
-                                        accumulated_damage.extend(damage_regions.iter().copied());
+                                        // (artifact prevention). Re-queue the
+                                        // full send set: the debt was already
+                                        // merged into it above.
+                                        accumulated_damage.absorb(damage_regions.clone());
                                         continue; // Drop frame, don't fall through to RemoteFX
                                     }
                                 }
@@ -4177,7 +4225,7 @@ impl LamcoDisplayHandler {
                             Ok(None) => {
                                 trace!("H.264 encoder skipped frame");
                                 frames_dropped += 1;
-                                accumulated_damage.extend(damage_regions.iter().copied());
+                                accumulated_damage.absorb(damage_regions.clone());
                                 continue;
                             }
                             Err(e) => {
@@ -4187,7 +4235,7 @@ impl LamcoDisplayHandler {
                                     e
                                 );
                                 frames_dropped += 1;
-                                accumulated_damage.extend(damage_regions.iter().copied());
+                                accumulated_damage.absorb(damage_regions.clone());
                                 continue; // Drop frame, don't fall through to RemoteFX
                             }
                         }
