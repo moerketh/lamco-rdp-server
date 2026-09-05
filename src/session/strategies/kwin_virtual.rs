@@ -448,9 +448,7 @@ fn wayland_thread(rx: std::sync::mpsc::Receiver<WlCommand>) {
     use wayland_protocols_plasma::screencast::v1::client::{
         zkde_screencast_stream_unstable_v1::Event as StreamEvent,
         zkde_screencast_stream_unstable_v1::ZkdeScreencastStreamUnstableV1,
-        zkde_screencast_unstable_v1::{
-            Event as ManagerEvent, Pointer, ZkdeScreencastUnstableV1,
-        },
+        zkde_screencast_unstable_v1::{Event as ManagerEvent, Pointer, ZkdeScreencastUnstableV1},
     };
 
     /// Per-thread dispatch state.
