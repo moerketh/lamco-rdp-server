@@ -448,7 +448,9 @@ fn wayland_thread(rx: std::sync::mpsc::Receiver<WlCommand>) {
     use wayland_protocols_plasma::screencast::v1::client::{
         zkde_screencast_stream_unstable_v1::Event as StreamEvent,
         zkde_screencast_stream_unstable_v1::ZkdeScreencastStreamUnstableV1,
-        zkde_screencast_unstable_v1::{Event as ManagerEvent, ZkdeScreencastUnstableV1},
+        zkde_screencast_unstable_v1::{
+            Event as ManagerEvent, Pointer, ZkdeScreencastUnstableV1,
+        },
     };
 
     /// Per-thread dispatch state.
@@ -732,6 +734,14 @@ fn wayland_thread(rx: std::sync::mpsc::Receiver<WlCommand>) {
                         state.retiring = Some(prev);
                     }
                     state.stream_sm.reset();
+                    // Pointer mode: Metadata. KWin then attaches cursor
+                    // position/hotspot/shape to each frame (SPA_META_Cursor),
+                    // which `process_cursor_update` turns into pointer PDUs
+                    // the client renders itself. Hidden (=1) would attach no
+                    // metadata at all and the client would be stuck with its
+                    // static default arrow forever — matching the portal
+                    // path, which also prefers Metadata (see
+                    // `best_cursor_mode` in screencast_only.rs).
                     let stream = screencast.stream_virtual_output(
                         OUTPUT_NAME.to_string(),
                         width,
@@ -739,9 +749,7 @@ fn wayland_thread(rx: std::sync::mpsc::Receiver<WlCommand>) {
                         // scale: 1.0 — RDP clients express size in physical
                         // pixels; no compositor-side scaling wanted.
                         1.0,
-                        // pointer mode: Hidden — RDP clients render their own
-                        // cursor via pointer PDUs (matches the portal path).
-                        1,
+                        u32::from(Pointer::Metadata),
                         &qh,
                         (),
                     );
