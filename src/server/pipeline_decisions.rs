@@ -27,6 +27,11 @@ pub(crate) fn compute_timestamp_ms(pts: u64, frames_sent: u64, target_fps: u32) 
 
 /// Fraction of the frame area covered by damage regions (0.0 when nothing
 /// changed). Drives adaptive-FPS activity tracking and the latency governor.
+///
+/// Note: sums region areas without deduplication — callers passing
+/// overlapping regions get a ratio inflated above the true coverage (and
+/// possibly >1.0). Feed this from a merged set (see `DamageAccumulator`)
+/// when the ratio drives decisions.
 pub(crate) fn compute_damage_ratio(regions: &[DamageRegion], width: u32, height: u32) -> f32 {
     if regions.is_empty() {
         return 0.0;
@@ -37,6 +42,91 @@ pub(crate) fn compute_damage_ratio(regions: &[DamageRegion], width: u32, height:
     }
     let damage_area: u64 = regions.iter().map(DamageRegion::area).sum();
     damage_area as f32 / frame_area as f32
+}
+
+/// Tracks damage regions from consumed-but-unsent frames ("debt") so no
+/// region is ever lost when the latency governor skips or a send fails.
+///
+/// Compositor damage hints are one-shot: a skipped frame's regions must be
+/// re-sent with a later one or the client keeps stale pixels forever.
+///
+/// Invariants:
+/// - `absorb` REPLACES the debt (it does not extend it): the incoming set
+///   already contains the prior debt, because the pipeline prepends debt to
+///   each frame's fresh regions before the governor runs. Extending here is
+///   what made the original inline code double the region count on every
+///   consecutive skip (2ⁿ growth across a sub-threshold skip streak —
+///   Interactive mode skips until `max_frame_delay_ms` elapses, easily 6-10
+///   consecutive skips at 60 fps).
+/// - The stored set is always merged (`merge_regions`) and hard-capped, so
+///   the debt cannot grow without bound and `compute_damage_ratio` over
+///   `take()`-ed output cannot double-count area.
+pub(crate) struct DamageAccumulator {
+    regions: Vec<DamageRegion>,
+    cap: usize,
+}
+
+impl DamageAccumulator {
+    /// Maximum number of rects retained as debt. The cap is never silently
+    /// exceeded: when it binds, the whole debt is replaced by its bounding
+    /// union — oversending the safe superset rather than dropping updates.
+    pub(crate) const DEFAULT_CAP: usize = 1024;
+
+    pub(crate) fn new() -> Self {
+        Self {
+            regions: Vec::new(),
+            cap: Self::DEFAULT_CAP,
+        }
+    }
+
+    /// Replace the debt with `send_set` (prior debt ∪ fresh regions), merged.
+    /// Called on the skip/wait paths where the frame was consumed but will
+    /// not be encoded.
+    pub(crate) fn absorb(&mut self, send_set: Vec<DamageRegion>) {
+        self.regions = Self::normalize(send_set, self.cap);
+    }
+
+    /// Take the entire debt, leaving the accumulator empty. The pipeline
+    /// prepends the returned regions to the next encoded frame's set.
+    pub(crate) fn take(&mut self) -> Vec<DamageRegion> {
+        std::mem::take(&mut self.regions)
+    }
+
+    /// Drop all debt (e.g. on reconnect/resize where the coordinate space
+    /// changed or the client will be fully re-initialized anyway).
+    pub(crate) fn clear(&mut self) {
+        self.regions.clear();
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.regions.is_empty()
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.regions.len()
+    }
+
+    /// Merge overlapping/adjacent regions; if the merged set still exceeds
+    /// the cap, collapse it to a single bounding union.
+    fn normalize(mut regions: Vec<DamageRegion>, cap: usize) -> Vec<DamageRegion> {
+        if regions.len() <= 1 {
+            return regions;
+        }
+        regions = crate::damage::merge_regions(regions, 0);
+        if regions.len() > cap
+            && let Some(first) = regions.first()
+        {
+            let union = regions.iter().skip(1).fold(*first, |acc, r| acc.union(r));
+            return vec![union];
+        }
+        regions
+    }
+}
+
+impl Default for DamageAccumulator {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Decide whether the pipeline should skip encoding this frame because the
@@ -296,12 +386,24 @@ pub(crate) fn evaluate_compositor_trust(
 /// covered intersection. Output is not merged — callers merge downstream
 /// (`merge_regions` in the damage pipeline) or accept the coarse
 /// fragmentation, which the tile-aligned inputs keep small in practice.
+///
+/// Worst case is multiplicative: each covering rect can split every surviving
+/// piece into up to 4 bands, so a pathological `covered` set produces
+/// O(4^|covered|) pieces per input region. A piece cap guards this: when it
+/// binds, the region is returned un-subtracted (a conservative oversend of
+/// its full area — the probe-union send set tolerates oversending, but never
+/// dropping).
 pub(crate) fn subtract_regions(
     regions: &[DamageRegion],
     covered: &[DamageRegion],
     frame_width: u32,
     frame_height: u32,
 ) -> Vec<DamageRegion> {
+    /// Per-region cap on fragmentation pieces before falling back to the
+    /// un-subtracted region. Generous for real workloads (compositor hints
+    /// arrive tile-aligned and coarse), while bounding the exponential.
+    const MAX_PIECES: usize = 256;
+
     // Fast paths: nothing to subtract from / by.
     if regions.is_empty() || covered.is_empty() {
         return regions.to_vec();
@@ -355,6 +457,14 @@ pub(crate) fn subtract_regions(
             if pieces.is_empty() {
                 break;
             }
+            if pieces.len() > MAX_PIECES {
+                // Fragmentation cap: return the region un-subtracted rather
+                // than let the worklist multiply further. Oversending is
+                // always safe here (probe-union semantics); under-sending
+                // would leave stale pixels.
+                pieces = vec![*r];
+                break;
+            }
         }
         result.extend(pieces);
     }
@@ -364,6 +474,99 @@ pub(crate) fn subtract_regions(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn accumulator_absorb_replaces_instead_of_extending() {
+        // Regression: the inline code extended the debt with a send set that
+        // already contained the debt, doubling it on every consecutive skip.
+        let mut acc = DamageAccumulator::new();
+        let a = DamageRegion::new(0, 0, 100, 100);
+        acc.absorb(vec![a]); // frame 1 skipped: debt = {A}
+        // Frame 2: send set = debt {A} + fresh {B}
+        let b = DamageRegion::new(200, 200, 50, 50);
+        acc.absorb(vec![a, b]); // must REPLACE, not extend → {A, B}
+        let taken = acc.take();
+        assert_eq!(taken.len(), 2, "no doubling: {taken:?}");
+        assert!(acc.is_empty());
+    }
+
+    #[test]
+    fn accumulator_survives_long_skip_streak_linearly() {
+        // 10 consecutive skips (an Interactive sub-threshold streak) must not
+        // grow the debt exponentially.
+        let mut acc = DamageAccumulator::new();
+        let fresh = DamageRegion::new(10, 10, 40, 40);
+        let mut send_set = vec![fresh];
+        for _ in 0..10 {
+            acc.absorb(send_set.clone());
+            // next frame's send set = debt + fresh
+            let mut next = acc.take();
+            next.push(fresh);
+            send_set = next;
+        }
+        acc.absorb(send_set);
+        assert!(
+            acc.len() <= 2,
+            "streak of 10 skips must stay bounded, got {}",
+            acc.len()
+        );
+    }
+
+    #[test]
+    fn accumulator_merges_overlapping_debt() {
+        let mut acc = DamageAccumulator::new();
+        // Two identical regions (e.g. re-detected at consecutive probes).
+        acc.absorb(vec![
+            DamageRegion::new(0, 0, 100, 100),
+            DamageRegion::new(0, 0, 100, 100),
+        ]);
+        assert_eq!(acc.len(), 1, "overlaps must merge: {:?}", acc.regions);
+        // Ratio over merged debt cannot double-count area.
+        let ratio = compute_damage_ratio(&acc.regions, 200, 200);
+        assert!((ratio - 0.25).abs() < 1e-6, "ratio {ratio}");
+    }
+
+    #[test]
+    fn accumulator_cap_collapses_to_bounding_union() {
+        let mut acc = DamageAccumulator::new();
+        // Push well past the cap with mutually non-adjacent regions.
+        let mut set = Vec::new();
+        for i in 0..(DamageAccumulator::DEFAULT_CAP + 64) {
+            let x = u32::try_from(i % 64).unwrap() * 1000;
+            let y = u32::try_from(i / 64).unwrap() * 1000;
+            set.push(DamageRegion::new(x, y, 10, 10));
+        }
+        acc.absorb(set);
+        assert!(
+            acc.len() <= DamageAccumulator::DEFAULT_CAP,
+            "cap must bind, got {}",
+            acc.len()
+        );
+    }
+
+    #[test]
+    fn subtract_caps_fragmentation_instead_of_exploding() {
+        // Pathological covered set: many thin strips crossing the region
+        // would multiply pieces toward 4^|covered| without the cap.
+        let region = DamageRegion::new(0, 0, 4096, 4096);
+        let covered: Vec<DamageRegion> = (0..200)
+            .map(|i| {
+                let y = i * 20;
+                // Horizontal strip crossing the full width, with a gap so
+                // full_coverage doesn't trigger.
+                DamageRegion::new(0, y, 4000, 10)
+            })
+            .collect();
+        let out = subtract_regions(&[region], &covered, 4096, 4096);
+        // Either the exact subtraction finished cheaply or the cap fell back
+        // to the whole region — both bounded results are acceptable; the
+        // exponential blowup (4^200) is not.
+        assert!(
+            out.len() <= 256 || (out.len() == 1 && out[0] == region),
+            "bounded output expected, got {}",
+            out.len()
+        );
+    }
 
     #[test]
     fn timestamp_prefers_pts_when_present() {
