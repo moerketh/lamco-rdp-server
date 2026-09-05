@@ -4446,12 +4446,14 @@ impl LamcoDisplayHandler {
     /// today's single-monitor reality (a `monitor_index` of the one active
     /// stream's node id, offset `(0, 0)` unless the primary is actually
     /// positioned away from the virtual desktop origin).
-    fn stream_offset_for(&self, monitor_index: u32) -> (i32, i32) {
-        // Sync context over the async RwLock: blocking_read is sound here —
-        // this runs on pipeline/EGFX tasks, not inside an async critical
-        // section that could deadlock against the writer side.
+    async fn stream_offset_for(&self, monitor_index: u32) -> (i32, i32) {
+        // Async context over the async RwLock: both callers
+        // (transform_rectangle_to_rdp, process_cursor_update) are async fns
+        // on tokio workers, where blocking_read() panics ("Cannot block the
+        // current thread from within a runtime") and kills the frame loop.
         self.stream_info
-            .blocking_read()
+            .read()
+            .await
             .iter()
             .find(|s| s.node_id == monitor_index)
             .map_or((0, 0), |s| s.position)
@@ -4485,7 +4487,7 @@ impl LamcoDisplayHandler {
         else {
             return rect;
         };
-        let offset = self.stream_offset_for(monitor_index);
+        let offset = self.stream_offset_for(monitor_index).await;
         let global_x = f64::from(i32::from(rect.left) + offset.0);
         let global_y = f64::from(i32::from(rect.top) + offset.1);
         let Ok((rdp_x, rdp_y)) = transformer.lock().await.stream_to_rdp(global_x, global_y) else {
@@ -4562,7 +4564,7 @@ impl LamcoDisplayHandler {
             .as_ref()
             .map(|h| Arc::clone(&h.coordinate_transformer));
         if let Some(transformer) = transformer {
-            let offset = self.stream_offset_for(monitor_index);
+            let offset = self.stream_offset_for(monitor_index).await;
             let global_x = f64::from(cursor.position.0 + offset.0);
             let global_y = f64::from(cursor.position.1 + offset.1);
             match transformer.lock().await.stream_to_rdp(global_x, global_y) {

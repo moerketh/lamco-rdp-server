@@ -37,6 +37,14 @@ All changes are relative to `1.4.4-hyperv.1`; the Cargo.toml version stays
 
 ### Fixed
 
+- **Black screen after reconnect (frame-loop panic)**: the FastPath bitmap
+  fallback path called `stream_info.blocking_read()` (synchronous tokio RwLock)
+  from async context — `stream_offset_for()`'s "runs on non-async tasks"
+  assumption was wrong. When a reconnect closed the EGFX DVC channel and the
+  gate timed out, the first cursor/rectangle transform panicked with
+  "Cannot block the current thread from within a runtime", killing the
+  frame-processing task: permanent black screen with PipeWire backpressure
+  until service restart. `stream_offset_for()` is now async.
 - **Permanent artifacts after damage misses**: periodic full-frame IDR
   (keyframe) every `periodic_idr_interval` seconds lets the client
   self-heal any accumulated reference-frame desynchronization
