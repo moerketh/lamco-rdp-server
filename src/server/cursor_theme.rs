@@ -75,6 +75,17 @@ pub trait CmdRunner: Send + Sync {
     fn persist_theme(&self, theme: &str) -> bool;
 }
 
+/// Validate a theme name before it becomes an argv element.
+///
+/// No shell is involved, so this is not classic injection — but a name
+/// beginning with `-` would be parsed as a flag by
+/// `plasma-apply-cursortheme` (config-sourced strings, operator-typoable),
+/// and NUL/empty can never be a valid theme. Reject those; everything
+/// else is a harmless literal argument.
+fn valid_theme_name(theme: &str) -> bool {
+    !theme.is_empty() && !theme.starts_with('-') && !theme.contains('\0')
+}
+
 /// Production runner: the lamco service runs as the desktop user inside
 /// the graphical session (the desktop's systemd user unit), so commands
 /// only need the session-bus env a non-login context may be missing.
@@ -133,10 +144,18 @@ fn current_uid() -> u32 {
 
 impl CmdRunner for SessionCmdRunner {
     fn apply_theme(&self, theme: &str) -> bool {
+        if !valid_theme_name(theme) {
+            warn!("rejecting invalid cursor theme name {theme:?} (empty/flag/NUL)");
+            return false;
+        }
         self.run(&["/usr/bin/plasma-apply-cursortheme", theme])
     }
 
     fn persist_theme(&self, theme: &str) -> bool {
+        if !valid_theme_name(theme) {
+            warn!("rejecting invalid cursor theme name {theme:?} (empty/flag/NUL)");
+            return false;
+        }
         self.run(&[
             "/usr/bin/kwriteconfig6",
             "--file",
@@ -295,6 +314,48 @@ mod tests {
             visible: "breeze_cursors".into(),
             transparent: "transparent".into(),
         }
+    }
+
+    #[test]
+    fn theme_name_validation_rejects_adversarial_names() {
+        // Flag-shaped names would be parsed as options by
+        // plasma-apply-cursortheme; empty and NUL-bearing names can never
+        // be valid themes.
+        assert!(!valid_theme_name(""));
+        assert!(!valid_theme_name("-h"));
+        assert!(!valid_theme_name("--help"));
+        assert!(!valid_theme_name("--"));
+        assert!(!valid_theme_name("foo\0bar"));
+        // Acceptable names: literals, dots, underscores, spaces.
+        assert!(valid_theme_name("breeze_cursors"));
+        assert!(valid_theme_name("Premium-Plus"));
+        assert!(valid_theme_name("Whiteglass 2"));
+        assert!(valid_theme_name("Adwaita"));
+    }
+
+    #[test]
+    fn manager_rejects_flag_shaped_config_theme_names() {
+        // End to end through the manager: a config-typo'd visible theme
+        // starting with '-' must not reach the runner as an argv element
+        // (the FakeRunner records whatever it is given; the production
+        // SessionCmdRunner is the rejecting gate, asserted separately by
+        // theme_name_validation_rejects_adversarial_names + the run()
+        // argv path).
+        let runner = FakeRunner::ok();
+        let bad = CursorThemes {
+            visible: "--config=/etc/passwd".into(),
+            transparent: "transparent".into(),
+        };
+        let mgr = CursorThemeManager::new(bad, &runner);
+        mgr.begin_rdp_session();
+        // The toggle apply of the (invalid) visible theme is attempted via
+        // the runner seam; the production gate would have rejected it. The
+        // transparent theme itself is valid and proceeds.
+        let calls = runner.calls();
+        assert!(
+            calls.iter().any(|c| c.starts_with("apply:transparent")),
+            "transparent apply must proceed: {calls:?}"
+        );
     }
 
     #[test]

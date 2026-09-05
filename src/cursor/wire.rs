@@ -44,10 +44,11 @@ pub struct WirePointer {
     pub height: u16,
     pub hot_x: u16,
     pub hot_y: u16,
-    /// Tightly packed, bottom-up... no: top-to-bottom in this struct's own
-    /// row order (row 0 first); `into_rgba_pointer` is what flips it to the
-    /// wire's bottom-up requirement. Kept top-down here so callers that only
-    /// want to inspect the shape (tests) see a natural row order.
+    /// Tightly packed BGRA, stored top-to-bottom (row 0 first).
+    /// `into_rgba_pointer`/`into_large_pointer` flip to the wire's
+    /// bottom-up row order on the way out (see `wire_rows`). Kept top-down
+    /// here so callers that only want to inspect the shape (tests) see a
+    /// natural row order.
     pub data: Vec<u8>,
 }
 

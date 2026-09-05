@@ -272,7 +272,7 @@ impl TransportsConfig {
     }
 
     /// Phase 1 compatibility shim. Phase 3a renamed this to `resolve`; the
-    /// old name is preserved as a thin wrapper to keep WlrDirectDeployment
+    /// old name is preserved as a thin wrapper to keep DesktopDeployment
     /// callers stable. Prefer `resolve`.
     pub fn resolve_phase1(&self, server_listen_addr: &str) -> Result<ResolvedTransports> {
         self.resolve(server_listen_addr)

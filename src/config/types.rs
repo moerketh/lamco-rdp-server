@@ -1314,7 +1314,13 @@ impl DamageTrackingConfig {
         match self.method.as_str() {
             // Presets
             "recommended" | "hybrid" => (false, "recommended".to_string()),
-            "pixel-diff-exact" | "diff" | "" => (true, "pixel-diff-exact".to_string()),
+            // An empty string is far more likely a config mistake than a
+            // deliberate request for the highest-CPU path: unlike other
+            // unrecognized strings (which fall through to recommended with
+            // a note), "" would otherwise silently opt into exclusive
+            // pixel-diff. Treat it as unset.
+            "" => (false, "recommended (unset)".to_string()),
+            "pixel-diff-exact" | "diff" => (true, "pixel-diff-exact".to_string()),
             "pipewire" => (false, "pipewire".to_string()),
             other => {
                 // Unknown method string: fall back to the recommended path so
@@ -1752,6 +1758,37 @@ impl Default for GuiStateConfig {
 mod tests {
     use super::*;
     use crate::compositor::CompositorType;
+
+    #[test]
+    fn damage_method_empty_string_resolves_to_recommended() {
+        // An unset/empty method must not silently opt into exclusive
+        // pixel-diff (the highest-CPU path) — it is far more likely a
+        // config mistake than a deliberate request.
+        let cfg = DamageTrackingConfig {
+            method: String::new(),
+            ..DamageTrackingConfig::default()
+        };
+        let (exclusive, name) = cfg.resolve_method();
+        assert!(!exclusive, "empty method must not be pixel-diff exclusive");
+        assert!(name.starts_with("recommended"), "got {name}");
+    }
+
+    #[test]
+    fn damage_method_presets_and_fallbacks() {
+        let m = |s: &str| DamageTrackingConfig {
+            method: s.to_string(),
+            ..DamageTrackingConfig::default()
+        };
+        assert_eq!(m("recommended").resolve_method().1, "recommended");
+        assert_eq!(m("hybrid").resolve_method().1, "recommended");
+        assert!(m("pixel-diff-exact").resolve_method().0);
+        assert!(m("diff").resolve_method().0);
+        assert_eq!(m("pipewire").resolve_method().1, "pipewire");
+        // Typos degrade to recommended with a note.
+        let (exclusive, name) = m("pixl-diff-exact").resolve_method();
+        assert!(!exclusive);
+        assert_eq!(name, "recommended (pixl-diff-exact)");
+    }
 
     #[test]
     fn input_protocol_auto_selects_libei_for_gnome() {

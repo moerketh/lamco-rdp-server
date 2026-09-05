@@ -1,4 +1,4 @@
-//! `WlrDirectDeployment` — `AcceptDeployment` for the lamco-rdp-server binary
+//! `DesktopDeployment` — `AcceptDeployment` for the lamco-rdp-server binary
 //! running on a user desktop (the wlr-direct / Portal / Mutter Direct paths).
 //!
 //! Encapsulates the per-binary differences described in
@@ -25,7 +25,7 @@ use crate::{
     },
 };
 
-pub(crate) struct WlrDirectDeployment {
+pub(crate) struct DesktopDeployment {
     config: Arc<Config>,
     display_handler: Arc<LamcoDisplayHandler>,
     health_subscriber: Option<HealthSubscriber>,
@@ -50,7 +50,7 @@ pub(crate) struct WlrDirectDeployment {
     primary_event_sender: tokio::sync::mpsc::UnboundedSender<ironrdp_server::ServerEvent>,
 }
 
-impl WlrDirectDeployment {
+impl DesktopDeployment {
     pub(crate) fn new(
         config: Arc<Config>,
         display_handler: Arc<LamcoDisplayHandler>,
@@ -77,12 +77,12 @@ impl WlrDirectDeployment {
 }
 
 #[async_trait::async_trait]
-impl AcceptDeployment for WlrDirectDeployment {
+impl AcceptDeployment for DesktopDeployment {
     fn name(&self) -> &'static str {
-        // Despite the type's name, this backs every desktop-sharing session
-        // strategy (Portal, Mutter Direct, libei, wlr-direct alike), not just
-        // wlr-direct — the log-visible label reflects that, matching how
-        // QemuDeployment's name() is "qemu" rather than a specific strategy.
+        // Backs every desktop-sharing session strategy (Portal, Mutter
+        // Direct, libei, wlr-direct alike) — matching how QemuDeployment's
+        // name() is "qemu" rather than a specific strategy. (The type was
+        // renamed from WlrDirectDeployment to match.)
         "desktop"
     }
 
@@ -115,6 +115,19 @@ impl AcceptDeployment for WlrDirectDeployment {
                 tracing::debug!(
                     route = ?route,
                     "display handler event sender re-pointed at the serving server"
+                );
+            } else {
+                // try_write lost a race (the writer side is only contended
+                // at startup, so this should be rare). The display handler
+                // still holds the PREVIOUS server's sender: every
+                // EGFX/cursor/rdpsnd command it emits until the next route
+                // switch is silently dropped into the idle server. Warn so
+                // the condition is visible rather than manifesting as an
+                // inexplicably dead graphics channel.
+                tracing::warn!(
+                    route = ?route,
+                    "failed to re-point display handler event sender (lock contention); \
+                     graphics/cursor/sound commands may be dropped until the next route switch"
                 );
             }
         }
