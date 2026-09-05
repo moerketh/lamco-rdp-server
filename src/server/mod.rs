@@ -1228,6 +1228,26 @@ impl LamcoRdpServer {
                          Standard RDP Security for Hyper-V Enhanced Session (vmconnect) \
                          connections; TCP/Unix/WebSocket keep their configured security"
                         );
+                        // The plain server never runs CredSSP, so the PAM
+                        // credential validator installed on the primary does
+                        // not apply to vsock-originated connections — they are
+                        // accepted on the host-relay's say-so alone. That is
+                        // the intended Hyper-V Enhanced Session design (vmms
+                        // authenticates the user before forwarding), but it
+                        // must be visible, not silent: with auth_method set to
+                        // anything but "none", say it loudly so an operator
+                        // hardening TCP auth knows vsock is the open flank.
+                        // (Mitigated by the CID allowlist; on the auto-detect
+                        // path it defaults to [VMADDR_CID_HOST].)
+                        if config.security.auth_method != "none" {
+                            warn!(
+                                auth_method = %config.security.auth_method,
+                                "Security: the vsock plain-RDP server does NOT authenticate \
+                                 (no CredSSP/PAM) — access control is the host relay's job. \
+                                 Restrict [server.transports.vsock] allowed_cids if this is \
+                                 unintended."
+                            );
+                        }
                         Some(
                             RdpServer::builder()
                                 .with_addr(listen_addr)

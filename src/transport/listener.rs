@@ -26,6 +26,17 @@ use tracing::{info, warn};
 pub trait AsyncRdpStream: AsyncRead + AsyncWrite + Send + Sync + Unpin {}
 impl<T> AsyncRdpStream for T where T: AsyncRead + AsyncWrite + Send + Sync + Unpin {}
 
+/// The vsock CID of the hypervisor host (`VMADDR_CID_HOST` = 2).
+///
+/// Always available (not feature-gated) so config defaults can reference it
+/// regardless of build; re-exported from `tokio_vsock` when the feature is on.
+#[cfg(feature = "vsock")]
+pub const VMADDR_CID_HOST: u32 = tokio_vsock::VMADDR_CID_HOST;
+/// The vsock CID of the hypervisor host (`VMADDR_CID_HOST` = 2), literal form
+/// for feature-less builds (config defaults only need the value).
+#[cfg(not(feature = "vsock"))]
+pub const VMADDR_CID_HOST: u32 = 2;
+
 /// Best-effort peer identification surfaced from each transport.
 ///
 /// Different transports expose different peer information. TCP and WebSocket
@@ -381,7 +392,20 @@ impl VsockListenerImpl {
     ) -> Result<Self, TransportError> {
         let addr = tokio_vsock::VsockAddr::new(tokio_vsock::VMADDR_CID_ANY, port);
         let listener = tokio_vsock::VsockListener::bind(addr).map_err(TransportError::Io)?;
-        let effective = match allowed_cids {
+        let effective = Self::normalize_allowlist(allowed_cids, port);
+        Ok(Self {
+            listener,
+            port,
+            allowed_cids: effective,
+        })
+    }
+
+    /// Normalize a configured allowlist to its effective form, logging which
+    /// enforcement mode was engaged. Shared by the bind and socket-activation
+    /// paths so a systemd-passed fd enforces exactly what the config asked
+    /// for (the original `from_owned_fd` silently dropped the allowlist).
+    fn normalize_allowlist(allowed_cids: Option<Vec<u32>>, port: u32) -> Option<Vec<u32>> {
+        match allowed_cids {
             Some(list) if !list.is_empty() => {
                 info!(
                     port,
@@ -397,17 +421,14 @@ impl VsockListenerImpl {
                 );
                 None
             }
-        };
-        Ok(Self {
-            listener,
-            port,
-            allowed_cids: effective,
-        })
+        }
     }
 
     /// Construct from a systemd-passed `OwnedFd` of kind `SOCK_STREAM AF_VSOCK`.
     /// Requires `ListenStream=vsock:<cid>:<port>` in the `.socket` unit
-    /// (systemd 246+, Linux 5.7+).
+    /// (systemd 246+, Linux 5.7+). The CID allowlist is threaded through
+    /// rather than hard-coded so socket activation enforces the same policy
+    /// the bind path does.
     ///
     /// # Safety
     ///
@@ -419,7 +440,10 @@ impl VsockListenerImpl {
         unsafe_code,
         reason = "tokio_vsock::VsockListener::from_raw_fd is unsafe; safety justified inline"
     )]
-    pub fn from_owned_fd(fd: std::os::fd::OwnedFd) -> Result<Self, TransportError> {
+    pub fn from_owned_fd(
+        fd: std::os::fd::OwnedFd,
+        allowed_cids: Option<Vec<u32>>,
+    ) -> Result<Self, TransportError> {
         use std::os::fd::{FromRawFd, IntoRawFd};
 
         let raw = fd.into_raw_fd();
@@ -427,14 +451,11 @@ impl VsockListenerImpl {
         // listening AF_VSOCK socket. tokio-vsock's FromRawFd takes ownership.
         let listener = unsafe { tokio_vsock::VsockListener::from_raw_fd(raw) };
         let port = listener.local_addr().map_or(0, |a| a.port());
-        info!(
-            port,
-            "vsock listener wrapped from systemd-passed fd (any peer)"
-        );
+        let effective = Self::normalize_allowlist(allowed_cids, port);
         Ok(Self {
             listener,
             port,
-            allowed_cids: None,
+            allowed_cids: effective,
         })
     }
 }

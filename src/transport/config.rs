@@ -112,14 +112,19 @@ pub struct VsockTransportConfig {
     #[serde(default = "default_vsock_port")]
     pub port: u32,
     /// Restrict accepted peers to these CIDs. `None` (default) accepts ANY
-    /// peer — access control delegated to the hypervisor/firewall layer, the
-    /// upstream default. Hyper-V Enhanced Session connections originate from
-    /// the host (VMADDR_CID_HOST = 2); provisioning an allowlist like `[2]`
-    /// confines the listener to exactly that. An empty list is invalid and
-    /// resolves to "any" (same as `None`) rather than "none", because a
-    /// misconfigured empty list must not silently brick the transport — the
-    /// operator intent is expressed by REMOVING the key or setting it to a
-    /// non-empty list.
+    /// peer — access control delegated to the hypervisor/firewall layer.
+    /// Hyper-V Enhanced Session connections originate from the host
+    /// (VMADDR_CID_HOST = 2). Note the two default paths differ: an explicit
+    /// `[server.transports.vsock]` subtable with `allowed_cids` unset accepts
+    /// any peer (upstream-compatible), while the whole-subtable-absent
+    /// Hyper-V auto-detect path defaults to `[2]` — see `resolve`. Linux
+    /// vsock supports loopback (VMADDR_CID_LOCAL = 1 via vsock_loopback), so
+    /// any-peer is reachable from unprivileged local processes, and the
+    /// plain-RDP server this transport can feed is unauthenticated. An empty
+    /// list is invalid and resolves to "any" (same as `None`) rather than
+    /// "none", because a misconfigured empty list must not silently brick
+    /// the transport — the operator intent is expressed by REMOVING the key
+    /// or setting it to a non-empty list.
     #[serde(default)]
     pub allowed_cids: Option<Vec<u32>>,
 }
@@ -208,14 +213,20 @@ impl TransportsConfig {
             None => {
                 if detect_hyperv() {
                     let port = default_vsock_port();
+                    // Security default: the whole-subtable-absent auto-enable
+                    // path gets [VMADDR_CID_HOST] (=2). Linux vsock supports
+                    // loopback (VMADDR_CID_LOCAL = 1 via vsock_loopback), so
+                    // an any-peer listener is reachable by any local
+                    // unprivileged process in the guest — and the plain-RDP
+                    // server this transport feeds is unauthenticated. 2 is
+                    // the only CID Hyper-V Enhanced Session ever uses.
+                    let allowed_cids = Some(vec![crate::transport::listener::VMADDR_CID_HOST]);
                     info!(
                         port,
-                        "vsock listener: Hyper-V detected, auto-enabling with defaults"
+                        cids = ?allowed_cids,
+                        "vsock listener: Hyper-V detected, auto-enabling with defaults (host CID only)"
                     );
-                    Some(ResolvedVsockTransport {
-                        port,
-                        allowed_cids: None,
-                    })
+                    Some(ResolvedVsockTransport { port, allowed_cids })
                 } else {
                     None
                 }
