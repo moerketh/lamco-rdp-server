@@ -3704,8 +3704,14 @@ impl LamcoDisplayHandler {
                         let cadence_elapsed =
                             last_telemetry_log.elapsed() >= telemetry_log_interval;
                         let in_eager_window = frames_since_connect <= EAGER_PROBE_FRAMES;
-                        let should_probe =
-                            cadence_elapsed || (in_eager_window && !compositor_hint_distrusted);
+                        // pixel-diff-exact: the detector IS the damage source —
+                        // there is nothing to cross-check, so never probe. Without
+                        // this guard the trust evaluation below would run (and
+                        // log spurious "hints distrusted" warnings) even though
+                        // hints were never consulted for the send set.
+                        let should_probe = !pixel_diff_exclusive
+                            && (cadence_elapsed
+                                || (in_eager_window && !compositor_hint_distrusted));
                         let should_log_telemetry = cadence_elapsed || in_eager_window;
 
                         // Which source produced damage_regions this frame — logged
