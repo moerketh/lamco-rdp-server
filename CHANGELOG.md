@@ -11,9 +11,13 @@ Add entries here as work lands; retitle to the release version and date when the
 
 ## [1.4.5-hyperv.2] - 2026-09-05
 
-Visual-fidelity and damage-tracking fixes for the Hyper-V / KDE line.
-All changes are relative to `1.4.4-hyperv.1`; the Cargo.toml version stays
-1.4.4 and the `-hyperv.N` suffix identifies this fork's release lineage.
+Visual-fidelity and damage-tracking fixes for the Hyper-V / KDE line,
+plus a full external-review remediation round (cursor, macroblock
+alignment, memory safety, transport robustness, vsock security, x264
+ABI gating). All changes are relative to `1.4.4-hyperv.1`; the
+Cargo.toml version stays 1.4.5 and the `-hyperv.N` suffix identifies
+this fork's release lineage. The tag was re-pointed to include the
+remediation; the release notes below cover both rounds.
 
 ### Added
 
@@ -21,9 +25,16 @@ All changes are relative to `1.4.4-hyperv.1`; the Cargo.toml version stays
 - `"recommended"` (new default): compositor hints as primary damage source,
   periodic pixel-diff calibration with automatic distrust fallback
 - `"pixel-diff-exact"`: pixel-diff as the sole damage source — highest
-  fidelity, higher CPU (aliases: `"diff"`, empty)
+  fidelity, higher CPU (aliases: `"diff"`)
 - `"pipewire"`: PipeWire damage hints only (unchanged)
 - `Config::validate()` and `example-config.toml` updated accordingly
+- An empty `method` now resolves to `recommended (unset)` instead of
+  silently opting into exclusive pixel-diff
+
+**vsock transport documentation** — `[server.transports.vsock]`
+(port, `allowed_cids` semantics, loopback caveat) documented in
+`example-config.toml`; `enabled` and `allowed_cids` shown as an
+uncomment-together pair.
 
 ### Changed
 
@@ -33,7 +44,16 @@ All changes are relative to `1.4.4-hyperv.1`; the Cargo.toml version stays
   tripped on
 - Eager calibration: the pixel-diff probe runs on every frame for the
   first 30 frames after connect, so distrust engages within seconds
-  instead of after several periodic probe cycles
+  instead of after several periodic probe cycles; the eager window and
+  damage debt now reset for each new client connection
+- Per-frame full-buffer clone dropped on the already-aligned encode path
+  (~8MB/frame at 1080p saved); DMA-BUF materialization wrapped in
+  `block_in_place` off the async runtime thread
+- `WlrDirectDeployment` renamed `DesktopDeployment` (it backs every
+  desktop-sharing strategy)
+- Fork-authored sections of the `start_pipeline` loop extracted to
+  `pipeline_sections.rs` (blame-gated; upstream text untouched;
+  merge-surface verified unchanged vs upstream)
 
 ### Fixed
 
@@ -52,7 +72,60 @@ All changes are relative to `1.4.4-hyperv.1`; the Cargo.toml version stays
   missed) were previously discarded when the probe frame raced ahead of
   the client-acknowledged reference frame; they are now unioned into the
   send set via `pipeline_decisions::subtract_regions()` (axis-aligned
-  region subtraction)
+  region subtraction)- **Cursor never changes shape over RDP**: the kwin-virtual strategy
+  requested pointer mode Hidden, which attaches no cursor metadata at
+  all — the client was stuck with its static default arrow forever.
+  Now requests `Pointer::Metadata`; KWin attaches `SPA_META_Cursor` and
+  the existing pointer-PDU path delivers shapes (resize arrows, I-beam)
+- **Tearing at window edges while dragging (both H.264 send paths)**:
+  `regionRects` are now snapped to the 16px macroblock grid (left/top
+  down, right/bottom up), clamped to the *encoded* (aligned) frame
+  dimensions, and overlap-merged. Initially applied to the AVC420 path
+  only; a verification round caught the AVC444 path (the
+  default-negotiated one on the OpenH264/VA-API ladder) still using raw
+  display geometry — both now aligned
+- **Damage-detection reference drift**: `update_reference()` ran on
+  ~59 of 60 frames, baking compositor-hint misses into the detector
+  reference where pixel-diff could never re-detect them (permanent drag
+  trails). The reference is now left stale between calibration probes;
+  the probe-union mechanism recovers accumulated misses
+- **Exponential damage-debt growth on governor skip streaks**: the
+  accumulation path extended an already-prepended set, doubling region
+  count per consecutive skip (2ⁿ). Debt is now REPLACED, merged
+  (overlaps can no longer double-count area in the damage ratio) and
+  hard-capped; `subtract_regions` gained a fragmentation cap bounding
+  its O(4ⁿ) worst case
+- **DMA-BUF out-of-bounds reads (SIGBUS abort)**: three CPU-read sites
+  mapped `len` bytes at offset 0 but copied from `ptr + plane.offset`,
+  reading past the mapping whenever `plane.offset > 0`; the
+  materializer additionally sized reads with a `max(w*h*4)` guess that
+  could exceed the allocation. All sites now share one bounds-checked
+  helper (maps `offset+len`, validates the extent via
+  `lseek(SEEK_END)`, clamps)
+- **Handshake errors swallowed by the deadline wrapper**: a peer that
+  RST mid-handshake occupied the serial accept dispatcher for the full
+  30s window and was misreported as TimedOut; real I/O errors now
+  propagate immediately. The post-session drain loop (which dropped
+  legitimate queued reconnects — the primary Hyper-V flow) is removed
+- **vsock any-peer default on auto-detect**: Hyper-V auto-enable now
+  defaults `allowed_cids = [VMADDR_CID_HOST]` (Linux vsock loopback
+  made the any-peer listener reachable from unprivileged local
+  processes, and the plain-RDP vsock server performs no authentication
+  of its own); a loud startup warning states the auth delegation when
+  `auth_method != "none"`
+- **x264 ABI-gate hardening**: the runtime `_164 → _148` fallback
+  deliberately called a different-ABI entry point through a mismatched
+  `x264_param_t` (UB); the loader now requires the exact
+  `x264_encoder_open_<X264_BUILD>` symbol and derives the soname from
+  the same macro, so library and header must agree by construction.
+  Encode/close fn pointers are cached (no per-frame dlsym), the NAL
+  concat loop is bounds-checked, and a lost IDR request can no longer
+  be silently swallowed when the encoder buffers a frame
+- **Sender-swap failure silently tolerated**: a failed
+  `set_server_event_sender_blocking` left EGFX/cursor/sound commands
+  flowing into the idle server; now warns loudly
+- Cursor-theme names from config are validated (empty, leading `-`,
+  NUL) before becoming `plasma-apply-cursortheme` argv elements
 
 ## [1.4.5] - 2026-09-02
 
