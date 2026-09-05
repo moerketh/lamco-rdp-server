@@ -17,7 +17,7 @@ use std::os::fd::AsRawFd;
 use lamco_pipewire::{DmaBufDescriptor, FrameBuffer, VideoFrame};
 use tracing::{info, trace, warn};
 
-use crate::egfx::dmabuf_access::{self, DmaBufSyncGuard};
+use crate::egfx::dmabuf_access;
 
 /// FrameFlags::DMABUF bit (crate has set but no clear — clear via from_bits).
 const FRAME_FLAG_DMABUF_BIT: u32 = 1 << 0;

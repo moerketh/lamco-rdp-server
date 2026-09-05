@@ -21,11 +21,7 @@ pub mod socket_activation;
 #[cfg(feature = "websocket")]
 pub mod websocket;
 
-use std::{
-    future::Future,
-    pin::Pin,
-    time::{Duration, Instant},
-};
+use std::{future::Future, pin::Pin, time::Instant};
 
 use anyhow::Result;
 pub use config::TransportsConfig;
@@ -38,6 +34,28 @@ pub use listener::{
 pub use proxy_auth::{AllowAllInsecure, DenyAll, ProxyAuthValidator, SharedSecretValidator};
 pub use socket_activation::{ActivatedFds, ActivationError};
 use tracing::{debug, error, info, warn};
+
+/// Whether `err`'s chain (the error itself or any `source`) contains an
+/// `io::Error` with `ErrorKind::TimedOut`.
+///
+/// `ServerError`'s `Display` renders only its own context+kind and never
+/// walks the source chain (see the precedent and longer comment in
+/// `handler.rs::on_disconnected_async`), and the handshake-deadline io::Error
+/// arrives nested two sources deep under `Connector(Custom(..))` — so
+/// neither string-matching the top level nor matching the top-level
+/// `ServerErrorKind` can detect it. Source-walking is the reliable check.
+fn server_error_chain_contains_timed_out(err: &ironrdp_server::ServerError) -> bool {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(e) = source {
+        if let Some(io_err) = e.downcast_ref::<std::io::Error>()
+            && io_err.kind() == std::io::ErrorKind::TimedOut
+        {
+            return true;
+        }
+        source = e.source();
+    }
+    false
+}
 
 /// Configures and runs an `AcceptDispatcher` for a specific binary's runtime
 /// context (desktop, qemu, future vsock-only, future WebSocket gateway, etc).
@@ -330,10 +348,16 @@ impl AcceptDispatcher {
                     // Surface deadline-based aborts distinctly from ordinary
                     // handshake failures — the wedge mitigation working as
                     // designed is worth seeing in logs at a glance.
-                    if let Err(ref e) = conn_result {
-                        if e.to_string().contains("handshake deadline elapsed") {
-                            handshake_deadline::log_deadline_rejection(&peer_display, duration);
-                        }
+                    // NOTE: ServerError's Display does not walk its source
+                    // chain (see on_disconnected_async's comment in
+                    // handler.rs), and the deadline io::Error arrives nested
+                    // under Connector layers anyway — string-matching the
+                    // top-level message can never fire. Walk sources for the
+                    // io::Error instead.
+                    if let Err(ref e) = conn_result
+                        && server_error_chain_contains_timed_out(e)
+                    {
+                        handshake_deadline::log_deadline_rejection(&peer_display, duration);
                     }
 
                     // on_disconnected_async: classify error, emit ClientDisconnected,
@@ -347,34 +371,15 @@ impl AcceptDispatcher {
                         return Ok(());
                     }
 
-                    // #57-adjacent: run_connection() above occupies this loop for
-                    // the entire session, so the OS backlog is the only thing
-                    // absorbing connection attempts that arrive while we're busy.
-                    // A client that gives up before we ever get back to accept()
-                    // leaves an unaccepted, already-CLOSE-WAIT socket sitting
-                    // there — under sustained rapid reconnects that fills the
-                    // backlog and starves every later attempt. Drain and
-                    // immediately drop anything that queued up during the
-                    // session we just finished, rather than serving each one a
-                    // full (likely-abandoned) connection attempt in turn.
-                    // Bounded so a genuine connection flood can't stall the
-                    // loop indefinitely; each attempt costs at most 1ms.
-                    let mut drained = 0u32;
-                    'drain: for l in listeners.iter_mut() {
-                        for _ in 0..32 {
-                            match tokio::time::timeout(Duration::from_millis(1), l.accept()).await {
-                                Ok(Ok(Some(_))) => drained += 1,
-                                _ => continue 'drain,
-                            }
-                        }
-                    }
-                    if drained > 0 {
-                        warn!(
-                            deployment = dep_name,
-                            drained,
-                            "Dropped stale connection attempts queued while busy with the prior session"
-                        );
-                    }
+                    // No post-session drain: a queued connection is
+                    // indistinguishable from a client patiently waiting, and
+                    // reconnect-immediately-after-disconnect (the primary
+                    // Hyper-V Enhanced Session flow) lands exactly in this
+                    // window — draining it dropped a legitimate reconnect.
+                    // The handshake deadline above already bounds how long a
+                    // dead queued connection can occupy the loop once
+                    // accepted (~30s worst case, and typically far less
+                    // because a dead peer's read errors immediately).
                 }
                 Ok(None) => {
                     warn!(

@@ -90,16 +90,27 @@ where
         // Race the inner read against the deadline while armed. Once the
         // inner read is Ready the sleep is disarmed permanently and the
         // wrapper becomes a transparent passthrough.
-        if let Poll::Ready(Ok(())) = Pin::new(&mut this.inner).poll_read(cx, buf) {
-            this.armed = false;
-            return Poll::Ready(Ok(()));
-        }
-        match this.deadline.as_mut().poll(cx) {
-            Poll::Ready(()) => Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "handshake deadline elapsed before any client bytes arrived",
-            ))),
-            Poll::Pending => Poll::Pending,
+        match Pin::new(&mut this.inner).poll_read(cx, buf) {
+            Poll::Ready(Ok(())) => {
+                this.armed = false;
+                Poll::Ready(Ok(()))
+            }
+            // Propagate inner errors immediately: a peer that RSTs mid-
+            // handshake has conclusively failed — sitting on it until the
+            // 30s deadline fires (then misreporting TimedOut) blacked out
+            // every listener for the full window, which is precisely the
+            // wedge this wrapper exists to prevent.
+            err @ Poll::Ready(Err(_)) => {
+                this.armed = false;
+                err
+            }
+            Poll::Pending => match this.deadline.as_mut().poll(cx) {
+                Poll::Ready(()) => Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "handshake deadline elapsed before any client bytes arrived",
+                ))),
+                Poll::Pending => Poll::Pending,
+            },
         }
     }
 }
@@ -167,6 +178,58 @@ mod tests {
             .await
             .expect_err("must time out");
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn inner_read_error_propagates_immediately() {
+        // A peer that errors mid-handshake must surface the real I/O error
+        // at once — not be held until the 30s deadline and misreported as
+        // TimedOut (which would black out every listener for the window).
+        // A duplex half-close would deliver a clean EOF (Ok(0)), which the
+        // wrapper intentionally treats as disarm-worthy; this test needs a
+        // hard error, so it uses an erroring stream.
+        struct ErroringStream;
+        impl AsyncRead for ErroringStream {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                _buf: &mut ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::ConnectionReset,
+                    "peer reset (test)",
+                )))
+            }
+        }
+        impl AsyncWrite for ErroringStream {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                _buf: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                Poll::Ready(Ok(_buf.len()))
+            }
+            fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        let mut wrapped = HandshakeDeadlineStream::new(ErroringStream, Duration::from_secs(30));
+
+        // Long before the deadline: the error must surface immediately.
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let err = wrapped
+            .read(&mut [0u8; 8])
+            .await
+            .expect_err("must error, not hang");
+        assert_eq!(
+            err.kind(),
+            io::ErrorKind::ConnectionReset,
+            "real I/O error must propagate unmuted"
+        );
     }
 
     #[tokio::test(start_paused = true)]
