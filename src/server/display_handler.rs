@@ -2343,7 +2343,14 @@ impl LamcoDisplayHandler {
                         // - the software EGFX paths consume FrameBuffer::Memory only
                         // - cloning a DmaBuf variant yields an empty buffer (loses the FD)
                         // - a cached DmaBuf read later may hit a recycled, unstable buffer
-                        let mut f = super::dmabuf_materialize::materialize_dmabuf_frame(f);
+                        //
+                        // block_in_place: materialization is a blocking
+                        // mmap + full-frame memcpy + munmap on the async
+                        // runtime thread — the same treatment the encode
+                        // path below already gets.
+                        let mut f = tokio::task::block_in_place(|| {
+                            super::dmabuf_materialize::materialize_dmabuf_frame(f)
+                        });
 
                         // === STRIDE NORMALIZATION (1366x768 bug) ===
                         // Compositors negotiate row strides aligned to hardware
@@ -4065,17 +4072,25 @@ impl LamcoDisplayHandler {
                         let aligned_width = align_to_16(frame_width);
                         let aligned_height = align_to_16(frame_height);
 
-                        let frame_data =
+                        // Only materialize a padded copy when the source is
+                        // actually unaligned; the aligned case borrows the
+                        // Arc's buffer directly. The previous unconditional
+                        // (*pixel_data).clone() copied the full frame (~8MB
+                        // at 1080p, ~33MB at 4K) every time only for it to
+                        // be used once, by reference, by the encoder.
+                        let padded;
+                        let frame_data: &[u8] =
                             if aligned_width != frame_width || aligned_height != frame_height {
-                                Self::pad_frame_to_aligned(
+                                padded = Self::pad_frame_to_aligned(
                                     &pixel_data,
                                     frame_width,
                                     frame_height,
                                     aligned_width,
                                     aligned_height,
-                                )
+                                );
+                                &padded
                             } else {
-                                (*pixel_data).clone()
+                                &pixel_data
                             };
 
                         // Update adaptive QP from client feedback before encoding
