@@ -271,15 +271,22 @@ impl X264Encoder {
             )
         };
         let encode_elapsed = encode_start.elapsed();
-        self.force_idr = false;
         debug!(
             convert_us = convert_elapsed.as_micros() as u64,
             encode_us = encode_elapsed.as_micros() as u64,
             "x264 stage timing"
         );
         if result <= 0 || output.is_null() || output_size <= 0 {
+            // The encoder consumed the frame but emitted nothing (x264
+            // legitimately returns 0 while buffering). The IDR request did
+            // NOT take effect — keep force_idr armed so it survives to the
+            // next emit, or a lost IDR would leave the client unable to
+            // resync. (The shim only writes *output on success, so there is
+            // no allocation to free on this path.)
             return Ok(None);
         }
+        // A frame was emitted: the pending IDR request (if any) was consumed.
+        self.force_idr = false;
         let data = unsafe {
             let bytes = std::slice::from_raw_parts(output, output_size as usize).to_vec();
             lamco_x264_free(output);
@@ -452,5 +459,50 @@ mod tests {
             matches!(profile_idc, 66 | 77 | 88 | 100),
             "SPS profile_idc {profile_idc} is not 4:2:0-compatible"
         );
+    }
+
+    #[cfg(feature = "x264")]
+    #[test]
+    fn force_idr_request_survives_an_emit_less_encode() {
+        // Regression: force_idr was cleared before checking whether the
+        // encode actually produced output. x264 legitimately returns 0
+        // while buffering, and a lost IDR request would leave the client
+        // unable to resync after e.g. an EGFX surface re-init.
+        let mut encoder = X264Encoder::new(EncoderConfig::default()).unwrap();
+        // First frame: emitted (and an IDR).
+        let _ = encoder
+            .encode_bgra(&vec![0x40; 64 * 64 * 4], 64, 64, 0)
+            .unwrap()
+            .expect("first frame emits");
+        assert!(!encoder.force_idr, "consumed by the emitted frame");
+
+        // Arm a request via the public API; the private flag is asserted
+        // directly (same module) to pin the survival semantics.
+        encoder.force_keyframe();
+        assert!(encoder.force_idr, "armed request is visible");
+
+        // Encode with changed content; whatever happens (emit or buffer),
+        // a subsequent non-IDR encode must still carry the request until an
+        // IDR is actually emitted.
+        let mut saw_idr = false;
+        for i in 0..8 {
+            let content = vec![(0x40 + i) as u8; 64 * 64 * 4];
+            if let Some(frame) = encoder.encode_bgra(&content, 64, 64, i as u64).unwrap() {
+                if frame.is_keyframe {
+                    saw_idr = true;
+                    break;
+                }
+                // Emitted a non-keyframe while the request was armed — the
+                // shim maps force_idr to X264_TYPE_IDR, so this cannot
+                // happen for the FIRST encode after arming; if it ever does,
+                // the request must still be armed.
+                assert!(encoder.force_idr, "request must survive non-IDR emit");
+            } else {
+                // Buffered: request must survive.
+                assert!(encoder.force_idr, "request must survive buffered encode");
+            }
+        }
+        assert!(saw_idr, "an IDR must eventually be emitted while armed");
+        assert!(!encoder.force_idr, "request cleared once the IDR is out");
     }
 }
