@@ -657,7 +657,7 @@ impl EgfxFrameSender {
                 self.qp(),
             )]
         } else {
-            damage_regions_to_avc420(damage_regions, display_width, display_height, self.qp())
+            damage_regions_to_avc420(damage_regions, encoded_width, encoded_height, self.qp())
         };
 
         // Every damage region may have been dropped as degenerate above; a
@@ -676,14 +676,20 @@ impl EgfxFrameSender {
         }
 
         if regions.len() > 1 {
-            let total_area: u64 = damage_regions
+            // Ratio over the *merged* (macroblock-aligned) regions — the raw
+            // damage list may overlap, which would double-count area.
+            let total_area: u64 = regions
                 .iter()
-                .map(super::super::damage::DamageRegion::area)
+                .map(|r| {
+                    let w = u64::from(r.right) + 1 - u64::from(r.left);
+                    let h = u64::from(r.bottom) + 1 - u64::from(r.top);
+                    w * h
+                })
                 .sum();
-            let frame_area = display_width as u64 * display_height as u64;
+            let frame_area = u64::from(encoded_width) * u64::from(encoded_height);
             let ratio = (total_area as f32 / frame_area as f32 * 100.0) as u32;
             debug!(
-                "EGFX: Sending {} regions ({}% of frame) for {}×{} frame",
+                "EGFX: Sending {} region(s) ({}% of frame) for {}×{} frame",
                 regions.len(),
                 ratio,
                 display_width,
@@ -862,67 +868,81 @@ fn is_full_frame_update(regions: &[DamageRegion], display_width: u16, display_he
 
 /// Convert DamageRegion list to Avc420Region list
 ///
-/// Clamps regions to display bounds and assigns QP values.
+/// Snaps regions to the H.264 macroblock grid and assigns QP values.
 /// Avc420Region uses left/top/right/bottom (inclusive LTRB) format.
+///
+/// # Macroblock alignment
+///
+/// The bitstream is encoded at 16-pixel-aligned dimensions in 4:2:0, so a
+/// rect whose left/top is odd takes its chroma from a shared 2×2 sample,
+/// and a rect that ends mid-macroblock leaves the rest of that macroblock
+/// (which the encoder did update) uncopied by the client — visible as
+/// one-macroblock tearing at window edges while dragging. Each rect is
+/// therefore expanded outward to the 16-pixel grid: left/top round DOWN,
+/// right/bottom round UP, clamped to the *encoded* (aligned) frame
+/// dimensions rather than the raw display size, matching what the
+/// bitstream actually contains (see `is_full_frame_update`). Expansion
+/// makes rects overlap; a merge pass collapses the overlaps so the
+/// metablock stays small and no pixels are double-claimed.
+///
+/// RFX_AVC420_METABLOCK rects MUST satisfy left < right and top < bottom
+/// (MS-RDPEGFX) — FreeRDP and mstsc reject a degenerate or inverted rect
+/// with ERROR_INVALID_DATA and tear down the GFX channel. Alignment
+/// guarantees every emitted rect is ≥ 16px in both axes, so a degenerate
+/// rect cannot occur here; sub-macroblock strips are absorbed into their
+/// containing macroblock instead of being dropped (dropping would leave
+/// that strip stale on the client).
 fn damage_regions_to_avc420(
     regions: &[DamageRegion],
-    display_width: u16,
-    display_height: u16,
+    encoded_width: u16,
+    encoded_height: u16,
     qp: u8,
 ) -> Vec<Avc420Region> {
-    regions
+    /// H.264 macroblock size in pixels; the encode grid in both axes.
+    const MACROBLOCK: u32 = 16;
+
+    let ew = u32::from(encoded_width);
+    let eh = u32::from(encoded_height);
+
+    // Convert to aligned exclusive LTRB rects, clamped to the encoded frame.
+    let aligned: Vec<DamageRegion> = regions
         .iter()
         .filter_map(|r| {
-            // Clamp to display bounds (LTRB format, inclusive)
-            let left = r.x.min(display_width as u32) as u16;
-            let top = r.y.min(display_height as u32) as u16;
-            // Right and bottom are inclusive, so subtract 1 from the exclusive bounds
-            let mut right = (r.x + r.width).min(display_width as u32).saturating_sub(1) as u16;
-            let mut bottom = (r.y + r.height)
-                .min(display_height as u32)
-                .saturating_sub(1) as u16;
+            // Snap outward: floor the top-left, ceil the bottom-right.
+            let left = (r.x / MACROBLOCK) * MACROBLOCK;
+            let top = (r.y / MACROBLOCK) * MACROBLOCK;
+            let right = ((r.x + r.width).div_ceil(MACROBLOCK) * MACROBLOCK).min(ew);
+            let bottom = ((r.y + r.height).div_ceil(MACROBLOCK) * MACROBLOCK).min(eh);
 
-            // RFX_AVC420_METABLOCK rects MUST satisfy left < right and top <
-            // bottom (MS-RDPEGFX). FreeRDP and mstsc reject a degenerate
-            // (zero-width/zero-height) or inverted rect with ERROR_INVALID_DATA
-            // and tear down the GFX channel — the user sees a blank screen and
-            // the session disconnects. A one-pixel-tall or one-pixel-wide damage
-            // rect (a scrolling text row, a progress-bar line) collapses to
-            // left==right / top==bottom after the inclusive conversion, which is
-            // ambiguous across client interpretations. Expand it by a pixel
-            // toward the display interior rather than drop it — dropping loses a
-            // real update and leaves that strip stale; expanding costs one row or
-            // column of encode and is unambiguously valid.
-            let max_x = display_width.saturating_sub(1);
-            let max_y = display_height.saturating_sub(1);
-            if right <= left {
-                right = left.saturating_add(1).min(max_x);
-            }
-            if bottom <= top {
-                bottom = top.saturating_add(1).min(max_y);
-            }
-            // Only unavoidable at the very last row/column, where a 1px strip
-            // cannot expand outward. There the update is a single edge line; drop
-            // it rather than emit an inverted rect.
+            // Fully outside the encoded frame (or empty after clamp).
             if right <= left || bottom <= top {
                 debug!(
-                    "EGFX: dropping edge damage region x{} y{} w{} h{} (LTRB {},{},{},{})",
-                    r.x, r.y, r.width, r.height, left, top, right, bottom
+                    "EGFX: dropping out-of-bounds damage region x{} y{} w{} h{}",
+                    r.x, r.y, r.width, r.height
                 );
                 return None;
             }
+            Some(DamageRegion::new(left, top, right - left, bottom - top))
+        })
+        .collect();
 
-            // Avc420Region fields:
-            // - quantization_parameter: H.264 QP (0-51, lower = better quality)
-            // - quality: 0-100 (higher = better)
-            Some(Avc420Region {
-                left,
-                top,
-                right,
-                bottom,
+    // Merge overlapping/adjacent aligned rects so the metablock stays small
+    // and no macroblock is claimed twice. Expansion guarantees ≥16px per
+    // rect, so `merge_regions` cannot produce a degenerate result.
+    let merged = super::super::damage::merge_regions(aligned, 0);
+
+    merged
+        .iter()
+        .map(|r| {
+            // Inclusive LTRB for the wire: subtract 1 from exclusive bounds.
+            Avc420Region {
+                left: r.x as u16,
+                top: r.y as u16,
+                right: (r.x + r.width).saturating_sub(1) as u16,
+                bottom: (r.y + r.height).saturating_sub(1) as u16,
                 quantization_parameter: qp,
                 quality: 100, // Maximum quality for damage regions
-            })
+            }
         })
         .collect()
 }
@@ -946,6 +966,78 @@ mod tests {
             SendError::Backpressure.to_string(),
             "Frame dropped due to backpressure"
         );
+    }
+
+    #[test]
+    fn avc420_regions_snap_to_macroblock_grid() {
+        // A rect starting mid-macroblock and ending mid-macroblock must
+        // expand outward: floor(left/top), ceil(right/bottom).
+        let regions = [DamageRegion::new(5, 3, 20, 10)];
+        let out = damage_regions_to_avc420(&regions, 1920, 1088, 28);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].left, 0); // 5 → floor to 0
+        assert_eq!(out[0].top, 0); // 3 → floor to 0
+        assert_eq!(out[0].right, 31); // 25 → ceil to 32, inclusive 31
+        assert_eq!(out[0].bottom, 15); // 13 → ceil to 16, inclusive 15
+    }
+
+    #[test]
+    fn avc420_regions_already_aligned_pass_through() {
+        let regions = [DamageRegion::new(16, 32, 32, 48)];
+        let out = damage_regions_to_avc420(&regions, 1920, 1088, 28);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].left, 16);
+        assert_eq!(out[0].top, 32);
+        assert_eq!(out[0].right, 47);
+        assert_eq!(out[0].bottom, 79);
+    }
+
+    #[test]
+    fn avc420_sub_macroblock_strip_is_absorbed_not_dropped() {
+        // A 1px-tall strip (e.g. a progress-bar line) must not vanish — it
+        // becomes its containing macroblock row.
+        let regions = [DamageRegion::new(100, 200, 50, 1)];
+        let out = damage_regions_to_avc420(&regions, 1920, 1088, 28);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].top, 192); // 200 → floor to 192
+        assert_eq!(out[0].bottom, 207); // 201 → ceil to 208, inclusive 207
+        assert!(out[0].right > out[0].left);
+        assert!(out[0].bottom > out[0].top);
+    }
+
+    #[test]
+    fn avc420_overlapping_regions_merge_after_expansion() {
+        // Two genuinely overlapping rects must merge into one, and the
+        // merged set must not double-claim pixels.
+        let regions = [
+            DamageRegion::new(0, 0, 20, 20),
+            DamageRegion::new(10, 10, 20, 20),
+        ];
+        let out = damage_regions_to_avc420(&regions, 1920, 1088, 28);
+        assert_eq!(out.len(), 1, "aligned overlap must merge: {out:?}");
+        assert_eq!(out[0].left, 0);
+        assert_eq!(out[0].top, 0);
+        assert_eq!(out[0].right, 31);
+        assert_eq!(out[0].bottom, 31);
+    }
+
+    #[test]
+    fn avc420_out_of_bounds_region_dropped() {
+        // Fully outside the encoded frame.
+        let regions = [DamageRegion::new(5000, 5000, 100, 100)];
+        let out = damage_regions_to_avc420(&regions, 1920, 1088, 28);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn avc420_region_clamps_to_encoded_not_display_dims() {
+        // A rect extending past the visible 1080 rows must clamp to the
+        // encoded 1088 (16-aligned) height, not be truncated at 1080 —
+        // the last macroblock row is real bitstream content.
+        let regions = [DamageRegion::new(0, 1070, 1920, 30)];
+        let out = damage_regions_to_avc420(&regions, 1920, 1088, 28);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].bottom, 1087); // clamped to encoded height, inclusive
     }
 
     #[test]
