@@ -70,10 +70,6 @@ pub fn materialize_dmabuf_frame(mut frame: VideoFrame) -> VideoFrame {
 
 #[expect(unsafe_code, reason = "mmap/munmap required for DMA-BUF CPU access")]
 fn read_dmabuf_to_vec(desc: &DmaBufDescriptor) -> Result<Vec<u8>, String> {
-    use nix::sys::mman::{MapFlags, ProtFlags, mmap, munmap};
-    use std::num::NonZeroUsize;
-    use std::os::fd::BorrowedFd;
-
     dmabuf_access::ensure_linear(desc.modifier)?;
 
     if desc.planes.is_empty() {
@@ -81,45 +77,12 @@ fn read_dmabuf_to_vec(desc: &DmaBufDescriptor) -> Result<Vec<u8>, String> {
     }
 
     let plane = &desc.planes[0];
-    let size = (desc.height as usize)
-        .saturating_mul(plane.stride as usize)
-        .max(desc.width as usize * desc.height as usize * 4);
+    let size = (desc.height as usize).saturating_mul(plane.stride as usize);
 
-    let nz_size = NonZeroUsize::new(size).ok_or_else(|| "zero size".to_string())?;
-
-    // SAFETY: plane.fd is a valid OwnedFd (dup'd by lamco-pipewire) and
-    // outlives this borrow, which is used only for the mmap call below.
-    let borrowed = unsafe { BorrowedFd::borrow_raw(plane.fd.as_raw_fd()) };
-    // SAFETY: fd is valid (dup'd by lamco-pipewire); mapping is read-only,
-    // copied out immediately, then unmapped. dma_buf_mmap requires offset 0;
-    // plane.offset indexes within the mapping.
-    let ptr = unsafe {
-        mmap(
-            None,
-            nz_size,
-            ProtFlags::PROT_READ,
-            MapFlags::MAP_SHARED,
-            borrowed,
-            0,
-        )
-    }
-    .map_err(|e| format!("mmap failed: {e}"))?;
-
-    let sync = DmaBufSyncGuard::begin_read(&plane.fd);
-
-    // SAFETY: ptr valid for `size` bytes, plane.offset within the mapping.
-    let src = unsafe { ptr.as_ptr().add(plane.offset as usize) as *const u8 };
-    let mut vec = Vec::with_capacity(size);
-    unsafe {
-        std::ptr::copy_nonoverlapping(src, vec.as_mut_ptr(), size);
-        vec.set_len(size);
-    }
-
-    drop(sync);
-    // SAFETY: unmap the region we mapped, after the copy.
-    unsafe {
-        let _ = munmap(ptr, size);
-    }
+    // Bounds-checked read: the helper maps offset+size and clamps to the
+    // dma-buf's real extent (SIGBUS guard — reading past a dma-buf's end
+    // aborts the process, it is not a catchable error).
+    let vec = dmabuf_access::read_plane_to_vec(&plane.fd, plane.offset, size)?;
 
     let nonzero = dmabuf_access::dmabuf_stats::record(&vec);
     if !nonzero {
@@ -130,7 +93,10 @@ fn read_dmabuf_to_vec(desc: &DmaBufDescriptor) -> Result<Vec<u8>, String> {
             "DMA-BUF frame materialized but reads all-zero — exporter backing likely has no CPU-visible data"
         );
     } else {
-        trace!("DMA-BUF frame materialized to CPU memory ({} bytes)", size);
+        trace!(
+            "DMA-BUF frame materialized to CPU memory ({} bytes)",
+            vec.len()
+        );
     }
 
     Ok(vec)

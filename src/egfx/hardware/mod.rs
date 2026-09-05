@@ -257,41 +257,11 @@ pub trait HardwareEncoder {
         let plane = &desc.planes[0];
         let size = (desc.height * plane.stride) as usize;
 
-        // SAFETY: plane.fd is a valid OwnedFd from the PipeWire dup path.
-        // mmap is read-only and we copy into a Vec immediately.
-        // dma_buf_mmap requires pgoff == 0; plane.offset indexes into the mapping.
-        let data = unsafe {
-            use std::{num::NonZeroUsize, os::fd::BorrowedFd};
-
-            use nix::sys::mman::{MapFlags, ProtFlags, mmap, munmap};
-
-            let nz_size = NonZeroUsize::new(size).ok_or_else(|| {
-                HardwareEncoderError::EncodeFailed("DMA-BUF plane has zero size".into())
-            })?;
-
-            let borrowed = BorrowedFd::borrow_raw(plane.fd.as_raw_fd());
-            let ptr = mmap(
-                None,
-                nz_size,
-                ProtFlags::PROT_READ,
-                MapFlags::MAP_SHARED,
-                borrowed,
-                // dma-buf mmap offset must be 0; skip plane bytes via offset
-                0,
-            )
-            .map_err(|e| HardwareEncoderError::EncodeFailed(format!("DMA-BUF mmap failed: {e}")))?;
-
-            let _sync = crate::egfx::dmabuf_access::DmaBufSyncGuard::begin_read(&plane.fd);
-
-            let src = ptr.as_ptr().add(plane.offset as usize) as *const u8;
-            let mut vec = Vec::with_capacity(size);
-            std::ptr::copy_nonoverlapping(src, vec.as_mut_ptr(), size);
-            vec.set_len(size);
-
-            drop(_sync);
-            let _ = munmap(ptr, size);
-            vec
-        };
+        // Bounds-checked shared read: maps offset+size, clamps to the
+        // dma-buf's real extent (SIGBUS guard), brackets with the sync
+        // ioctl. See egfx::dmabuf_access::read_plane_to_vec.
+        let data = crate::egfx::dmabuf_access::read_plane_to_vec(&plane.fd, plane.offset, size)
+            .map_err(|e| HardwareEncoderError::EncodeFailed(e))?;
 
         let nonzero = crate::egfx::dmabuf_access::dmabuf_stats::record(&data);
         if !nonzero {
