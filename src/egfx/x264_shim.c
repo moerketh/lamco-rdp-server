@@ -4,12 +4,16 @@
 #include <dlfcn.h>
 #include <x264.h>
 
-typedef struct {
-    void *library;
-    x264_t *encoder;
-    x264_picture_t input;
-    x264_picture_t output;
-} lamco_x264_encoder;
+/* Compile-time ABI gate: x264 versions its encoder-open symbol precisely
+ * because x264_param_t changes layout between builds. Stringify the
+ * X264_BUILD the HEADER was compiled against and require exactly that
+ * symbol at runtime — a library exporting a different version must fail
+ * cleanly here, not be called through a mismatched struct layout (which is
+ * UB: garbage parameters at best, heap corruption at worst). The previous
+ * _164 -> _148 fallback deliberately invoked a different-ABI entry point. */
+#define LAMCO_STR2(x) #x
+#define LAMCO_STR(x) LAMCO_STR2(x)
+#define LAMCO_X264_OPEN_SYMBOL "x264_encoder_open_" LAMCO_STR(X264_BUILD)
 
 typedef x264_t *(*x264_encoder_open_fn)(x264_param_t *);
 typedef int (*x264_encoder_encode_fn)(x264_t *, x264_nal_t **, int *, x264_picture_t *, x264_picture_t *);
@@ -20,6 +24,18 @@ typedef int (*x264_param_parse_fn)(x264_param_t *, const char *, const char *);
 typedef int (*x264_param_apply_profile_fn)(x264_param_t *, const char *);
 typedef void (*x264_param_cleanup_fn)(x264_param_t *);
 
+typedef struct {
+    void *library;
+    x264_t *encoder;
+    x264_picture_t input;
+    x264_picture_t output;
+    /* Cached hot-path symbols, resolved once at create: encode runs per
+     * frame and close per teardown; dlsym on each was pure overhead (and
+     * the only per-call lookup left in this shim). */
+    x264_encoder_encode_fn encode;
+    x264_encoder_close_fn close_fn;
+} lamco_x264_encoder;
+
 static void *load_symbol(void *library, const char *name) {
     return dlsym(library, name);
 }
@@ -27,7 +43,7 @@ static void *load_symbol(void *library, const char *name) {
 void *lamco_x264_create(uint32_t width, uint32_t height, uint32_t fps,
                         uint32_t qp_min, uint32_t qp_max, uint32_t threads,
                         uint32_t fullrange) {
-    const char *names[] = {"libx264.so.164", "libx264.so.148", "libx264.so"};
+    const char *names[] = {"libx264.so.164", "libx264.so"};
     void *library = NULL;
     for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
         library = dlopen(names[i], RTLD_NOW | RTLD_LOCAL);
@@ -37,18 +53,23 @@ void *lamco_x264_create(uint32_t width, uint32_t height, uint32_t fps,
 
     x264_param_default_preset_fn default_preset =
         (x264_param_default_preset_fn)load_symbol(library, "x264_param_default_preset");
-    x264_param_parse_fn parse =
-        (x264_param_parse_fn)load_symbol(library, "x264_param_parse");
     x264_param_apply_profile_fn apply_profile =
         (x264_param_apply_profile_fn)load_symbol(library, "x264_param_apply_profile");
     x264_param_cleanup_fn cleanup =
         (x264_param_cleanup_fn)load_symbol(library, "x264_param_cleanup");
+    /* Exact-ABI open symbol (see LAMCO_X264_OPEN_SYMBOL above). No
+     * cross-version fallback: a version mismatch must fail loudly, not
+     * corrupt memory through a wrong-layout param struct. */
     x264_encoder_open_fn open =
-        (x264_encoder_open_fn)load_symbol(library, "x264_encoder_open_164");
-    if (!open) open = (x264_encoder_open_fn)load_symbol(library, "x264_encoder_open_148");
+        (x264_encoder_open_fn)load_symbol(library, LAMCO_X264_OPEN_SYMBOL);
     x264_picture_init_fn picture_init =
         (x264_picture_init_fn)load_symbol(library, "x264_picture_init");
-    if (!default_preset || !parse || !apply_profile || !cleanup || !open || !picture_init) {
+    x264_encoder_encode_fn encode =
+        (x264_encoder_encode_fn)load_symbol(library, "x264_encoder_encode");
+    x264_encoder_close_fn close_fn =
+        (x264_encoder_close_fn)load_symbol(library, "x264_encoder_close");
+    if (!default_preset || !apply_profile || !cleanup || !open || !picture_init ||
+        !encode || !close_fn) {
         dlclose(library);
         return NULL;
     }
@@ -103,6 +124,8 @@ void *lamco_x264_create(uint32_t width, uint32_t height, uint32_t fps,
         return NULL;
     }
     result->library = library;
+    result->encode = encode;
+    result->close_fn = close_fn;
     result->encoder = open(&param);
     cleanup(&param);
     if (!result->encoder) {
@@ -137,13 +160,9 @@ int lamco_x264_encode(void *opaque, const uint8_t *y, const uint8_t *u,
     picture->img.plane[1] = (uint8_t *)u;
     picture->img.plane[2] = (uint8_t *)v;
 
-    x264_encoder_encode_fn encode =
-        (x264_encoder_encode_fn)load_symbol(encoder->library, "x264_encoder_encode");
-    if (!encode) return -1;
-
     x264_nal_t *nals = NULL;
     int nal_count = 0;
-    int result = encode(encoder->encoder, &nals, &nal_count, picture, &encoder->output);
+    int result = encoder->encode(encoder->encoder, &nals, &nal_count, picture, &encoder->output);
     if (result <= 0 || nal_count <= 0 || !nals) return result;
 
     uint8_t *data = malloc((size_t)result);
@@ -153,6 +172,11 @@ int lamco_x264_encode(void *opaque, const uint8_t *y, const uint8_t *u,
     for (int i = 0; i < nal_count; ++i) {
         if (nals[i].i_type == NAL_SLICE_IDR) keyframe = 1;
         if (nals[i].i_payload > 0) {
+            /* x264's contract is sum(i_payload) == return value; the
+             * running bound check turns any contract violation (e.g. a
+             * subtly ABI-mismatched library) into a truncated copy instead
+             * of a heap overflow. */
+            if (offset + nals[i].i_payload > result) break;
             memcpy(data + offset, nals[i].p_payload, (size_t)nals[i].i_payload);
             offset += nals[i].i_payload;
         }
@@ -170,9 +194,7 @@ void lamco_x264_free(void *data) {
 void lamco_x264_destroy(void *opaque) {
     lamco_x264_encoder *encoder = (lamco_x264_encoder *)opaque;
     if (!encoder) return;
-    x264_encoder_close_fn close =
-        (x264_encoder_close_fn)load_symbol(encoder->library, "x264_encoder_close");
-    if (close && encoder->encoder) close(encoder->encoder);
+    if (encoder->close_fn && encoder->encoder) encoder->close_fn(encoder->encoder);
     if (encoder->library) dlclose(encoder->library);
     free(encoder);
 }
