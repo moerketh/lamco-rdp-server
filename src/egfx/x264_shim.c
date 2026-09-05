@@ -14,6 +14,7 @@
 #define LAMCO_STR2(x) #x
 #define LAMCO_STR(x) LAMCO_STR2(x)
 #define LAMCO_X264_OPEN_SYMBOL "x264_encoder_open_" LAMCO_STR(X264_BUILD)
+#define LAMCO_X264_SONAME "libx264.so." LAMCO_STR(X264_BUILD)
 
 typedef x264_t *(*x264_encoder_open_fn)(x264_param_t *);
 typedef int (*x264_encoder_encode_fn)(x264_t *, x264_nal_t **, int *, x264_picture_t *, x264_picture_t *);
@@ -43,7 +44,12 @@ static void *load_symbol(void *library, const char *name) {
 void *lamco_x264_create(uint32_t width, uint32_t height, uint32_t fps,
                         uint32_t qp_min, uint32_t qp_max, uint32_t threads,
                         uint32_t fullrange) {
-    const char *names[] = {"libx264.so.164", "libx264.so"};
+    /* Soname derived from the same X264_BUILD as the open symbol, so the
+     * dlopen target and the dlsym gate agree by construction. On a box
+     * whose header is any build other than the listed literal, a hardcoded
+     * "libx264.so.164" would miss and fall back to the unversioned
+     * "libx264.so" — which only exists with libx264-dev installed. */
+    const char *names[] = {LAMCO_X264_SONAME, "libx264.so"};
     void *library = NULL;
     for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
         library = dlopen(names[i], RTLD_NOW | RTLD_LOCAL);

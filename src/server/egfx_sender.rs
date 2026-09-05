@@ -778,7 +778,14 @@ impl EgfxFrameSender {
                 self.qp(),
             )]
         } else {
-            damage_regions_to_avc420(damage_regions, display_width, display_height, self.qp())
+            // Must match the AVC420 path: same macroblock-aligned conversion
+            // against the *encoded* dims. Using display dims here (as it
+            // previously did) left the default-negotiated AVC444 path with
+            // raw-geometry rects and no 16px snap — the exact tearing the
+            // alignment fix exists to prevent, live for every client on the
+            // OpenH264/VA-API AVC444 ladder while the x264/AVC420 path was
+            // already fixed.
+            damage_regions_to_avc420(damage_regions, encoded_width, encoded_height, self.qp())
         };
 
         // See send_frame_with_regions: never emit an empty (zero-rect) metablock.

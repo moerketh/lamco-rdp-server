@@ -152,8 +152,12 @@ pub fn read_plane_to_vec(
         return Err("plane read length clamped to zero".into());
     }
 
-    // Invariant 1: cover offset+len. Round the mapping up to page size —
-    // mmap rejects non-page-multiple lengths.
+    // Cover offset+len. The explicit rounding is belt-and-braces: the kernel
+    // rounds a non-page-multiple mmap length up itself, and the copy never
+    // touches the over-mapped tail — but a page-multiple length keeps the
+    // munmap argument exactly what was requested and makes the NonZeroUsize
+    // construction below self-evidently valid (len >= 1 => pages >= 1 =>
+    // at least PAGE_SIZE).
     const PAGE_SIZE: usize = 4096;
     // len ≥ 1 (validated above) ⇒ pages ≥ 1 ⇒ the rounded length is at
     // least PAGE_SIZE, so the NonZeroUsize conversion cannot fail; the
