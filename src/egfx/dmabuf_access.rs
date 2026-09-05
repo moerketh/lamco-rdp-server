@@ -154,9 +154,12 @@ pub fn read_plane_to_vec(
 
     // Invariant 1: cover offset+len. Round the mapping up to page size —
     // mmap rejects non-page-multiple lengths.
-    let map_len = plane_offset + len;
-    let page = 4096usize;
-    let map_len_rounded = map_len.div_ceil(page) * page;
+    const PAGE_SIZE: usize = 4096;
+    // len ≥ 1 (validated above) ⇒ pages ≥ 1 ⇒ the rounded length is at
+    // least PAGE_SIZE, so the NonZeroUsize conversion cannot fail; the
+    // unwrap_or arm is unreachable and exists only to satisfy the type.
+    let nz_map_len = NonZeroUsize::new((plane_offset + len).div_ceil(PAGE_SIZE) * PAGE_SIZE)
+        .unwrap_or(NonZeroUsize::MIN);
 
     // SAFETY: fd is a valid OwnedFd (dup'd by lamco-pipewire). Mapping is
     // read-only and unmapped after the copy below.
@@ -165,7 +168,7 @@ pub fn read_plane_to_vec(
     let ptr = unsafe {
         mmap(
             None,
-            NonZeroUsize::new(map_len_rounded).expect("nonzero by construction"),
+            nz_map_len,
             ProtFlags::PROT_READ,
             MapFlags::MAP_SHARED,
             borrowed,
@@ -176,7 +179,7 @@ pub fn read_plane_to_vec(
 
     let sync = DmaBufSyncGuard::begin_read(fd);
 
-    // SAFETY: ptr is valid for map_len_rounded >= plane_offset+len bytes;
+    // SAFETY: ptr is valid for nz_map_len >= plane_offset+len bytes;
     // the copy reads exactly `len` bytes starting at plane_offset.
     let src = unsafe { ptr.as_ptr().add(plane_offset) as *const u8 };
     let mut vec = Vec::with_capacity(len);
@@ -188,7 +191,7 @@ pub fn read_plane_to_vec(
     drop(sync);
     // SAFETY: unmap exactly what was mapped, after the copy is done.
     unsafe {
-        let _ = munmap(ptr, map_len_rounded);
+        let _ = munmap(ptr, nz_map_len.get());
     }
 
     Ok(vec)
