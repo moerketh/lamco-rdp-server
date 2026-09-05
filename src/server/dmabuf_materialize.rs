@@ -12,8 +12,6 @@
 //! genuinely reads zeros (virtual-GPUBacking with no CPU-coherent data),
 //! that is counted and logged so the condition is observable.
 
-use std::os::fd::AsRawFd;
-
 use lamco_pipewire::{DmaBufDescriptor, FrameBuffer, VideoFrame};
 use tracing::{info, trace, warn};
 

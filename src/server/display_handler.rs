@@ -152,7 +152,7 @@ fn build_cursor_theme_manager(
 /// The codec is selected at runtime based on client capability negotiation.
 /// When the `x264` feature is enabled and the config selects it, an x264-based
 /// AVC420 encoder is used instead of OpenH264 for faster encoding.
-enum VideoEncoder {
+pub(crate) enum VideoEncoder {
     /// Standard H.264 with 4:2:0 chroma subsampling (OpenH264)
     Avc420(Avc420Encoder),
     /// Premium H.264 with 4:4:4 chroma via dual-stream encoding
@@ -387,7 +387,7 @@ pub struct LamcoDisplayHandler {
 
     /// Current compositor capture size (what PipeWire delivers). Tracked per
     /// frame; drives the input-transformer geometry re-sync.
-    capture_size: Arc<RwLock<(u32, u32)>>,
+    pub(crate) capture_size: Arc<RwLock<(u32, u32)>>,
 
     /// PipeWire thread manager
     pipewire_thread: Arc<Mutex<PipeWireThreadManager>>,
@@ -436,7 +436,7 @@ pub struct LamcoDisplayHandler {
     server_event_tx: Arc<RwLock<Option<mpsc::UnboundedSender<ServerEvent>>>>,
 
     /// Server configuration (for feature flags and settings)
-    config: Arc<crate::config::Config>,
+    pub(crate) config: Arc<crate::config::Config>,
 
     /// Service registry for compositor-aware feature decisions
     service_registry: Arc<ServiceRegistry>,
@@ -487,7 +487,7 @@ pub struct LamcoDisplayHandler {
     /// lifecycle) rebinds capture to a new node via `rebind_capture_node`; this
     /// tracks it so a subsequent client resize acts on the current node rather
     /// than the one captured at startup (which `stream_info` still holds).
-    capture_node: Arc<std::sync::atomic::AtomicU32>,
+    pub(crate) capture_node: Arc<std::sync::atomic::AtomicU32>,
 
     /// Set true by `on_client_disconnect` on a real disconnect; consumed
     /// (swap→false) by the connect-start reset in `updates()`. Distinguishes a
@@ -569,7 +569,8 @@ pub struct LamcoDisplayHandler {
     /// After the source resizes, `rebind_capture_node` reconnects the
     /// PipeWire stream to the new node. None for all other strategies.
     /// parking_lot RwLock so the hand-written (sync) Clone impl can copy it.
-    elastic_capture: parking_lot::RwLock<Option<Arc<dyn crate::session::strategy::SessionHandle>>>,
+    pub(crate) elastic_capture:
+        parking_lot::RwLock<Option<Arc<dyn crate::session::strategy::SessionHandle>>>,
 }
 
 impl LamcoDisplayHandler {
@@ -2037,52 +2038,14 @@ impl LamcoDisplayHandler {
                             continue;
                         }
 
-                        // Elastic capture (kwin-virtual): the compositor-side virtual
-                        // output is recreated at ANY requested size; PipeWire stream
-                        // rebinds to the new node. This replaces the DRM mode-switch
-                        // path entirely — no mode list, no kscreen-doctor, identity
-                        // scaling guaranteed (capture == desktop).
-                        let elastic = {
-                            let hook = handler.elastic_capture.read();
-                            hook.clone()
-                        };
-                        if let Some(session) = elastic {
-                            info!(
-                                "Elastic capture: recreating virtual output at {}x{}",
-                                req.width, req.height
-                            );
-                            match session.resize_capture_source(req.width, req.height).await {
-                                Some((w, h)) => {
-                                    // Rebind the PipeWire stream to the new node.
-                                    // resize_capture_source already updated the
-                                    // session's stream table; fetch the fresh node.
-                                    let streams = session.streams();
-                                    if let Some(s) = streams.first() {
-                                        let old_node = handler
-                                            .capture_node
-                                            .load(std::sync::atomic::Ordering::Relaxed);
-                                        handler
-                                            .rebind_capture_node(
-                                                old_node, s.node_id, s.width, s.height,
-                                            )
-                                            .await;
-                                    }
-                                    // Record capture truth; desktop stays at the
-                                    // client's request (the stored size is
-                                    // updated by request_initial_size on the
-                                    // next activation).
-                                    info!(
-                                        "Elastic capture resized: source now delivers {}x{}",
-                                        w, h
-                                    );
-                                }
-                                None => {
-                                    warn!(
-                                        "Elastic capture resize to {}x{} failed — keeping current stream",
-                                        req.width, req.height
-                                    );
-                                }
-                            }
+                        // Elastic capture (kwin-virtual): the compositor-side
+                        // virtual output is recreated at ANY requested size;
+                        // PipeWire stream rebinds to the new node — replaces
+                        // the DRM mode-switch path entirely. Extracted to
+                        // pipeline_sections::handle_elastic_resize (fork-owned
+                        // code); returns false when no elastic session is
+                        // bound, letting the upstream Destroy/Create path run.
+                        if handler.handle_elastic_resize(req.width, req.height).await {
                             continue;
                         }
 
@@ -2353,45 +2316,12 @@ impl LamcoDisplayHandler {
                         });
 
                         // === STRIDE NORMALIZATION (1366x768 bug) ===
-                        // Compositors negotiate row strides aligned to hardware
-                        // limits (KWin: 256 bytes). For most modes width*4 is
-                        // already aligned (1920*4=7680, 1600*4=6400, 1280*4=5120)
-                        // — but 1366*4 = 5464 pads to 5632, and EVERY downstream
-                        // CPU consumer (H.264 bgra_to_i420, bitmap
-                        // convert_format, uncompressed WireToSurface1) assumes
-                        // tight width*4 rows. A padded stride therefore shears
-                        // the H.264 picture (client tears down the EGFX DVC) and
-                        // breaks the bitmap conversion fast path ("Unsupported
-                        // conversion: BGRx -> BGRx"), which requires equal
-                        // strides. Compact to tight rows ONCE here, right after
-                        // materialization, so all consumers see the layout they
-                        // assume.
-                        if let lamco_pipewire::FrameBuffer::Memory(data) = &f.buffer {
-                            let tight = (f.width as usize) * 4;
-                            if f.stride as usize > tight
-                                && data.len() >= f.stride as usize * f.height as usize
-                            {
-                                static COMPACT_LOGS: std::sync::atomic::AtomicU32 =
-                                    std::sync::atomic::AtomicU32::new(0);
-                                let n =
-                                    COMPACT_LOGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                if n < 3 {
-                                    info!(
-                                        "Compacted padded stride: {} -> {} (width {})",
-                                        f.stride, tight, f.width
-                                    );
-                                }
-                                let mut packed = Vec::with_capacity(tight * f.height as usize);
-                                for y in 0..f.height as usize {
-                                    let row = &data[y * f.stride as usize..][..tight];
-                                    packed.extend_from_slice(row);
-                                }
-                                f.buffer = lamco_pipewire::FrameBuffer::Memory(
-                                    std::sync::Arc::new(packed),
-                                );
-                                f.stride = tight as u32;
-                            }
-                        }
+                        // Compact hardware-padded strides to tight width*4
+                        // rows so every downstream CPU consumer sees the
+                        // layout it assumes. Full rationale (sheared H.264
+                        // picture, broken bitmap fast path) in
+                        // pipeline_sections::compact_padded_stride.
+                        LamcoDisplayHandler::compact_padded_stride(&mut f);
 
                         // Always cache the latest frame for replay on EGFX init.
                         // Clone is cheap: VideoFrame.data is Arc<Vec<u8>>.
@@ -2466,18 +2396,11 @@ impl LamcoDisplayHandler {
                         // a capture size that no longer exists. Tracking per
                         // frame is one comparison and self-heals every
                         // transition.
-                        {
-                            let (cw, ch) = *handler.capture_size.read().await;
-                            if (f.width, f.height) != (cw, ch) {
-                                info!(
-                                    "Capture size changed: {}x{} -> {}x{} (stream renegotiated)",
-                                    cw, ch, f.width, f.height
-                                );
-                                handler
-                                    .update_capture_size(f.width as u32, f.height as u32)
-                                    .await;
-                            }
-                        }
+                        // Per-frame capture-size tracking: self-heals stream
+                        // renegotiation flaps (OLD-size frames then new-size
+                        // truth). Rationale in
+                        // pipeline_sections::track_capture_size_change.
+                        handler.track_capture_size_change(&f).await;
 
                         // Report recovery if we previously flagged a stall
                         if video_stall_reported {
@@ -3336,36 +3259,15 @@ impl LamcoDisplayHandler {
                                     );
                                     // Fall through to AVC420
                                     // Try x264 first if configured, fall back to OpenH264
-                                    #[cfg(feature = "x264")]
-                                    {
-                                        let backend =
-                                            self.config.egfx.encoder_backend.to_lowercase();
-                                        if backend == "x264" || backend == "auto" {
-                                            match X264Encoder::new(config.clone()) {
-                                                Ok(mut encoder) => {
-                                                    encoder.set_diagnostics(
-                                                        encoder_diagnostics.clone(),
-                                                    );
-                                                    encoder.configure_periodic_idr(
-                                                        self.config.egfx.periodic_idr_interval,
-                                                    );
-                                                    video_encoder =
-                                                        Some(VideoEncoder::X264(encoder));
-                                                    info!(
-                                                        "✅ x264 AVC420 encoder initialized for {}×{} (4:2:0 fallback from AVC444)",
-                                                        aligned_width, aligned_height
-                                                    );
-                                                }
-                                                Err(e) => {
-                                                    warn!(
-                                                        "Failed to create x264 encoder: {:?} - falling back to OpenH264",
-                                                        e
-                                                    );
-                                                }
-                                            }
-                                        }
-                                        let _ = &config;
-                                    }
+                                    // (fork-owned rung extracted to
+                                    // pipeline_sections::try_x264_backend)
+                                    video_encoder = self.try_x264_backend(
+                                        &config,
+                                        encoder_diagnostics.clone(),
+                                        aligned_width,
+                                        aligned_height,
+                                        "4:2:0 fallback from AVC444",
+                                    );
 
                                     if video_encoder.is_none() {
                                         match Avc420Encoder::new(config) {
@@ -3432,36 +3334,19 @@ impl LamcoDisplayHandler {
                             }
 
                             // 2. x264 software (feature-gated; "auto" or
-                            //    explicit "x264").
-                            #[cfg(feature = "x264")]
-                            if video_encoder.is_none()
-                                && (backend_pref == "auto" || backend_pref == "x264")
-                            {
-                                match X264Encoder::new(config.clone()) {
-                                    Ok(mut encoder) => {
-                                        encoder.set_diagnostics(encoder_diagnostics.clone());
-                                        // Periodic full-frame IDR = the artifact
-                                        // self-heal for damage-hint misses
-                                        // (window-drag trails on zkde hints).
-                                        encoder.configure_periodic_idr(
-                                            self.config.egfx.periodic_idr_interval,
-                                        );
-                                        video_encoder = Some(VideoEncoder::X264(encoder));
-                                        info!(
-                                            "✅ x264 AVC420 encoder initialized for {}×{} (ultrafast/zerolatency)",
-                                            aligned_width, aligned_height
-                                        );
-                                    }
-                                    Err(e) => {
-                                        warn!(
-                                            "Failed to create x264 encoder: {:?} - falling back to OpenH264",
-                                            e
-                                        );
-                                        // Fall through to OpenH264 below
-                                    }
-                                }
+                            //    explicit "x264"). Fork-owned rung extracted
+                            //    to pipeline_sections::try_x264_backend.
+                            // Guarded exactly like the inline original: never
+                            // replaces a VA-API encoder built by rung 1.
+                            if video_encoder.is_none() {
+                                video_encoder = self.try_x264_backend(
+                                    &config,
+                                    encoder_diagnostics.clone(),
+                                    aligned_width,
+                                    aligned_height,
+                                    "ultrafast/zerolatency",
+                                );
                             }
-                            #[cfg(feature = "x264")]
                             let _ = &backend_pref; // referenced on all cfg paths
 
                             // 3. OpenH264 software (always the final fallback,

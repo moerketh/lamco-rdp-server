@@ -726,8 +726,6 @@ impl Avc420Encoder {
         desc: &lamco_pipewire::DmaBufDescriptor,
         timestamp_ms: u64,
     ) -> EncoderResult<Option<H264Frame>> {
-        use std::os::fd::AsRawFd;
-
         if desc.planes.is_empty() {
             return Err(EncoderError::EncodeFailed(
                 "DmaBufDescriptor has no planes".into(),

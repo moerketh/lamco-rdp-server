@@ -76,6 +76,7 @@ mod input_handler;
 #[expect(dead_code, reason = "WIP: not yet integrated into the server pipeline")]
 mod multiplexer_loop;
 mod pipeline_decisions;
+mod pipeline_sections;
 mod rdpei_factory;
 
 use std::{net::SocketAddr, sync::Arc};
