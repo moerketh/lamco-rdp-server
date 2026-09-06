@@ -5,9 +5,20 @@ All notable changes to lamco-rdp-server will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+
 ## [Unreleased]
 
 Add entries here as work lands; retitle to the release version and date when the release is cut.
+
+## [1.4.5-hyperv.2] - 2026-09-06
+
+Visual-fidelity and damage-tracking fixes for the Hyper-V / KDE line,
+plus a full external-review remediation round (cursor, macroblock
+alignment, memory safety, transport robustness, vsock security, x264
+ABI gating). All changes are relative to `1.4.4-hyperv.1`; the
+Cargo.toml version stays 1.4.5 and the `-hyperv.N` suffix identifies
+this fork's release lineage. **This tag was re-pointed** to include the
+double-cursor fix below; the release notes cover the full round.
 
 ### Fixed
 
@@ -42,29 +53,6 @@ Auto-selection now never flips out of Painted or Hidden modes (prediction
 is meaningless there), per-connection hide state is re-armed at client
 activation, and `auto_mode = true` with
 `predictive_latency_threshold_ms = 0` is rejected at config validation.
-
-### Removed
-
-**Session-scoped guest cursor-theme workaround** (`cursor_theme.rs`, 582
-lines) — applied a transparent XCursor theme to the guest session while an
-RDP client was connected. Deleted in full: on default config it raced the
-new transparent shape PDU into a **zero-cursor** state (transparent guest
-cursor + transparent client shape), and with pointer ownership taken by the
-shape PDU there is nothing left to hide guest-side. The
-`[cursor] session_scoped_cursor_theme` / `console_cursor_theme` /
-`transparent_cursor_theme` config keys are gone (stale keys in existing
-config files are ignored); the console cursor theme is no longer touched.
-
-
-## [1.4.5-hyperv.2] - 2026-09-05
-
-Visual-fidelity and damage-tracking fixes for the Hyper-V / KDE line,
-plus a full external-review remediation round (cursor, macroblock
-alignment, memory safety, transport robustness, vsock security, x264
-ABI gating). All changes are relative to `1.4.4-hyperv.1`; the
-Cargo.toml version stays 1.4.5 and the `-hyperv.N` suffix identifies
-this fork's release lineage. The tag was re-pointed to include the
-remediation; the release notes below cover both rounds.
 
 ### Added
 
@@ -119,11 +107,7 @@ uncomment-together pair.
   missed) were previously discarded when the probe frame raced ahead of
   the client-acknowledged reference frame; they are now unioned into the
   send set via `pipeline_decisions::subtract_regions()` (axis-aligned
-  region subtraction)- **Cursor never changes shape over RDP**: the kwin-virtual strategy
-  requested pointer mode Hidden, which attaches no cursor metadata at
-  all — the client was stuck with its static default arrow forever.
-  Now requests `Pointer::Metadata`; KWin attaches `SPA_META_Cursor` and
-  the existing pointer-PDU path delivers shapes (resize arrows, I-beam)
+  region subtraction)
 - **Tearing at window edges while dragging (both H.264 send paths)**:
   `regionRects` are now snapped to the 16px macroblock grid (left/top
   down, right/bottom up), clamped to the *encoded* (aligned) frame
@@ -171,8 +155,18 @@ uncomment-together pair.
 - **Sender-swap failure silently tolerated**: a failed
   `set_server_event_sender_blocking` left EGFX/cursor/sound commands
   flowing into the idle server; now warns loudly
-- Cursor-theme names from config are validated (empty, leading `-`,
-  NUL) before becoming `plasma-apply-cursortheme` argv elements
+
+### Removed
+
+**Session-scoped guest cursor-theme workaround** (`cursor_theme.rs`, 582
+lines) — applied a transparent XCursor theme to the guest session while an
+RDP client was connected. Deleted in full: on default config it raced the
+new transparent shape PDU into a **zero-cursor** state (transparent guest
+cursor + transparent client shape), and with pointer ownership taken by the
+shape PDU there is nothing left to hide guest-side. The
+`[cursor] session_scoped_cursor_theme` / `console_cursor_theme` /
+`transparent_cursor_theme` config keys are gone (stale keys in existing
+config files are ignored); the console cursor theme is no longer touched.
 
 ## [1.4.5] - 2026-09-02
 
