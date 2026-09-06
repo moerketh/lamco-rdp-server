@@ -2809,6 +2809,15 @@ impl LamcoDisplayHandler {
                     };
                 }
 
+                // Feed the cursor-theme manager's metadata detection BEFORE
+                // the update is processed: when this capture path delivers
+                // cursor metadata, the manager must never apply the
+                // transparent-theme workaround (it would starve the metadata
+                // of its shape source — see cursor_theme.rs docs).
+                if let Some(mgr) = &handler.cursor_theme {
+                    mgr.observe_metadata_cursors(frame.meta.cursor.is_some());
+                }
+
                 handler
                     .process_cursor_update(frame.meta.cursor.clone(), frame.monitor_index)
                     .await;
