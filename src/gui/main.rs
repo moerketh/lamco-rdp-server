@@ -41,6 +41,19 @@ fn main() {
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
+    // Build identity banner. Also load-bearing for the release pipeline's
+    // provenance guard: build.rs embeds GIT_HASH at compile time, and the
+    // guard greps BOTH release binaries for the tagged commit — a binary
+    // that never references the env var gets the literal dead-code-
+    // eliminated under LTO and the release is refused.
+    info!(
+        "lamco-rdp-server-gui v{} (commit {}, built {} {})",
+        env!("CARGO_PKG_VERSION"),
+        option_env!("GIT_HASH").unwrap_or("vendored"),
+        option_env!("BUILD_DATE").unwrap_or("unknown"),
+        option_env!("BUILD_TIME").unwrap_or("")
+    );
+
     let software_configured = env::var(SOFTWARE_RENDERING_CONFIGURED).is_ok();
     let force_software = env::var("LAMCO_GUI_SOFTWARE").is_ok();
 
