@@ -45,6 +45,17 @@ every 60 pipeline frames so client-side pointer-state resets (EGFX
 ResetGraphics, resize-driven Deactivate/Reactivate) cannot resurrect the
 client arrow.
 
+**Runtime Painted auto-selection** — the fix applies out of the box, no
+config needed. The cursor strategy now observes per-frame whether the
+capture path delivers `SPA_META_Cursor`: after 5 consecutive
+metadata-absent frames, a session whose configured mode is the Metadata
+default (no explicit operator choice) flips to Painted and takes pointer
+ownership. Paths that do deliver metadata (Portal, Mutter) keep
+client-side rendering; once metadata has been seen the flip never
+engages; an explicit `cursor.mode` always wins. Covers kwin-virtual
+(KWin never attaches metadata on zkde virtual outputs) and portal_generic
+(structurally metadata-less) with the same mechanism.
+
 Also fixed, the live cause of the previous attempt (9981c8c) doing nothing:
 `auto_select_mode` flipped the config-driven Painted mode to Predictive as
 soon as measured RTT crossed `predictive_latency_threshold_ms` (with the

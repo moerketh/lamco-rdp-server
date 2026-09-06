@@ -4442,6 +4442,16 @@ impl LamcoDisplayHandler {
         cursor: Option<lamco_pipewire::meta::CursorMeta>,
         monitor_index: u32,
     ) {
+        let sender = self.get_update_sender();
+        let mut strategy = self.cursor_strategy.lock().await;
+
+        // Feed the mode resolver FIRST: on paths that never deliver cursor
+        // metadata this flips the default Metadata mode to Painted (which
+        // then takes pointer ownership via the transparent shape below);
+        // on paths that DO deliver it, it keeps/returns Metadata for
+        // client-side rendering.
+        strategy.observe_metadata_cursors(cursor.is_some());
+
         // Painted mode: the stream itself carries the cursor. Suppress the
         // client's local pointer and stop — no shape/position PDUs (they
         // would fight the embedded cursor).
@@ -4465,8 +4475,6 @@ impl LamcoDisplayHandler {
         // Deactivate/Reactivate, capability re-exchange). The PDU is small
         // and idempotent, so re-sending every PAINTED_SHAPE_INTERVAL frames
         // is cheap insurance.
-        let sender = self.get_update_sender();
-        let mut strategy = self.cursor_strategy.lock().await;
         if strategy.mode() == crate::cursor::CursorMode::Painted {
             if strategy.needs_hide_update() || self.painted_shape_counter.should_send() {
                 let transparent = ColorPointer {
