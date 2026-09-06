@@ -41,7 +41,7 @@
 //! the transition/toggle logic without touching a real session.
 
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 
 use tracing::{debug, info, warn};
 
@@ -56,6 +56,16 @@ pub enum ThemeState {
 
 const STATE_VISIBLE: u8 = 0;
 const STATE_TRANSPARENT: u8 = 1;
+/// Session active but the transparency decision is deferred until the
+/// frame loop has reported whether the capture delivers cursor metadata
+/// (a few frames at most — see `observe_metadata_cursors`).
+const STATE_PENDING: u8 = 2;
+/// How many metadata-absent frames settle the deferred decision toward
+/// applying the transparent theme. ~3 frames ≈ 50ms at 60fps: short enough
+/// that an embedded-cursor path can't show a double cursor for long, long
+/// enough that a metadata path whose first frame legitimately lacks the
+/// cursor meta (pointer off-output at session start) isn't misclassified.
+const PENDING_ABSENT_FRAMES: u32 = 3;
 
 /// Theme identifiers used by the manager.
 #[derive(Debug, Clone)]
@@ -174,6 +184,17 @@ pub struct CursorThemeManager<R: CmdRunner> {
     state: AtomicU8,
     themes: CursorThemes,
     runner: R,
+    /// Set when the capture path delivers cursor metadata (SPA_META_Cursor)
+    /// — i.e. KWin excludes the cursor from the stream and reports it
+    /// separately (zkde-screencast pointer mode Metadata). While set, the
+    /// transparent-theme workaround must NOT run: there is no composited
+    /// guest sprite to hide (no double cursor), and blanking the sprite
+    /// also starves the metadata of its shape source — the client would be
+    /// stuck on its static default pointer with no context-aware shapes.
+    metadata_cursors: AtomicBool,
+    /// Frames observed with cursor metadata absent while the decision is
+    /// pending (see STATE_PENDING).
+    pending_absent: AtomicU32,
 }
 
 impl<R: CmdRunner> CursorThemeManager<R> {
@@ -182,6 +203,8 @@ impl<R: CmdRunner> CursorThemeManager<R> {
             state: AtomicU8::new(STATE_VISIBLE),
             themes,
             runner,
+            metadata_cursors: AtomicBool::new(false),
+            pending_absent: AtomicU32::new(0),
         }
     }
 
@@ -192,24 +215,80 @@ impl<R: CmdRunner> CursorThemeManager<R> {
         }
     }
 
-    /// Apply the transparent theme for the live session (RDP client
-    /// activated). Idempotent: no-op when already transparent or when
-    /// the toggle fails (state stays Visible).
-    pub fn begin_rdp_session(&self) {
-        if self.state() == ThemeState::Transparent {
-            debug!("Cursor already transparent — no apply needed");
+    /// Record whether the capture path is delivering cursor metadata.
+    /// Called by the frame loop with each frame's observation. Once true,
+    /// stays true for the manager's lifetime (metadata capability is a
+    /// property of the negotiated capture, not per-frame — KWin may
+    /// legitimately omit the meta when the pointer leaves the output or
+    /// is hidden by the app). Resolves a pending begin_rdp_session()
+    /// decision in either direction.
+    pub fn observe_metadata_cursors(&self, present: bool) {
+        if present {
+            if !self.metadata_cursors.swap(true, Ordering::AcqRel) {
+                info!(
+                    "Capture delivers cursor metadata — keeping the visible guest cursor theme \
+                     (no transparency needed; shapes reach the client via pointer PDUs)"
+                );
+            }
+            if self.state.load(Ordering::Acquire) == STATE_PENDING {
+                self.state.store(STATE_VISIBLE, Ordering::Release);
+                debug!("Cursor metadata active — transparent theme cancelled");
+            }
             return;
         }
-        if self.apply_toggle(&self.themes.transparent, &self.themes.visible) {
-            self.state.store(STATE_TRANSPARENT, Ordering::Release);
-            info!(
-                "Guest cursor transparent for RDP session (console cursor hidden until disconnect)"
-            );
+        // Cursor meta absent this frame. If the session decision is still
+        // pending, accumulate; enough absent frames settle it toward the
+        // transparent workaround (the classic embedded-cursor path).
+        if self.state.load(Ordering::Acquire) == STATE_PENDING {
+            let n = self.pending_absent.fetch_add(1, Ordering::AcqRel) + 1;
+            if n >= PENDING_ABSENT_FRAMES
+                && self.apply_toggle(&self.themes.transparent, &self.themes.visible)
+            {
+                self.state.store(STATE_TRANSPARENT, Ordering::Release);
+                info!(
+                    "Guest cursor transparent for RDP session (console cursor hidden until disconnect)"
+                );
+            }
         }
     }
 
-    /// Restore the visible theme (RDP client gone). Idempotent.
+    /// Arm the session-scoped cursor decision (RDP client activated).
+    /// The apply itself is DEFERRED until `observe_metadata_cursors` has
+    /// seen a few frames: applying immediately would starve metadata-based
+    /// capture paths of their shape source (the transparent sprite makes
+    /// KWin report no cursor at all), and activation happens before the
+    /// first frame arrives, so the metadata signal cannot be known here.
+    /// No-op when already transparent or when this capture path has already
+    /// proven metadata-capable.
+    pub fn begin_rdp_session(&self) {
+        if self.metadata_cursors.load(Ordering::Acquire) {
+            debug!(
+                "Cursor metadata active — skipping transparent theme \
+                 (double-cursor workaround not needed on this capture path)"
+            );
+            return;
+        }
+        match self.state() {
+            ThemeState::Transparent => {
+                debug!("Cursor already transparent — no apply needed");
+            }
+            _ => {
+                self.pending_absent.store(0, Ordering::Release);
+                self.state.store(STATE_PENDING, Ordering::Release);
+                debug!("Cursor theme decision deferred until frames reveal metadata presence");
+            }
+        }
+    }
+
+    /// Restore the visible theme (RDP client gone). Idempotent. A pending
+    /// (never-applied) decision simply returns to Visible — nothing was
+    /// applied, so there is nothing to restore.
     pub fn end_rdp_session(&self) {
+        if self.state.load(Ordering::Acquire) == STATE_PENDING {
+            self.state.store(STATE_VISIBLE, Ordering::Release);
+            debug!("Cursor theme decision cancelled on disconnect (nothing applied)");
+            return;
+        }
         if self.state() == ThemeState::Visible {
             return;
         }
@@ -348,9 +427,13 @@ mod tests {
         };
         let mgr = CursorThemeManager::new(bad, &runner);
         mgr.begin_rdp_session();
-        // The toggle apply of the (invalid) visible theme is attempted via
-        // the runner seam; the production gate would have rejected it. The
-        // transparent theme itself is valid and proceeds.
+        // The (invalid) visible name is rejected by the production gate;
+        // the session defers the decision, and absent metadata frames
+        // settle it toward the transparent apply. The transparent theme
+        // itself is valid and proceeds.
+        for _ in 0..3 {
+            mgr.observe_metadata_cursors(false);
+        }
         let calls = runner.calls();
         assert!(
             calls.iter().any(|c| c.starts_with("apply:transparent")),
@@ -359,13 +442,20 @@ mod tests {
     }
 
     #[test]
-    fn begin_applies_toggle_and_persists_visible() {
+    fn begin_defers_until_frames_reveal_metadata_absence() {
         let runner = FakeRunner::ok();
         let mgr = CursorThemeManager::new(themes(), &runner);
         mgr.begin_rdp_session();
+        // Nothing applied yet: activation happens before the first frame.
+        assert!(runner.calls().is_empty());
+        // Absent frames accumulate... 2 is below the threshold.
+        mgr.observe_metadata_cursors(false);
+        mgr.observe_metadata_cursors(false);
+        assert!(runner.calls().is_empty());
+        // ...the 3rd absent frame settles it: toggle applies transparent.
+        mgr.observe_metadata_cursors(false);
         assert_eq!(mgr.state(), ThemeState::Transparent);
-        // Toggle order: real theme first, transparent second...
-        // ...then kcminputrc pinned back to visible (crash-safety).
+        // Toggle order: real theme first, transparent second.
         assert_eq!(
             runner.calls(),
             vec![
@@ -377,10 +467,46 @@ mod tests {
     }
 
     #[test]
+    fn metadata_frames_cancel_the_transparent_apply() {
+        let runner = FakeRunner::ok();
+        let mgr = CursorThemeManager::new(themes(), &runner);
+        mgr.begin_rdp_session();
+        // First frames carry cursor metadata (kwin-virtual + Pointer::Metadata):
+        // the workaround must never run.
+        mgr.observe_metadata_cursors(true);
+        for _ in 0..10 {
+            mgr.observe_metadata_cursors(false);
+        }
+        assert_eq!(mgr.state(), ThemeState::Visible);
+        assert!(
+            runner.calls().is_empty(),
+            "no theme applies: {:?}",
+            runner.calls()
+        );
+    }
+
+    #[test]
+    fn metadata_arriving_mid_pending_cancels_apply() {
+        let runner = FakeRunner::ok();
+        let mgr = CursorThemeManager::new(themes(), &runner);
+        mgr.begin_rdp_session();
+        mgr.observe_metadata_cursors(false);
+        mgr.observe_metadata_cursors(false);
+        // Metadata arrives on the 3rd frame — before the threshold settled.
+        mgr.observe_metadata_cursors(true);
+        mgr.observe_metadata_cursors(false);
+        assert_eq!(mgr.state(), ThemeState::Visible);
+        assert!(runner.calls().is_empty());
+    }
+
+    #[test]
     fn begin_is_idempotent_when_already_transparent() {
         let runner = FakeRunner::ok();
         let mgr = CursorThemeManager::new(themes(), &runner);
         mgr.begin_rdp_session();
+        for _ in 0..3 {
+            mgr.observe_metadata_cursors(false);
+        }
         let after_first = runner.calls().len();
         mgr.begin_rdp_session(); // no-op
         assert_eq!(runner.calls().len(), after_first);
@@ -391,6 +517,9 @@ mod tests {
         let runner = FakeRunner::ok();
         let mgr = CursorThemeManager::new(themes(), &runner);
         mgr.begin_rdp_session();
+        for _ in 0..3 {
+            mgr.observe_metadata_cursors(false);
+        }
         mgr.end_rdp_session();
         assert_eq!(mgr.state(), ThemeState::Visible);
         assert_eq!(runner.calls().last().unwrap(), "persist:breeze_cursors");
@@ -414,9 +543,15 @@ mod tests {
         };
         let mgr = CursorThemeManager::new(themes(), &runner);
         mgr.begin_rdp_session();
+        for _ in 0..3 {
+            mgr.observe_metadata_cursors(false);
+        }
         assert_eq!(mgr.state(), ThemeState::Visible);
         // Retry still attempts the toggle (transition not latched).
         mgr.begin_rdp_session();
+        for _ in 0..3 {
+            mgr.observe_metadata_cursors(false);
+        }
         assert_eq!(mgr.state(), ThemeState::Visible);
     }
 
@@ -429,6 +564,9 @@ mod tests {
         };
         let mgr = CursorThemeManager::new(themes(), &runner);
         mgr.begin_rdp_session();
+        for _ in 0..3 {
+            mgr.observe_metadata_cursors(false);
+        }
         assert_eq!(mgr.state(), ThemeState::Transparent);
     }
 
