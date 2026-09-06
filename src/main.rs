@@ -385,12 +385,6 @@ async fn main() -> Result<()> {
 
     let run_result = server.run().await;
 
-    // Force-restore the guest console cursor regardless of tracked state:
-    // the process is going away, so this is the ExecStopPost-style recovery
-    // path (a crash between begin and end would otherwise leave the console
-    // with a transparent cursor after reboot-persistent config reset).
-    display_handler.restore_console_cursor_forced();
-
     // Remove the PID file regardless of how the server exited (graceful or
     // error). A stale PID file is mostly harmless — the GUI's
     // check_pid_file() does kill(pid, 0) liveness verification — but we

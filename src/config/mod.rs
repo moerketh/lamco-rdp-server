@@ -441,6 +441,20 @@ impl Config {
             _ => anyhow::bail!("Invalid cursor strategy mode: {}", self.cursor.mode),
         }
 
+        // threshold 0 + auto_mode means "Predictive on the first latency
+        // sample" — almost certainly not what anyone intends, and it
+        // silently clobbers any configured mode (measured live: a
+        // mode="painted" config was flipped to Predictive before its
+        // HidePointer was ever sent). Reject rather than guess.
+        if self.cursor.auto_mode && self.cursor.predictive_latency_threshold_ms == 0 {
+            anyhow::bail!(
+                "cursor.predictive_latency_threshold_ms = 0 with auto_mode = true selects \
+                 Predictive mode on the first latency sample (any RTT > 0 beats a threshold \
+                 of 0), overriding the configured mode. Set a positive threshold or disable \
+                 auto_mode."
+            );
+        }
+
         match self.egfx.zgfx_compression.as_str() {
             "never" | "auto" | "always" => {}
             _ => anyhow::bail!(

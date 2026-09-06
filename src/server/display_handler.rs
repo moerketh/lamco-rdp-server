@@ -74,7 +74,7 @@ use std::{
 use anyhow::Result;
 use bytes::Bytes;
 use ironrdp_server::{
-    BitmapUpdate as IronBitmapUpdate, DesktopSize, DisplayUpdate, GfxServerHandle,
+    BitmapUpdate as IronBitmapUpdate, ColorPointer, DesktopSize, DisplayUpdate, GfxServerHandle,
     PixelFormat as IronPixelFormat, RdpServerDisplay, RdpServerDisplayUpdates, ServerEvent,
     ServerResult,
 };
@@ -108,42 +108,31 @@ struct ResizeRequest {
     height: u16,
 }
 
-/// Build the session-scoped cursor theme manager from config.
-///
-/// Returns None when the feature is disabled in config, when the desktop
-/// is not Plasma (plasma-apply-cursortheme not installed), or when the
-/// service runs as root (cannot address the user session bus).
-fn build_cursor_theme_manager(
-    config: &crate::config::Config,
-) -> Option<
-    Arc<
-        crate::server::cursor_theme::CursorThemeManager<
-            crate::server::cursor_theme::SessionCmdRunner,
-        >,
-    >,
-> {
-    let cc = &config.cursor;
-    if !cc.session_scoped_cursor_theme {
-        debug!("Session-scoped cursor theme disabled in config");
-        return None;
+/// Interval, in processed pipeline frames, between Painted-mode
+/// transparent-shape re-sends. The first shape goes out immediately on
+/// mode entry; this only governs the periodic re-send that survives
+/// client-side pointer-state resets (EGFX ResetGraphics, resize-driven
+/// Deactivate/Reactivate). At ~30–60 fps this is a once-or-twice-per-second
+/// ~3 KB PDU.
+const PAINTED_SHAPE_INTERVAL: u32 = 60;
+
+/// Frame counter gating the periodic Painted-mode transparent-shape
+/// re-send. Interior-mutable (shared atomic) so the frame loop can tick it
+/// without a mutex, and `Clone` so handler clones share one counter.
+#[derive(Debug, Clone, Default)]
+struct PaintedShapeCounter {
+    frames: std::sync::Arc<std::sync::atomic::AtomicU32>,
+}
+
+impl PaintedShapeCounter {
+    /// Whether this frame should carry a periodic transparent-shape
+    /// re-send. Ticks the counter on every call.
+    fn should_send(&self) -> bool {
+        let n = self
+            .frames
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        n > 0 && n.is_multiple_of(PAINTED_SHAPE_INTERVAL)
     }
-    let Some(runner) = crate::server::cursor_theme::SessionCmdRunner::new() else {
-        debug!("No session context for cursor theme manager (root or no uid)");
-        return None;
-    };
-    if !std::path::Path::new("/usr/bin/plasma-apply-cursortheme").exists() {
-        debug!("plasma-apply-cursortheme not installed — cursor theme manager off");
-        return None;
-    }
-    Some(Arc::new(
-        crate::server::cursor_theme::CursorThemeManager::new(
-            crate::server::cursor_theme::CursorThemes {
-                visible: cc.console_cursor_theme.clone(),
-                transparent: cc.transparent_cursor_theme.clone(),
-            },
-            runner,
-        ),
-    ))
 }
 
 /// Video encoder abstraction for codec-agnostic frame encoding
@@ -415,6 +404,11 @@ pub struct LamcoDisplayHandler {
     /// shape-change tracking, predictive rendering state).
     cursor_strategy: Arc<Mutex<crate::cursor::CursorStrategy>>,
 
+    /// Frame counter gating the periodic Painted-mode transparent-shape
+    /// re-send. Not part of `CursorStrategy`: it counts pipeline frames,
+    /// which only the display handler sees.
+    painted_shape_counter: PaintedShapeCounter,
+
     /// Server-published NetworkAutoDetect RTT (MS-RDPBCGR 2.2.14), same
     /// handle the EGFX FlowController reads (`server/mod.rs` creates it and
     /// hands it to the ironrdp-server builder, which writes measured RTT
@@ -495,20 +489,6 @@ pub struct LamcoDisplayHandler {
     /// DeactivationReactivation (display resize) — the latter re-enters
     /// `updates()` but must NOT tear down clipboard lifecycle.
     saw_real_disconnect: Arc<std::sync::atomic::AtomicBool>,
-
-    /// Session-scoped guest cursor theme manager. While an RDP client is
-    /// connected the guest cursor is made transparent (compositor-relative
-    /// capture would otherwise bake it into the video stream — no hardware
-    /// cursor plane on hyperv_drm); on disconnect the console cursor is
-    /// restored. Arc<Option<..>> so the manager can be absent (non-Plasma
-    /// desktops / feature off) and clones share one instance.
-    cursor_theme: Option<
-        Arc<
-            crate::server::cursor_theme::CursorThemeManager<
-                crate::server::cursor_theme::SessionCmdRunner,
-            >,
-        >,
-    >,
 
     /// Health reporter for forwarding PipeWire stream state to health monitor
     health_reporter: Arc<RwLock<Option<crate::health::HealthReporter>>>,
@@ -662,10 +642,6 @@ impl LamcoDisplayHandler {
         // Capacity 4: enough to absorb a burst without blocking, pipeline coalesces
         let (resize_tx, resize_rx) = std::sync::mpsc::sync_channel(4);
 
-        // Session-scoped cursor theme manager (built before the struct
-        // literal below moves `config`).
-        let cursor_theme_mgr = build_cursor_theme_manager(&config);
-
         Ok(Self {
             size,
             capture_size: Arc::new(RwLock::new((initial_width as u32, initial_height as u32))),
@@ -680,6 +656,7 @@ impl LamcoDisplayHandler {
             cursor_strategy: Arc::new(Mutex::new(crate::cursor::CursorStrategy::new(
                 (&config.cursor).into(),
             ))),
+            painted_shape_counter: PaintedShapeCounter::default(),
             autodetect_rtt: Arc::new(RwLock::new(None)),
             stream_info: Arc::new(RwLock::new(stream_info)),
             gfx_server_handle,
@@ -700,7 +677,6 @@ impl LamcoDisplayHandler {
             client_active,
             display_suppressed: parking_lot::RwLock::new(None),
             saw_real_disconnect: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            cursor_theme: cursor_theme_mgr,
             health_reporter: Arc::new(RwLock::new(None)),
             pipewire_sensor: Arc::new(RwLock::new(None)),
             egfx_snapshot: Arc::new(RwLock::new(None)),
@@ -767,10 +743,6 @@ impl LamcoDisplayHandler {
 
         let (resize_tx, resize_rx) = std::sync::mpsc::sync_channel(4);
 
-        // Session-scoped cursor theme manager (built before the struct
-        // literal below moves `config`).
-        let cursor_theme_mgr = build_cursor_theme_manager(&config);
-
         Ok(Self {
             size,
             capture_size: Arc::new(RwLock::new((initial_width as u32, initial_height as u32))),
@@ -785,6 +757,7 @@ impl LamcoDisplayHandler {
             cursor_strategy: Arc::new(Mutex::new(crate::cursor::CursorStrategy::new(
                 (&config.cursor).into(),
             ))),
+            painted_shape_counter: PaintedShapeCounter::default(),
             autodetect_rtt: Arc::new(RwLock::new(None)),
             stream_info: Arc::new(RwLock::new(stream_info)),
             gfx_server_handle,
@@ -805,7 +778,6 @@ impl LamcoDisplayHandler {
             client_active,
             display_suppressed: parking_lot::RwLock::new(None),
             saw_real_disconnect: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            cursor_theme: cursor_theme_mgr,
             health_reporter: Arc::new(RwLock::new(None)),
             pipewire_sensor: Arc::new(RwLock::new(None)),
             egfx_snapshot: Arc::new(RwLock::new(None)),
@@ -948,24 +920,6 @@ impl LamcoDisplayHandler {
             {
                 warn!("Failed to notify clipboard of RDP disconnect: {e}");
             }
-        }
-    }
-
-    /// Restore the guest console cursor after the RDP session ends
-    /// (disconnect cleanup path — also safe when never made transparent).
-    /// Uses the state-tracked restore: a no-op if no session ever began
-    /// (probe disconnects leave the console cursor untouched).
-    pub fn restore_console_cursor(&self) {
-        if let Some(mgr) = &self.cursor_theme {
-            mgr.end_rdp_session();
-        }
-    }
-
-    /// Force-restore the visible console cursor regardless of tracked state
-    /// (process-shutdown recovery — ExecStopPost semantics). Idempotent.
-    pub fn restore_console_cursor_forced(&self) {
-        if let Some(mgr) = &self.cursor_theme {
-            mgr.restore_visible();
         }
     }
 
@@ -2809,15 +2763,6 @@ impl LamcoDisplayHandler {
                     };
                 }
 
-                // Feed the cursor-theme manager's metadata detection BEFORE
-                // the update is processed: when this capture path delivers
-                // cursor metadata, the manager must never apply the
-                // transparent-theme workaround (it would starve the metadata
-                // of its shape source — see cursor_theme.rs docs).
-                if let Some(mgr) = &handler.cursor_theme {
-                    mgr.observe_metadata_cursors(frame.meta.cursor.is_some());
-                }
-
                 handler
                     .process_cursor_update(frame.meta.cursor.clone(), frame.monitor_index)
                     .await;
@@ -4484,12 +4429,12 @@ impl LamcoDisplayHandler {
     ///
     /// `CursorMode::Painted` (cursor composited into the video stream) is
     /// implemented for the kwin-virtual strategy: KWin itself paints the
-    /// cursor into the virtual output when zkde-screencast runs in Embedded
-    /// mode, so "Painted" here means the server sends a one-time
-    /// HidePointer PDU (the client stops drawing its local pointer and the
-    /// stream-embedded cursor — with its context-aware shape changes — is
-    /// the only pointer the user sees) and then sends nothing further.
-    /// Server-side compositing for other strategies
+    /// cursor into the virtual output (measured on KWin 6.3.6: regardless
+    /// of the requested zkde pointer mode), so "Painted" here means the
+    /// server sends a transparent color-pointer shape PDU (the client
+    /// swaps its local arrow for a fully transparent cursor — see the
+    /// Painted branch below for why HidePointer is not used) and then
+    /// sends nothing further. Server-side compositing for other strategies
     /// (`CursorMode::requires_compositing()` without a compositor-painted
     /// source) remains future work.
     async fn process_cursor_update(
@@ -4497,16 +4442,53 @@ impl LamcoDisplayHandler {
         cursor: Option<lamco_pipewire::meta::CursorMeta>,
         monitor_index: u32,
     ) {
-        // Painted mode: the stream itself carries the cursor. Hide the
-        // client's local pointer exactly once and stop — no shape/position
-        // PDUs (they would fight the embedded cursor).
+        // Painted mode: the stream itself carries the cursor. Suppress the
+        // client's local pointer and stop — no shape/position PDUs (they
+        // would fight the embedded cursor).
+        //
+        // Suppression uses a TRANSPARENT COLOR POINTER SHAPE, not
+        // HidePointer: measured on Hyper-V vmconnect (2026-09-06), repeated
+        // HidePointer PDUs (one-shot AND a 60-frame periodic re-send, wire
+        // path verified end-to-end) never removed the client's arrow —
+        // vmconnect treats SYSPTR_NULL as "no server cursor: fall back to
+        // my default" rather than "draw nothing". A real shape PDU —
+        // all-opaque AND mask (0xFF..) + all-zero XOR mask — is the
+        // xrdp-proven way to take pointer ownership on that client: the
+        // client swaps its arrow for a cursor that is fully transparent
+        // (AND=1 keeps screen pixels; XOR=0 leaves them unchanged). 32x32
+        // is the classic monochrome-and-color cursor size every client
+        // accepts, and ColorPointer is not gated on the client advertising
+        // the New Pointer Update capability (RGBAPointer is).
+        //
+        // Re-sent periodically rather than once: client pointer state can
+        // be reset after our one-shot (EGFX ResetGraphics, resize-driven
+        // Deactivate/Reactivate, capability re-exchange). The PDU is small
+        // and idempotent, so re-sending every PAINTED_SHAPE_INTERVAL frames
+        // is cheap insurance.
         let sender = self.get_update_sender();
         let mut strategy = self.cursor_strategy.lock().await;
         if strategy.mode() == crate::cursor::CursorMode::Painted {
-            if strategy.needs_hide_update() {
+            if strategy.needs_hide_update() || self.painted_shape_counter.should_send() {
+                let transparent = ColorPointer {
+                    cache_index: 0,
+                    width: 32,
+                    height: 32,
+                    hot_x: 0,
+                    hot_y: 0,
+                    // AND mask: one bit per pixel, 32px = 4 bytes/row,
+                    // 32 rows, all bits set (opaque "screen" pixel).
+                    and_mask: vec![0xFF; 32 * 4],
+                    // XOR mask: TS_COLORPOINTERATTRIBUTE fixes this at 24
+                    // bpp — 32px * 3 bytes/row * 32 rows, all zero.
+                    // AND=1/XOR=0 leaves every screen pixel unchanged
+                    // (fully transparent cursor). 32 bpp would only be
+                    // legal via New Pointer Update's xorBpp (RGBAPointer),
+                    // which is capability-gated.
+                    xor_mask: vec![0x00; 32 * 32 * 3],
+                };
                 let sender = sender.lock().await;
-                if let Err(e) = sender.send(DisplayUpdate::HidePointer).await {
-                    debug!("Failed to send painted-mode cursor hide update: {e}");
+                if let Err(e) = sender.send(DisplayUpdate::ColorPointer(transparent)).await {
+                    debug!("Failed to send painted-mode transparent cursor: {e}");
                 }
             }
             return;
@@ -4859,13 +4841,11 @@ impl RdpServerDisplay for LamcoDisplayHandler {
             warn!("Failed to activate EIS input: {}", e);
         }
 
-        // The RDP session now owns the guest cursor: make it transparent so
-        // the captured stream carries no composited sprite (restored on
-        // disconnect). Skipped on same-connection reactivation (resize);
-        // gated by the config below.
-        if let Some(mgr) = &self.cursor_theme {
-            mgr.begin_rdp_session();
-        }
+        // Re-arm per-connection cursor state: CursorStrategy outlives
+        // connections, so `hidden_sent` from a previous client would
+        // suppress the transparent-pointer-shape update the new client
+        // needs.
+        self.cursor_strategy.lock().await.rearm_for_connection();
 
         // Signal pipeline that a client is now consuming frames
         self.client_active
@@ -5004,6 +4984,7 @@ impl Clone for LamcoDisplayHandler {
             graphics_tx: self.graphics_tx.clone(),
             stream_info: self.stream_info.clone(),
             cursor_strategy: Arc::clone(&self.cursor_strategy),
+            painted_shape_counter: self.painted_shape_counter.clone(),
             autodetect_rtt: Arc::clone(&self.autodetect_rtt),
             // EGFX fields
             gfx_server_handle: Arc::clone(&self.gfx_server_handle),
@@ -5025,7 +5006,6 @@ impl Clone for LamcoDisplayHandler {
             display_suppressed: parking_lot::RwLock::new(self.display_suppressed.read().clone()),
             capture_node: Arc::clone(&self.capture_node),
             saw_real_disconnect: Arc::clone(&self.saw_real_disconnect),
-            cursor_theme: self.cursor_theme.clone(),
             health_reporter: Arc::clone(&self.health_reporter),
             pipewire_sensor: Arc::clone(&self.pipewire_sensor),
             egfx_snapshot: Arc::clone(&self.egfx_snapshot),

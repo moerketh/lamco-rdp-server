@@ -732,22 +732,22 @@ fn wayland_thread(rx: std::sync::mpsc::Receiver<WlCommand>) {
                         state.retiring = Some(prev);
                     }
                     state.stream_sm.reset();
-                    // Pointer mode: Embedded. KWin paints the cursor into
-                    // the virtual output's frames (with its context-aware
-                    // shape changes), and the server sends a one-time
-                    // HidePointer PDU so the RDP client stops drawing its
-                    // own pointer — the stream cursor becomes the only one
-                    // the user sees (see process_cursor_update's Painted
-                    // mode).
-                    //
-                    // Why not Metadata (=4): SPA_META_Cursor on zkde
-                    // virtual outputs was measured absent on every frame
-                    // with KWin 6.3.6 (Parrot 7.3) — cursor=absent across
-                    // an entire live session — while Embedded demonstrably
-                    // delivers compositor-painted cursors with shape
-                    // changes. If a future KWin fixes metadata for virtual
-                    // outputs, the Metadata mode + PDU path remains
-                    // available via config (cursor.mode = "metadata").
+                    // Pointer mode argument: measured 2026-09-06 on KWin
+                    // 6.3.6 (Parrot 7.3) — this argument does NOT control
+                    // whether KWin paints the cursor into the virtual
+                    // output's frames. Requesting Metadata still yielded a
+                    // composited cursor (two pointers with the client's
+                    // arrow); requesting Hidden did too. It also does not
+                    // yield SPA_META_Cursor: with Metadata requested, cursor
+                    // meta was absent on every frame of a whole live session
+                    // while the consumer provably requested SPA_META_Cursor
+                    // (lamco-pipewire requests it unconditionally). Embedded
+                    // (=2) is kept as the declared intent — it matches the
+                    // observed behaviour (composited cursor, context-aware
+                    // shapes) — but the value passed here is not the lever
+                    // it appears to be. The client-side arrow is suppressed
+                    // by the Painted-mode HidePointer re-send instead (see
+                    // process_cursor_update).
                     let stream = screencast.stream_virtual_output(
                         OUTPUT_NAME.to_string(),
                         width,

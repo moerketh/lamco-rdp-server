@@ -182,6 +182,16 @@ pub struct CursorStrategy {
     /// Whether a `HidePointer` update has already been sent for the current
     /// hidden/no-cursor span, so it's sent exactly once per transition.
     hidden_sent: bool,
+
+    /// Whether the active mode was pinned by an explicit `set_mode` call.
+    /// When set, `auto_select_mode` must not clobber it: latency samples
+    /// arrive continuously (the RTT prediction loop), and reverting an
+    /// explicitly chosen mode to `config.mode`/Predictive on every sample
+    /// would silently undo it. Measured live on the Parrot VM: config
+    /// `mode = "painted"` + `auto_mode = true` + threshold 0 flipped the
+    /// mode to Predictive on the FIRST latency sample, so the Painted-mode
+    /// HidePointer was never sent (9981c8c shipped exactly that config).
+    mode_pinned: bool,
 }
 
 /// Number of pointer-cache slots this crate assumes it can safely use.
@@ -266,6 +276,7 @@ impl CursorStrategy {
             current_shape: None,
             shape_cache: CursorShapeCache::new(SHAPE_CACHE_CAPACITY),
             hidden_sent: false,
+            mode_pinned: false,
             config,
         }
     }
@@ -372,8 +383,10 @@ impl CursorStrategy {
         self.active_mode
     }
 
-    /// Set cursor mode explicitly
-    pub fn set_mode(&mut self, mode: CursorMode) {
+    /// Switch the active mode (predictor lifecycle included). Shared by the
+    /// explicit `set_mode` and the internal `auto_select_mode`; does not
+    /// touch the pin.
+    fn apply_mode(&mut self, mode: CursorMode) {
         if mode != self.active_mode {
             debug!("Cursor mode changed: {:?} -> {:?}", self.active_mode, mode);
             self.active_mode = mode;
@@ -390,6 +403,25 @@ impl CursorStrategy {
                 }
             }
         }
+    }
+
+    /// Set cursor mode explicitly. Explicit modes are pinned against
+    /// `auto_select_mode` — see `mode_pinned` for why an unpinned explicit
+    /// mode gets clobbered by the first latency sample.
+    pub fn set_mode(&mut self, mode: CursorMode) {
+        self.apply_mode(mode);
+        self.mode_pinned = true;
+    }
+
+    /// Re-arm per-connection cursor state. `CursorStrategy` outlives RDP
+    /// connections (the display handler owns it for the process lifetime),
+    /// so `hidden_sent` from a previous client would suppress the
+    /// HidePointer the new connection needs. Call from the client-
+    /// activation path. (The active mode itself is NOT reset here — it is
+    /// resolved once from config at construction; per-connection mode
+    /// selection is future work.)
+    pub fn rearm_for_connection(&mut self) {
+        self.hidden_sent = false;
     }
 
     /// Get measured latency
@@ -414,6 +446,18 @@ impl CursorStrategy {
     }
 
     fn auto_select_mode(&mut self) {
+        // An explicitly set mode wins, and prediction is meaningless when
+        // the cursor is painted into the video or suppressed entirely.
+        // BOTH guards are needed: config-driven modes (the production path)
+        // never pass through `set_mode`, so the pin alone leaves them
+        // unprotected — measured live: config mode="painted" + auto_mode
+        // flipped to Predictive once RTT crossed the threshold, so the
+        // Painted-mode HidePointer was never sent.
+        if self.mode_pinned || matches!(self.active_mode, CursorMode::Painted | CursorMode::Hidden)
+        {
+            return;
+        }
+
         let should_predict = self.measured_latency_ms > self.config.predictive_latency_threshold_ms;
 
         let new_mode = if should_predict {
@@ -427,7 +471,7 @@ impl CursorStrategy {
                 "Auto-switching cursor mode: {:?} -> {:?} (latency={}ms)",
                 self.active_mode, new_mode, self.measured_latency_ms
             );
-            self.set_mode(new_mode);
+            self.apply_mode(new_mode);
         }
     }
 }
@@ -476,6 +520,57 @@ mod tests {
         // Low latency again - should switch back
         strategy.update_latency(50);
         assert_eq!(strategy.mode(), CursorMode::Metadata);
+    }
+
+    #[test]
+    fn test_explicit_mode_pins_against_auto_select() {
+        // Regression (measured live on the Parrot VM): a config of
+        // mode="painted" + auto_mode + threshold 0 flipped the mode to
+        // Predictive on the FIRST latency sample, so Painted's HidePointer
+        // was never sent (shipped 9981c8c). An explicit set_mode must win.
+        let mut config = CursorStrategyConfig::default();
+        config.auto_mode = true;
+        config.predictive_latency_threshold_ms = 100;
+
+        let mut strategy = CursorStrategy::new(config);
+        strategy.set_mode(CursorMode::Painted);
+
+        // Latency samples arrive continuously (RTT loop); none may clobber.
+        strategy.update_latency(500);
+        assert_eq!(strategy.mode(), CursorMode::Painted);
+        strategy.update_latency(5);
+        assert_eq!(strategy.mode(), CursorMode::Painted);
+    }
+
+    #[test]
+    fn test_config_driven_painted_mode_survives_auto_select() {
+        // The production path: config mode="painted" reaches the strategy
+        // via `new` (never `set_mode`), so the pin alone does not protect
+        // it — the semantic guard in auto_select_mode must.
+        let mut config = CursorStrategyConfig::default();
+        config.mode = CursorMode::Painted;
+        config.auto_mode = true;
+        config.predictive_latency_threshold_ms = 100;
+
+        let mut strategy = CursorStrategy::new(config);
+        assert_eq!(strategy.mode(), CursorMode::Painted);
+
+        strategy.update_latency(500);
+        assert_eq!(strategy.mode(), CursorMode::Painted);
+        strategy.update_latency(5);
+        assert_eq!(strategy.mode(), CursorMode::Painted);
+    }
+
+    #[test]
+    fn test_config_driven_hidden_mode_survives_auto_select() {
+        let mut config = CursorStrategyConfig::default();
+        config.mode = CursorMode::Hidden;
+        config.auto_mode = true;
+        config.predictive_latency_threshold_ms = 100;
+
+        let mut strategy = CursorStrategy::new(config);
+        strategy.update_latency(500);
+        assert_eq!(strategy.mode(), CursorMode::Hidden);
     }
 
     #[test]
@@ -569,12 +664,6 @@ mod tests {
             auto_mode: false,
             predictive_latency_threshold_ms: 42,
             cursor_update_fps: 30,
-            // Console-cursor theme fields are consumed by the display
-            // handler's CursorThemeManager, not the client-cursor strategy;
-            // defaults are fine here.
-            session_scoped_cursor_theme: false,
-            console_cursor_theme: String::new(),
-            transparent_cursor_theme: String::new(),
             predictor: crate::config::types::CursorPredictorConfig {
                 history_size: 3,
                 lookahead_ms: 10.0,
