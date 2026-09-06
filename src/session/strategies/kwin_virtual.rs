@@ -732,14 +732,22 @@ fn wayland_thread(rx: std::sync::mpsc::Receiver<WlCommand>) {
                         state.retiring = Some(prev);
                     }
                     state.stream_sm.reset();
-                    // Pointer mode: Metadata. KWin then attaches cursor
-                    // position/hotspot/shape to each frame (SPA_META_Cursor),
-                    // which `process_cursor_update` turns into pointer PDUs
-                    // the client renders itself. Hidden (=1) would attach no
-                    // metadata at all and the client would be stuck with its
-                    // static default arrow forever — matching the portal
-                    // path, which also prefers Metadata (see
-                    // `best_cursor_mode` in screencast_only.rs).
+                    // Pointer mode: Embedded. KWin paints the cursor into
+                    // the virtual output's frames (with its context-aware
+                    // shape changes), and the server sends a one-time
+                    // HidePointer PDU so the RDP client stops drawing its
+                    // own pointer — the stream cursor becomes the only one
+                    // the user sees (see process_cursor_update's Painted
+                    // mode).
+                    //
+                    // Why not Metadata (=4): SPA_META_Cursor on zkde
+                    // virtual outputs was measured absent on every frame
+                    // with KWin 6.3.6 (Parrot 7.3) — cursor=absent across
+                    // an entire live session — while Embedded demonstrably
+                    // delivers compositor-painted cursors with shape
+                    // changes. If a future KWin fixes metadata for virtual
+                    // outputs, the Metadata mode + PDU path remains
+                    // available via config (cursor.mode = "metadata").
                     let stream = screencast.stream_virtual_output(
                         OUTPUT_NAME.to_string(),
                         width,
@@ -747,7 +755,7 @@ fn wayland_thread(rx: std::sync::mpsc::Receiver<WlCommand>) {
                         // scale: 1.0 — RDP clients express size in physical
                         // pixels; no compositor-side scaling wanted.
                         1.0,
-                        u32::from(Pointer::Metadata),
+                        u32::from(Pointer::Embedded),
                         &qh,
                         (),
                     );

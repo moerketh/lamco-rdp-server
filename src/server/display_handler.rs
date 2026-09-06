@@ -4482,24 +4482,39 @@ impl LamcoDisplayHandler {
     /// lookup); this call is correct for whatever `stream_info` it's given
     /// and will reflect real multi-monitor layout once that's wired up.
     ///
-    /// `CursorMode::Painted` (server-side compositing into the video frame)
-    /// is not implemented yet — `CursorMode::requires_compositing()` exists
-    /// for a future caller that does the compositing, but nothing calls it
-    /// today. Until that lands, Painted falls through to the same
-    /// client-side metadata path as Metadata/Predictive rather than sending
-    /// no cursor at all; that's a deliberate temporary fallback, not the
-    /// intended final behavior for that mode.
+    /// `CursorMode::Painted` (cursor composited into the video stream) is
+    /// implemented for the kwin-virtual strategy: KWin itself paints the
+    /// cursor into the virtual output when zkde-screencast runs in Embedded
+    /// mode, so "Painted" here means the server sends a one-time
+    /// HidePointer PDU (the client stops drawing its local pointer and the
+    /// stream-embedded cursor — with its context-aware shape changes — is
+    /// the only pointer the user sees) and then sends nothing further.
+    /// Server-side compositing for other strategies
+    /// (`CursorMode::requires_compositing()` without a compositor-painted
+    /// source) remains future work.
     async fn process_cursor_update(
         &self,
         cursor: Option<lamco_pipewire::meta::CursorMeta>,
         monitor_index: u32,
     ) {
+        // Painted mode: the stream itself carries the cursor. Hide the
+        // client's local pointer exactly once and stop — no shape/position
+        // PDUs (they would fight the embedded cursor).
+        let sender = self.get_update_sender();
+        let mut strategy = self.cursor_strategy.lock().await;
+        if strategy.mode() == crate::cursor::CursorMode::Painted {
+            if strategy.needs_hide_update() {
+                let sender = sender.lock().await;
+                if let Err(e) = sender.send(DisplayUpdate::HidePointer).await {
+                    debug!("Failed to send painted-mode cursor hide update: {e}");
+                }
+            }
+            return;
+        }
+
         let Some(cursor) = cursor else {
             return;
         };
-
-        let sender = self.get_update_sender();
-        let mut strategy = self.cursor_strategy.lock().await;
 
         // id == 0 is the compositor's "invalid/no cursor" sentinel (e.g. the
         // pointer left the captured surface). Hide once, regardless of mode.
