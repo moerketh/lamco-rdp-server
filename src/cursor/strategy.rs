@@ -4,7 +4,7 @@
 //! each optimized for different scenarios.
 
 use serde::{Deserialize, Serialize};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use super::predictor::{CursorPredictor, PredictorConfig};
 
@@ -192,7 +192,26 @@ pub struct CursorStrategy {
     /// mode to Predictive on the FIRST latency sample, so the Painted-mode
     /// HidePointer was never sent (9981c8c shipped exactly that config).
     mode_pinned: bool,
+
+    /// Consecutive frames with no `SPA_META_Cursor` attached. Drives the
+    /// runtime Painted auto-selection in `observe_metadata_cursors`.
+    metadata_absent_frames: u32,
+
+    /// One-way latch: this capture path has delivered cursor metadata at
+    /// least once. Once set, the runtime Painted flip never engages — a
+    /// path that CAN deliver metadata keeps client-side rendering even if
+    /// some frames are absent (the pointer can be off-output).
+    metadata_ever_seen: bool,
 }
+
+/// Consecutive metadata-absent frames after which the runtime Painted
+/// auto-selection engages (only when the configured mode is the Metadata
+/// default and no explicit `set_mode` pin exists). The old cursor-theme
+/// workaround's `PENDING_ABSENT_FRAMES = 3` is the precedent; a slightly
+/// larger N costs ~2 frames (~35 ms at 60 fps) of visible double cursor at
+/// connect and avoids misclassifying a first frame where the pointer is
+/// briefly off-output.
+const METADATA_ABSENT_FRAMES_LIMIT: u32 = 5;
 
 /// Number of pointer-cache slots this crate assumes it can safely use.
 ///
@@ -277,6 +296,8 @@ impl CursorStrategy {
             shape_cache: CursorShapeCache::new(SHAPE_CACHE_CAPACITY),
             hidden_sent: false,
             mode_pinned: false,
+            metadata_absent_frames: 0,
+            metadata_ever_seen: false,
             config,
         }
     }
@@ -318,6 +339,71 @@ impl CursorStrategy {
     /// Clear the hidden/no-cursor tracking after sending a real update.
     pub fn note_visible(&mut self) {
         self.hidden_sent = false;
+    }
+
+    /// Observe whether this frame's capture metadata carried a cursor, and
+    /// resolve the active mode from the evidence.
+    ///
+    /// On paths that never deliver `SPA_META_Cursor` (measured: KWin 6.3.6
+    /// zkde virtual outputs; portal_generic's direct channel structurally),
+    /// the compositor still paints the cursor into the video — a Metadata
+    /// (or Predictive, which is metadata-driven) session then sends no
+    /// pointer PDUs at all and the client draws its own arrow on top of
+    /// the painted one: the double cursor. After
+    /// `METADATA_ABSENT_FRAMES_LIMIT` consecutive absent frames, a session
+    /// whose *configured* mode is Metadata or Predictive (no explicit
+    /// Painted/Hidden operator choice, no `set_mode` pin) flips to Painted
+    /// so the transparent-shape PDU takes pointer ownership.
+    ///
+    /// The flip is deliberately UNPINNED: `auto_select_mode`'s semantic
+    /// guard already protects Painted, and staying unpinned lets a metadata
+    /// stream that starts later (Portal/Mutter session, fixed KWin) flip
+    /// the mode back to Metadata for client-side rendering. An explicit
+    /// `set_mode` pin always wins over both directions, and once metadata
+    /// has ever been seen the Painted flip never engages.
+    pub fn observe_metadata_cursors(&mut self, present: bool) {
+        if present {
+            self.metadata_ever_seen = true;
+            self.metadata_absent_frames = 0;
+            if !self.mode_pinned && self.active_mode == CursorMode::Painted {
+                info!(
+                    "cursor metadata delivered — switching Painted -> Metadata \
+                     (client-side rendering)"
+                );
+                self.apply_mode(CursorMode::Metadata);
+            }
+            return;
+        }
+        if self.metadata_ever_seen || self.mode_pinned {
+            self.metadata_absent_frames = 0;
+            return;
+        }
+        // saturating_add: on a metadata-less path this counter otherwise
+        // grows unboundedly (u32 overflow after ~828 days at 60 fps — a
+        // debug build would panic).
+        self.metadata_absent_frames = self.metadata_absent_frames.saturating_add(1);
+        // The `active_mode != Painted` guard makes the flip (and its log)
+        // fire exactly once per transition: on a metadata-less path every
+        // frame past the limit would otherwise re-enter this block and
+        // bury the journal 30-60 times per second.
+        // Predictive is treated like Metadata here: prediction is driven
+        // by cursor-metadata samples, so a Predictive-configured session
+        // on a metadata-less path sends no pointer PDUs either — the same
+        // double cursor — and equally benefits from the Painted flip.
+        if self.metadata_absent_frames >= METADATA_ABSENT_FRAMES_LIMIT
+            && matches!(
+                self.config.mode,
+                CursorMode::Metadata | CursorMode::Predictive
+            )
+            && self.active_mode != CursorMode::Painted
+        {
+            info!(
+                "no cursor metadata after {} frames — auto-selecting Painted mode \
+                 (compositor-painted cursor + transparent client pointer shape)",
+                self.metadata_absent_frames
+            );
+            self.apply_mode(CursorMode::Painted);
+        }
     }
 
     /// Update cursor position
@@ -571,6 +657,93 @@ mod tests {
         let mut strategy = CursorStrategy::new(config);
         strategy.update_latency(500);
         assert_eq!(strategy.mode(), CursorMode::Hidden);
+    }
+
+    #[test]
+    fn test_runtime_painted_auto_select_when_metadata_absent() {
+        // Fresh install, default config (mode=metadata): a capture path
+        // that never delivers cursor metadata must flip to Painted so the
+        // transparent shape PDU takes pointer ownership (the double-cursor
+        // fix, out of the box).
+        let mut strategy = CursorStrategy::new(CursorStrategyConfig::default());
+        assert_eq!(strategy.mode(), CursorMode::Metadata);
+
+        for _ in 0..(METADATA_ABSENT_FRAMES_LIMIT - 1) {
+            strategy.observe_metadata_cursors(false);
+            assert_eq!(strategy.mode(), CursorMode::Metadata);
+        }
+        strategy.observe_metadata_cursors(false);
+        assert_eq!(strategy.mode(), CursorMode::Painted);
+
+        // Late metadata flips it back (client-side rendering), and the
+        // ever-seen latch keeps it Metadata even across later absences.
+        strategy.observe_metadata_cursors(true);
+        assert_eq!(strategy.mode(), CursorMode::Metadata);
+        for _ in 0..(METADATA_ABSENT_FRAMES_LIMIT + 3) {
+            strategy.observe_metadata_cursors(false);
+        }
+        assert_eq!(strategy.mode(), CursorMode::Metadata);
+    }
+
+    #[test]
+    fn test_explicit_config_mode_wins_over_runtime_auto_select() {
+        // An operator's explicit non-default choice must not be overridden
+        // by the runtime resolver in EITHER direction.
+        let mut config = CursorStrategyConfig::default();
+        config.mode = CursorMode::Hidden;
+        let mut strategy = CursorStrategy::new(config);
+        for _ in 0..(METADATA_ABSENT_FRAMES_LIMIT + 5) {
+            strategy.observe_metadata_cursors(false);
+        }
+        assert_eq!(strategy.mode(), CursorMode::Hidden);
+
+        strategy.observe_metadata_cursors(true);
+        assert_eq!(strategy.mode(), CursorMode::Hidden);
+    }
+
+    #[test]
+    fn test_set_mode_pin_wins_over_runtime_auto_select() {
+        let mut strategy = CursorStrategy::new(CursorStrategyConfig::default());
+        strategy.set_mode(CursorMode::Predictive);
+        for _ in 0..(METADATA_ABSENT_FRAMES_LIMIT + 5) {
+            strategy.observe_metadata_cursors(false);
+        }
+        strategy.observe_metadata_cursors(true);
+        assert_eq!(strategy.mode(), CursorMode::Predictive);
+    }
+
+    #[test]
+    fn test_predictive_config_also_flips_to_painted_when_metadata_absent() {
+        // Predictive is metadata-driven; without metadata it sends no
+        // pointer PDUs either — the same double cursor as Metadata.
+        let mut config = CursorStrategyConfig::default();
+        config.mode = CursorMode::Predictive;
+        let mut strategy = CursorStrategy::new(config);
+        assert_eq!(strategy.mode(), CursorMode::Predictive);
+
+        for _ in 0..METADATA_ABSENT_FRAMES_LIMIT {
+            strategy.observe_metadata_cursors(false);
+        }
+        assert_eq!(strategy.mode(), CursorMode::Painted);
+    }
+
+    #[test]
+    fn test_runtime_auto_select_is_transition_guarded() {
+        // On a metadata-less path the counter keeps growing past the limit;
+        // the mode must stay Painted and state must remain stable (the
+        // `active_mode != Painted` guard makes the flip-and-log fire once
+        // per transition instead of every frame).
+        let mut strategy = CursorStrategy::new(CursorStrategyConfig::default());
+        for _ in 0..(METADATA_ABSENT_FRAMES_LIMIT + 100) {
+            strategy.observe_metadata_cursors(false);
+        }
+        assert_eq!(strategy.mode(), CursorMode::Painted);
+        // Still stable after many more frames: no re-flip churn, no
+        // per-frame work beyond the counter tick.
+        for _ in 0..1000 {
+            strategy.observe_metadata_cursors(false);
+        }
+        assert_eq!(strategy.mode(), CursorMode::Painted);
     }
 
     #[test]
