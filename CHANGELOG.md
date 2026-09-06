@@ -9,6 +9,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Add entries here as work lands; retitle to the release version and date when the release is cut.
 
+### Fixed
+
+**Double cursor on Hyper-V Enhanced Session (vmconnect)** — the RDP session
+showed two pointers: the Parrot cursor KWin paints into the video stream plus
+the client's own arrow on top. Measured on KWin 6.3.6 (zkde virtual outputs,
+Parrot 7.3):
+
+- The zkde `stream_virtual_output` pointer-mode argument (Hidden/Embedded/
+  Metadata) controls nothing: the cursor is always painted into frames, and
+  `SPA_META_Cursor` never arrives even with Metadata requested (the consumer
+  side requests it unconditionally — verified in lamco-pipewire 0.6.13's
+  `request_buffer_metadata` and in the journal).
+- vmconnect ignores `HidePointer` (SYSPTR_NULL) — one-shot and re-sent
+  alike; it treats it as "no server cursor, fall back to my default arrow".
+
+The fix takes pointer ownership with a **transparent color-pointer shape
+PDU** (32×32, all-opaque AND mask, all-zero 24-bpp XOR mask per
+`TS_COLORPOINTERATTRIBUTE` — the same approach xrdp uses for Hyper-V
+enhanced session): the client swaps its arrow for a cursor that renders
+invisibly, leaving the compositor-painted guest cursor — with its
+context-aware shape changes — as the only pointer. The shape is re-sent
+every 60 pipeline frames so client-side pointer-state resets (EGFX
+ResetGraphics, resize-driven Deactivate/Reactivate) cannot resurrect the
+client arrow.
+
+Also fixed, the live cause of the previous attempt (9981c8c) doing nothing:
+`auto_select_mode` flipped the config-driven Painted mode to Predictive as
+soon as measured RTT crossed `predictive_latency_threshold_ms` (with the
+shipped threshold of 0: on the first sample), so the hide was never sent.
+Auto-selection now never flips out of Painted or Hidden modes (prediction
+is meaningless there), per-connection hide state is re-armed at client
+activation, and `auto_mode = true` with
+`predictive_latency_threshold_ms = 0` is rejected at config validation.
+
+### Removed
+
+**Session-scoped guest cursor-theme workaround** (`cursor_theme.rs`, 582
+lines) — applied a transparent XCursor theme to the guest session while an
+RDP client was connected. Deleted in full: on default config it raced the
+new transparent shape PDU into a **zero-cursor** state (transparent guest
+cursor + transparent client shape), and with pointer ownership taken by the
+shape PDU there is nothing left to hide guest-side. The
+`[cursor] session_scoped_cursor_theme` / `console_cursor_theme` /
+`transparent_cursor_theme` config keys are gone (stale keys in existing
+config files are ignored); the console cursor theme is no longer touched.
+
+
 ## [1.4.5-hyperv.2] - 2026-09-05
 
 Visual-fidelity and damage-tracking fixes for the Hyper-V / KDE line,
