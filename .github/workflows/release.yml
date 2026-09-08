@@ -144,16 +144,19 @@ jobs:
           BASE="${SECTION%-hyperv.*}"
           BODY=""
           for head in "[${SECTION}]" "[${BASE}]"; do
-            if awk -v h="${head}" '
+            # Guard via byte count, NOT `awk ... | grep -q .`: grep -q exits at
+            # the first matching line, closing the pipe while awk still has
+            # output buffered → awk dies on SIGPIPE (141) → with pipefail the
+            # whole condition is false → extraction silently falls back to the
+            # commit list for EVERY multi-line section. (This is why all prior
+            # releases shipped with "No CHANGELOG.md section found" bodies.)
+            OUT="$(awk -v h="${head}" '
               index($0, "## " h) == 1 { inside=1; next }
               inside && index($0, "## [") == 1 { inside=0 }
               inside { print }
-            ' CHANGELOG.md | grep -q .; then
-              BODY="$(awk -v h="${head}" '
-                index($0, "## " h) == 1 { inside=1; next }
-                inside && index($0, "## [") == 1 { inside=0 }
-                inside { print }
-              ' CHANGELOG.md)"
+            ' CHANGELOG.md)"
+            if [[ -n "$OUT" ]]; then
+              BODY="$OUT"
               break
             fi
           done

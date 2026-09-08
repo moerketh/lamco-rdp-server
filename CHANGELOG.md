@@ -5,7 +5,6 @@ All notable changes to lamco-rdp-server will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-
 ## [Unreleased]
 
 Add entries here as work lands; retitle to the release version and date when the release is cut.
@@ -83,7 +82,6 @@ logs that administrative disconnect is not implemented in this build.
 - `server.max_connections` and `server.session_timeout` are NOT ENFORCED
   at runtime (no consumers outside the GUI); now stated in the config
   reference and struct docs, matching the GUI's existing notes.
-
 
 ## [1.4.5-hyperv.2] - 2026-09-06
 
