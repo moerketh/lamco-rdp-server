@@ -3485,21 +3485,54 @@ impl LamcoDisplayHandler {
                             }
                         }
                         if throttle {
-                            frames_dropped += 1;
-                            if frames_dropped.is_multiple_of(60)
-                                && let Some(ref s) = handler.gfx_handler_state
-                                && let Ok(fc) = s.flow_controller.lock()
-                            {
+                            // Halt-latch probe: while HALTED (sustained ack
+                            // stalls), grant exactly one frame slot per
+                            // HALT_PROBE_INTERVAL so a live-but-quiet peer
+                            // can ack and release the latch. The probe frame
+                            // is forced to IDR below so a recovering client
+                            // resyncs from it. Without this, HALTED's only
+                            // exit would be a late ack for a pre-halt frame
+                            // — a peer with nothing left to ack would stay
+                            // video-frozen forever.
+                            let probe_granted = handler
+                                .gfx_handler_state
+                                .as_ref()
+                                .and_then(|s| {
+                                    s.flow_controller
+                                        .lock()
+                                        .ok()
+                                        .map(|mut fc| fc.take_halt_probe(std::time::Instant::now()))
+                                })
+                                .unwrap_or(false);
+                            if probe_granted {
                                 info!(
-                                    unacked = fc.unacked_count(),
-                                    activate_th = fc.activate_th(),
-                                    avg_rtt_us = fc.avg_rtt().as_micros() as u64,
-                                    state = ?fc.state(),
-                                    "EGFX L4 flow controller: throttling encoder \
-                                     (waiting for client to drain unacked frames)"
+                                    "EGFX: halt probe granted — sending one IDR frame to test \
+                                     for client liveness"
                                 );
+                                encoder.request_idr();
+                                // force_first_frame (not the later recomputed
+                                // force_full_frame binding): it is the mutable
+                                // flag this loop consumes at damage-detection
+                                // time, and it forces a full-frame IDR send.
+                                force_first_frame = true;
+                                // Fall through to encode the probe frame.
+                            } else {
+                                frames_dropped += 1;
+                                if frames_dropped.is_multiple_of(60)
+                                    && let Some(ref s) = handler.gfx_handler_state
+                                    && let Ok(fc) = s.flow_controller.lock()
+                                {
+                                    info!(
+                                        unacked = fc.unacked_count(),
+                                        activate_th = fc.activate_th(),
+                                        avg_rtt_us = fc.avg_rtt().as_micros() as u64,
+                                        state = ?fc.state(),
+                                        "EGFX L4 flow controller: throttling encoder \
+                                         (waiting for client to drain unacked frames)"
+                                    );
+                                }
+                                continue;
                             }
-                            continue;
                         }
 
                         use crate::egfx::align_to_16;
