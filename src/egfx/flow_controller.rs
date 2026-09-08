@@ -93,6 +93,13 @@ const RATE_WINDOW: Duration = Duration::from_millis(1000);
 /// not a latency preference.
 const MAX_CONSECUTIVE_ACK_STALLS: u32 = 12;
 
+/// While latched HALTED, one probe frame is granted per this interval so a
+/// live-but-quiet peer can ack and release the latch (see `take_halt_probe`).
+/// 5s matches the default `frame_ack_timeout` — a probe's ack arrives (or
+/// doesn't) within one stall window, keeping the latch's bookkeeping in step
+/// with `check_ack_timeout`'s cadence.
+const HALT_PROBE_INTERVAL: Duration = Duration::from_secs(5);
+
 /// Bound the frame history. At 60fps with 1s RTT we'd track ~60 frames; double
 /// it for safety. Old entries get garbage-collected on each unack/ack call.
 const MAX_FRAME_HISTORY: usize = 240;
@@ -197,6 +204,9 @@ pub struct FlowController {
     /// Latched by sustained ack stalls; cleared by `ack_frame`.
     stall_halted: bool,
 
+    /// Last `take_halt_probe` grant; gates probe frequency while halted.
+    last_halt_probe: Instant,
+
     /// Optional NetworkAutoDetect RTT handle (milliseconds, `u32::MAX` until
     /// measured), shared with the RDP server that writes the latest probe RTT.
     /// Freshness floor: when no FrameAck-derived sample is recent, the threshold
@@ -221,6 +231,7 @@ impl FlowController {
             stats_throttle_exits: 0,
             consecutive_ack_stalls: 0,
             stall_halted: false,
+            last_halt_probe: Instant::now(),
             autodetect_rtt: None,
         }
     }
@@ -429,6 +440,38 @@ impl FlowController {
     /// Display loop checks this before encoding each frame.
     pub fn should_throttle(&self) -> bool {
         self.total_frame_slots == 0 || self.stall_halted
+    }
+
+    /// Halt-latch probe (call from the display loop's throttle path, once
+    /// per pipeline iteration while halted).
+    ///
+    /// The latch's only exit is `ack_frame` — but once latched, the encoder
+    /// stops and nothing new can be acked. A client that is alive but has
+    /// no un-acked frame left (e.g. it acked everything just before the
+    /// latch fired, or a post-reconnect client) would leave the session
+    /// video-frozen forever without disconnecting. This hands the encoder
+    /// exactly ONE frame slot every `HALT_PROBE_INTERVAL`, so a periodic
+    /// probe frame (the pipeline sends it as an IDR) goes out; a live peer
+    /// acks it and `ack_frame` releases the latch. A dead peer ignores it
+    /// and the single slot bounds the cost to one small frame per interval.
+    ///
+    /// Returns `true` when a probe slot was granted this call.
+    pub fn take_halt_probe(&mut self, now: Instant) -> bool {
+        if !self.stall_halted {
+            return false;
+        }
+        let since = now.saturating_duration_since(self.last_halt_probe);
+        if since < HALT_PROBE_INTERVAL {
+            return false;
+        }
+        self.last_halt_probe = now;
+        self.total_frame_slots = 1;
+        debug!(
+            interval_ms = HALT_PROBE_INTERVAL.as_millis() as u64,
+            "EGFX flow controller: halt probe — granting one frame slot to test \
+             for peer liveness"
+        );
+        true
     }
 
     /// Diagnostic accessors.
@@ -676,6 +719,54 @@ mod tests {
             let _ = fc.check_ack_timeout(timeout);
         }
         assert!(!fc.should_throttle(), "live client must never latch");
+    }
+
+    #[test]
+    fn halt_probe_grants_one_slot_per_interval_and_ack_releases() {
+        // The HALTED latch's only exit is an ack, but a latched encoder sends
+        // nothing new to ack. The probe grants exactly one frame slot per
+        // HALT_PROBE_INTERVAL: a live peer acks the probe and releases; a
+        // dead peer ignores it and the cost stays bounded at one frame per
+        // interval.
+        let timeout = Duration::from_millis(0);
+        let mut fc = FlowController::new(cfg());
+
+        // Latch the halt.
+        for frame_id in 1..=(MAX_CONSECUTIVE_ACK_STALLS + 1) {
+            fc.unack_frame(frame_id, 1);
+            let _ = fc.check_ack_timeout(timeout);
+        }
+        assert!(fc.should_throttle());
+
+        // Probe gating: no grant before the interval elapses...
+        let t0 = Instant::now();
+        assert!(!fc.take_halt_probe(t0), "first call at t0 grants nothing");
+        // (last_halt_probe initialized at construction, so t0 is within the
+        // first interval — grant only after it elapses.)
+        let t1 = t0 + HALT_PROBE_INTERVAL;
+        assert!(
+            fc.take_halt_probe(t1),
+            "probe must grant after the interval"
+        );
+        // Exactly one slot: the encoder may send one frame, then re-halts.
+        assert_eq!(fc.total_frame_slots(), 1);
+        assert!(
+            !fc.take_halt_probe(t1 + Duration::from_millis(1)),
+            "one grant per interval"
+        );
+
+        // The probe frame goes out, the live peer acks it: latch releases.
+        fc.unack_frame(1000, 1); // the probe frame itself
+        fc.ack_frame(1000);
+        assert!(!fc.should_throttle(), "probe ack must release the halt");
+        assert_eq!(
+            fc.total_frame_slots(),
+            UNLIMITED_FRAME_SLOTS,
+            "release must restore unlimited slots"
+        );
+
+        // And probing is inert once released.
+        assert!(!fc.take_halt_probe(t1 + HALT_PROBE_INTERVAL * 2));
     }
 
     #[test]

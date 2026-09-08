@@ -10,6 +10,81 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Add entries here as work lands; retitle to the release version and date when the release is cut.
 
+## [1.4.5-hyperv.2] - 2026-09-08
+
+Clipboard, file transfer, and dead-peer resilience for the Hyper-V /
+KDE line. The tag was re-pointed to include this round; entries below
+are appended to the 2026-09-06 release (visual-fidelity and
+review-remediation round — see the previous section for those notes).
+
+### Added
+
+**Clipboard on kwin-virtual (text + files, both directions)** — CLIPRDR
+is now enabled for the kwin-virtual session strategy, composing the
+libei handle's wl-clipboard provider. Validated end-to-end with
+vmconnect: host→guest and guest→host text, and file copy both ways
+(Explorer ⇄ Dolphin), with file materialization via the staging backend
+(~/Downloads; FUSE mount is denied by Parrot's sandbox).
+
+### Fixed
+
+**Clipboard both-directions failure (two-server sender overwrite)** —
+when vsock is active the fork builds TWO RdpServers (plain vsock +
+primary TCP), each with a CLIPRDR factory over ONE shared clipboard
+orchestrator. The orchestrator's single server-event sender slot was
+overwritten by the second factory's registration at boot; whichever
+server lost the slot never saw another clipboard event. Now a fan-out:
+every dispatch broadcasts to all registered servers
+(`broadcast_server_event`; per-sender construction since `ServerEvent`
+is not `Clone`), and a stale transfer cache is cleared on each new
+FormatList so a fresh copy never serves the previous copy's bytes.
+
+**Host→guest file paste (never-subscribed FilesReady)** — the staging
+backend completed its half (file downloaded to ~/Downloads in tens of
+milliseconds) and emitted `FileTransferEvent::FilesReady` on an event
+channel nothing had ever subscribed to. The pending eager-fetch serial
+went unanswered, the wl-clipboard selection stayed an unfulfilled
+announce, and local apps pasted fallback text instead of the file. The
+orchestrator now consumes the backend's events and materializes the
+selection (uri-list + gnome-copied-files) on completion.
+
+**Dead-peer wedge (overnight host sleep froze the server)** — a vmconnect
+peer that dies without FIN/RST parked IronRDP's writer; the display
+pipeline then blocked forever on an awaited DisplayUpdate send while
+holding the update-sender mutex, deadlocking every display path
+(including the recovery path itself) and the sole PipeWire drain, and
+the serial accept loop never re-armed: no new connections until service
+restart, with a 107k-line backpressure log wall. All DisplayUpdate
+sends are now `try_send` under the guard (drop-on-Full, bail-on-Closed;
+bitmap drops re-queue ALL un-sent rects into the damage accumulator so
+no pixels are lost). Field-verified by host-sleep reproduction: the same
+process detected the peer death, cleaned up, and accepted a fresh
+session 31s later.
+
+**EGFX unbounded memory on a dead peer** — the EGFX path sends on an
+unbounded channel by design, and the ack-stall recovery path cleared
+the unacked set and resumed the encoder every 5s forever, so encoded
+frames accumulated without bound (worse after the wedge fix: the wedged
+pipeline used to incidentally stop encoding). The flow controller now
+latches HALTED after 12 consecutive stalls (~60s of zero acks); the
+encoder stops and the channel stops filling. A one-frame IDR probe
+every 5s while halted gives a live-but-quiet peer an ack to release the
+latch with, so the halt self-heals instead of freezing forever.
+
+**D-Bus connection tracking (empty list, fake disconnect success)** —
+`GetConnections` always returned empty in production (the tracking list
+was only ever populated by tests); the signal relay now fills it from
+the real ClientConnected/ClientDisconnected events. `DisconnectClient`
+no longer reports success while doing nothing — it returns false and
+logs that administrative disconnect is not implemented in this build.
+
+### Documentation
+
+- `server.max_connections` and `server.session_timeout` are NOT ENFORCED
+  at runtime (no consumers outside the GUI); now stated in the config
+  reference and struct docs, matching the GUI's existing notes.
+
+
 ## [1.4.5-hyperv.2] - 2026-09-06
 
 Visual-fidelity and damage-tracking fixes for the Hyper-V / KDE line,
