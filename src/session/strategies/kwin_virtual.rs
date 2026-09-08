@@ -369,6 +369,22 @@ impl SessionHandle for KwinVirtualSessionHandle {
     fn clipboard_source(&self) -> ClipboardSource {
         ClipboardSource::None
     }
+
+    // Clipboard comes from the composed libei session (Wayland data-control
+    // via wl-clipboard-rs) — the same provider the standalone libei
+    // strategy uses. clipboard_source() stays None: this path supplies the
+    // provider through build_clipboard(), not the Portal/Mutter/DataControl
+    // handles that enum carries.
+    #[cfg(feature = "wl-clipboard")]
+    async fn build_clipboard(
+        &self,
+        _portal_fallback: Option<crate::session::strategy::ClipboardComponents>,
+        rate_limit_ms: u64,
+    ) -> Option<std::sync::Arc<dyn crate::clipboard::provider::ClipboardProvider>> {
+        self.libei
+            .build_clipboard(_portal_fallback, rate_limit_ms)
+            .await
+    }
 }
 
 /// Wayland connection thread: owns the zkde-screencast objects.

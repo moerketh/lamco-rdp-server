@@ -18,6 +18,7 @@ use tracing::{debug, error, info, trace, warn};
 use super::{
     ClipboardOrchestrator, ClipboardOrchestratorConfig, EAGER_FETCH_SERIAL, EagerFetchKind,
     PendingEagerFetches, PendingPortalRequests, ServerEventSender, SharedClipboardProvider,
+    broadcast_server_event, first_live_sender,
 };
 use crate::clipboard::{
     FormatConverterExt,
@@ -234,15 +235,17 @@ impl ClipboardOrchestrator {
                     info!(
                         "Data-control provider: initiating FileGroupDescriptorW paste to fetch remote file list"
                     );
-                    let sender_opt = server_event_sender.read().await.clone();
-                    if let Some(sender) = sender_opt {
+                    if !broadcast_server_event(server_event_sender, || {
                         use ironrdp_cliprdr::{backend::ClipboardMessage, pdu::ClipboardFormatId};
-
-                        if let Err(e) = sender.send(ironrdp_server::ServerEvent::Clipboard(
-                            ClipboardMessage::SendInitiatePaste(ClipboardFormatId(fgd_id)),
-                        )) {
-                            warn!("Failed to initiate FileGroupDescriptorW paste: {:?}", e);
-                        }
+                        ironrdp_server::ServerEvent::Clipboard(ClipboardMessage::SendInitiatePaste(
+                            ClipboardFormatId(fgd_id),
+                        ))
+                    })
+                    .await
+                    {
+                        warn!(
+                            "Failed to initiate FileGroupDescriptorW paste: no live server event channel"
+                        );
                     }
                 }
             }
@@ -258,66 +261,45 @@ impl ClipboardOrchestrator {
     /// can decode it correctly when the response arrives (IronRDP doesn't correlate
     /// requests/responses itself, hence the existing FIFO queue).
     ///
-    /// On send failure, drops the sentinel and tries the next queued item instead of
-    /// stalling the rest of the round eager-fetch entirely.
+    /// With fan-out the request only fails when every server channel is gone, in
+    /// which case retrying the rest of the queue is pointless — the sentinel is
+    /// dropped and the round ends.
     async fn fire_eager_fetch(
-        first: EagerFetchKind,
+        kind: EagerFetchKind,
         pending_portal_requests: &PendingPortalRequests,
-        pending_eager_fetches: &PendingEagerFetches,
+        _pending_eager_fetches: &PendingEagerFetches,
         server_event_sender: &ServerEventSender,
     ) {
-        let mut kind = first;
-        loop {
-            let (format_id, encoded_mime) = match kind {
-                EagerFetchKind::Text => (13, "text/plain".to_string()),
-                EagerFetchKind::Html { format_id } => {
-                    (format_id, format!("eager-html:{format_id}"))
-                }
-                EagerFetchKind::Image { format_id } => {
-                    (format_id, format!("eager-image:{format_id}"))
-                }
-            };
+        let (format_id, encoded_mime) = match kind {
+            EagerFetchKind::Text => (13, "text/plain".to_string()),
+            EagerFetchKind::Html { format_id } => (format_id, format!("eager-html:{format_id}")),
+            EagerFetchKind::Image { format_id } => (format_id, format!("eager-image:{format_id}")),
+        };
 
-            info!(
-                "Data-control provider: eagerly fetching {:?} (format {}) from RDP client",
-                kind, format_id
-            );
+        info!(
+            "Data-control provider: eagerly fetching {:?} (format {}) from RDP client",
+            kind, format_id
+        );
 
-            pending_portal_requests.write().await.push_back((
-                EAGER_FETCH_SERIAL,
-                encoded_mime,
-                std::time::Instant::now(),
-            ));
+        pending_portal_requests.write().await.push_back((
+            EAGER_FETCH_SERIAL,
+            encoded_mime,
+            std::time::Instant::now(),
+        ));
 
-            let sender_opt = server_event_sender.read().await.clone();
-            let Some(sender) = sender_opt else {
-                warn!("ServerEvent sender not available for eager fetch");
-                pending_portal_requests
-                    .write()
-                    .await
-                    .retain(|(s, _, _)| *s != EAGER_FETCH_SERIAL);
-                return;
-            };
-
+        if !broadcast_server_event(server_event_sender, || {
             use ironrdp_cliprdr::{backend::ClipboardMessage, pdu::ClipboardFormatId};
-            let send_result = sender.send(ironrdp_server::ServerEvent::Clipboard(
-                ClipboardMessage::SendInitiatePaste(ClipboardFormatId(format_id)),
-            ));
-
-            match send_result {
-                Ok(()) => return,
-                Err(e) => {
-                    warn!("Failed to send eager fetch for {:?}: {:?}", kind, e);
-                    pending_portal_requests
-                        .write()
-                        .await
-                        .retain(|(s, _, _)| *s != EAGER_FETCH_SERIAL);
-                    match pending_eager_fetches.write().await.pop_front() {
-                        Some(next) => kind = next,
-                        None => return,
-                    }
-                }
-            }
+            ironrdp_server::ServerEvent::Clipboard(ClipboardMessage::SendInitiatePaste(
+                ClipboardFormatId(format_id),
+            ))
+        })
+        .await
+        {
+            warn!("ServerEvent sender not available for eager fetch");
+            pending_portal_requests
+                .write()
+                .await
+                .retain(|(s, _, _)| *s != EAGER_FETCH_SERIAL);
         }
     }
 
@@ -388,45 +370,37 @@ impl ClipboardOrchestrator {
                     cached_data.len()
                 );
 
-                let sender_opt = server_event_sender.read().await.clone();
-                if let Some(sender) = sender_opt {
+                let data_to_send = if format_id == 1 {
+                    // CF_TEXT: client wants ANSI text, cache is UTF-16LE
+                    let text = ironrdp_pdu::utils::from_utf16_bytes(cached_data);
+                    let trimmed = text.trim_end_matches('\0');
+                    let mut bytes = trimmed.as_bytes().to_vec();
+                    bytes.push(0); // CF_TEXT null terminator
+                    debug!(
+                        "Converted cooperation cache UTF-16LE ({} bytes) to CF_TEXT ({} bytes)",
+                        cached_data.len(),
+                        bytes.len()
+                    );
+                    bytes
+                } else {
+                    // CF_UNICODETEXT: cache is already UTF-16LE
+                    cached_data.clone()
+                };
+
+                if broadcast_server_event(server_event_sender, || {
                     use ironrdp_cliprdr::{backend::ClipboardMessage, pdu::FormatDataResponse};
                     use ironrdp_pdu::IntoOwned;
-
-                    let data_to_send = if format_id == 1 {
-                        // CF_TEXT: client wants ANSI text, cache is UTF-16LE
-                        let text = ironrdp_pdu::utils::from_utf16_bytes(cached_data);
-                        let trimmed = text.trim_end_matches('\0');
-                        let mut bytes = trimmed.as_bytes().to_vec();
-                        bytes.push(0); // CF_TEXT null terminator
-                        debug!(
-                            "Converted cooperation cache UTF-16LE ({} bytes) to CF_TEXT ({} bytes)",
-                            cached_data.len(),
-                            bytes.len()
-                        );
-                        bytes
-                    } else {
-                        // CF_UNICODETEXT: cache is already UTF-16LE
-                        cached_data.clone()
-                    };
-
-                    let response = FormatDataResponse::new_data(data_to_send.clone());
-                    let owned_response = response.into_owned();
-
-                    if sender
-                        .send(ironrdp_server::ServerEvent::Clipboard(
-                            ClipboardMessage::SendFormatData(owned_response),
-                        ))
-                        .is_ok()
-                    {
-                        info!(
-                            "Sent {} bytes from cooperation cache to RDP client",
-                            data_to_send.len()
-                        );
-                        return Ok(());
-                    }
-                } else {
-                    warn!("ServerEvent sender not available");
+                    ironrdp_server::ServerEvent::Clipboard(ClipboardMessage::SendFormatData(
+                        FormatDataResponse::new_data(data_to_send.clone()).into_owned(),
+                    ))
+                })
+                .await
+                {
+                    info!(
+                        "Sent {} bytes from cooperation cache to RDP client",
+                        data_to_send.len()
+                    );
+                    return Ok(());
                 }
             }
         }
@@ -619,29 +593,21 @@ impl ClipboardOrchestrator {
         let data_len = rdp_data.len();
         debug!("Converted to RDP format: {} bytes", data_len);
 
-        let sender_opt = server_event_sender.read().await.clone();
-        if let Some(sender) = sender_opt {
+        if !broadcast_server_event(server_event_sender, || {
             use ironrdp_cliprdr::{backend::ClipboardMessage, pdu::FormatDataResponse};
             use ironrdp_pdu::IntoOwned;
-
-            let response = FormatDataResponse::new_data(rdp_data);
-            let owned_response = response.into_owned();
-
-            match sender.send(ironrdp_server::ServerEvent::Clipboard(
-                ClipboardMessage::SendFormatData(owned_response),
-            )) {
-                Err(e) => {
-                    error!("Failed to send FormatDataResponse via ServerEvent: {:?}", e);
-                }
-                _ => {
-                    info!(
-                        "Sent {} bytes to RDP client for format {} (Linux → Windows)",
-                        data_len, format_id
-                    );
-                }
-            }
-        } else {
+            ironrdp_server::ServerEvent::Clipboard(ClipboardMessage::SendFormatData(
+                FormatDataResponse::new_data(rdp_data.clone()).into_owned(),
+            ))
+        })
+        .await
+        {
             warn!("ServerEvent sender not available - cannot send clipboard data to RDP");
+        } else {
+            info!(
+                "Sent {} bytes to RDP client for format {} (Linux → Windows)",
+                data_len, format_id
+            );
         }
 
         Ok(())
@@ -690,8 +656,8 @@ impl ClipboardOrchestrator {
             })
             .collect();
 
-        let sender = match server_event_sender.read().await.as_ref() {
-            Some(s) => s.clone(),
+        let sender = match first_live_sender(server_event_sender).await {
+            Some(s) => s,
             None => {
                 warn!("RemoteFileList: ServerEvent sender not available");
                 return Ok(());
@@ -852,29 +818,22 @@ impl ClipboardOrchestrator {
             }
         };
 
-        let sender_opt = server_event_sender.read().await.clone();
-        if let Some(sender) = sender_opt {
+        if broadcast_server_event(server_event_sender, || {
             use ironrdp_cliprdr::{backend::ClipboardMessage, pdu::FormatDataResponse};
             use ironrdp_pdu::IntoOwned;
-
-            let response = FormatDataResponse::new_data(descriptor_data);
-            let owned_response = response.into_owned();
-
-            match sender.send(ironrdp_server::ServerEvent::Clipboard(
-                ClipboardMessage::SendFormatData(owned_response),
-            )) {
-                Err(e) => {
-                    error!("Failed to send FileGroupDescriptorW response: {:?}", e);
-                }
-                _ => {
-                    debug!(" Sent FileGroupDescriptorW to Windows (Linux → Windows file transfer)");
-                }
-            }
+            ironrdp_server::ServerEvent::Clipboard(ClipboardMessage::SendFormatData(
+                FormatDataResponse::new_data(descriptor_data.clone()).into_owned(),
+            ))
+        })
+        .await
+        {
+            debug!(" Sent FileGroupDescriptorW to Windows (Linux → Windows file transfer)");
+        } else {
+            error!("Failed to send FileGroupDescriptorW response: no live server event channel");
         }
 
         Ok(())
     }
-
     /// Handle RDP data response (Windows → Linux paste completion)
     #[expect(
         clippy::too_many_arguments,
@@ -1082,8 +1041,8 @@ impl ClipboardOrchestrator {
                         })
                         .collect();
 
-                    let sender = match server_event_sender.read().await.as_ref() {
-                        Some(s) => s.clone(),
+                    let sender = match first_live_sender(server_event_sender).await {
+                        Some(s) => s,
                         None => {
                             error!("ServerEvent sender not available");
                             if let Some(ref provider) = provider_opt {

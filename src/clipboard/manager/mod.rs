@@ -67,7 +67,46 @@ pub(super) enum EagerFetchKind {
 type PendingEagerFetches = Arc<RwLock<std::collections::VecDeque<EagerFetchKind>>>;
 
 /// Server event sender for RDP clipboard messages
-type ServerEventSender = Arc<RwLock<Option<mpsc::UnboundedSender<ironrdp_server::ServerEvent>>>>;
+type ServerEventSender = Arc<RwLock<Vec<mpsc::UnboundedSender<ironrdp_server::ServerEvent>>>>;
+
+/// Broadcast a clipboard `ServerEvent` to every registered server event
+/// loop. `msg` builds one event per sender (`ServerEvent` is not `Clone`).
+/// Returns `true` if at least one accepted it.
+///
+/// The vsock/plain server pair registers TWO senders over one clipboard
+/// manager; with a single slot the second registration silently overwrote
+/// the first, and whichever server lost the slot never saw another
+/// clipboard request — its client pasted nothing while the other server's
+/// request went nowhere (the both-directions clipboard failure). Fan-out
+/// is safe: the server without a connected client simply drops the event
+/// in its own run loop. Closed senders are pruned on the way.
+async fn broadcast_server_event<F>(holder: &ServerEventSender, msg: F) -> bool
+where
+    F: Fn() -> ironrdp_server::ServerEvent,
+{
+    let mut senders = holder.write().await;
+    let mut any_ok = false;
+    senders.retain(|s| match s.send(msg()) {
+        Ok(()) => {
+            any_ok = true;
+            true
+        }
+        // Channel closed: its server event loop is gone — drop the sender.
+        Err(_) => false,
+    });
+    any_ok
+}
+
+/// First live per-server sender, for the file-transfer call sites that must
+/// hand one concrete channel to an API taking `&UnboundedSender`. Broadcast
+/// (`broadcast_server_event`) is preferred everywhere else; use this only
+/// when a single channel is required. Unlike the pre-fan-out single slot it
+/// can never return a channel that a later registration overwrote.
+async fn first_live_sender(
+    holder: &ServerEventSender,
+) -> Option<mpsc::UnboundedSender<ironrdp_server::ServerEvent>> {
+    holder.read().await.first().cloned()
+}
 
 /// Runtime configuration for the clipboard orchestrator
 ///
@@ -297,7 +336,7 @@ pub struct ClipboardOrchestrator {
 
     /// Server event sender for sending clipboard requests to IronRDP
     /// Set by LamcoCliprdrFactory after ServerEvent sender is available
-    server_event_sender: Arc<RwLock<Option<mpsc::UnboundedSender<ironrdp_server::ServerEvent>>>>,
+    server_event_sender: ServerEventSender,
 
     /// Clipboard provider (trait-abstracted backend).
     clipboard_provider: Arc<RwLock<Option<Arc<dyn crate::clipboard::provider::ClipboardProvider>>>>,
@@ -556,7 +595,7 @@ impl ClipboardOrchestrator {
             shutdown_tx: None,
             pending_portal_requests: Arc::new(RwLock::new(std::collections::VecDeque::new())),
             pending_eager_fetches: Arc::new(RwLock::new(std::collections::VecDeque::new())),
-            server_event_sender: Arc::new(RwLock::new(None)), // Set by WrdCliprdrFactory
+            server_event_sender: Arc::new(RwLock::new(Vec::new())), // Filled by LamcoCliprdrFactory
             clipboard_provider: Arc::new(RwLock::new(None)),
             current_rdp_formats: Arc::new(RwLock::new(Vec::new())),
             local_advertised_formats: Arc::new(RwLock::new(Vec::new())),
@@ -693,25 +732,24 @@ impl ClipboardOrchestrator {
                             continue;
                         }
 
-                        match *server_event_sender.read().await { Some(ref sender) => {
+                        {
                             use ironrdp_cliprdr::backend::ClipboardMessage;
 
                             let ironrdp_formats: Vec<ironrdp_cliprdr::pdu::ClipboardFormat> =
                                 formats
                                     .iter()
-                                    .map(|f| {
-                                        ironrdp_cliprdr::pdu::ClipboardFormat {
-                                            id: ironrdp_cliprdr::pdu::ClipboardFormatId(f.id),
-                                            name: None,
-                                        }
+                                    .map(|f| ironrdp_cliprdr::pdu::ClipboardFormat {
+                                        id: ironrdp_cliprdr::pdu::ClipboardFormatId(f.id),
+                                        name: None,
                                     })
                                     .collect();
 
-                            if sender
-                                .send(ironrdp_server::ServerEvent::Clipboard(
-                                    ClipboardMessage::SendInitiateCopy(ironrdp_formats),
-                                ))
-                                .is_ok()
+                            if broadcast_server_event(&server_event_sender, || {
+                                ironrdp_server::ServerEvent::Clipboard(
+                                    ClipboardMessage::SendInitiateCopy(ironrdp_formats.clone()),
+                                )
+                            })
+                            .await
                             {
                                 info!("✅ Cooperation: Sent FormatList to client (text from Klipper)");
 
@@ -731,11 +769,9 @@ impl ClipboardOrchestrator {
                                     bytes.len()
                                 );
                             } else {
-                                warn!("Cooperation: Failed to send FormatList (channel closed)");
+                                warn!("Cooperation: Failed to send FormatList (no live server event channel)");
                             }
-                        } _ => {
-                            debug!("Cooperation: No server event sender (not ready yet)");
-                        }}
+                        }
                     }
 
                     crate::clipboard::CooperationEvent::CooperationFailed { reason, retry } => {
@@ -763,13 +799,22 @@ impl ClipboardOrchestrator {
         self.task_handles.lock().await.push(handle);
     }
 
-    /// Set server event sender (called by LamcoCliprdrFactory after initialization)
+    /// Register a server event sender (called by each LamcoCliprdrFactory
+    /// after its server initializes). Multiple servers (the vsock plain +
+    /// primary TCP pair) each register one; see `broadcast_server_event`
+    /// for why they are ALL kept.
     pub async fn set_server_event_sender(
         &self,
         sender: mpsc::UnboundedSender<ironrdp_server::ServerEvent>,
     ) {
-        *self.server_event_sender.write().await = Some(sender);
-        debug!(" ServerEvent sender registered with clipboard manager");
+        let mut senders = self.server_event_sender.write().await;
+        if !senders.iter().any(|s| s.same_channel(&sender)) {
+            senders.push(sender);
+        }
+        debug!(
+            " ServerEvent sender registered with clipboard manager ({} active)",
+            senders.len()
+        );
     }
 
     /// Wire a health reporter so clipboard operations emit health events.
@@ -1021,54 +1066,52 @@ impl ClipboardOrchestrator {
                     let formats_to_send = advertised.clone();
                     drop(advertised);
 
-                    let sender_opt = server_event_sender.read().await.clone();
-                    if let Some(sender) = sender_opt {
-                        use ironrdp_cliprdr::backend::ClipboardMessage;
+                    use ironrdp_cliprdr::backend::ClipboardMessage;
 
-                        let rdp_formats: Vec<ironrdp_cliprdr::pdu::ClipboardFormat> =
-                            formats_to_send
-                                .iter()
-                                .map(|f| {
-                                    let name = f.name.as_ref().map(|n| {
-                                        ironrdp_cliprdr::pdu::ClipboardFormatName::new(n.clone())
-                                    });
-                                    ironrdp_cliprdr::pdu::ClipboardFormat {
-                                        id: ironrdp_cliprdr::pdu::ClipboardFormatId(f.id),
-                                        name,
-                                    }
-                                })
-                                .collect();
-
-                        // File-aware re-announce: if the cached offer includes a file
-                        // descriptor, re-register the files and send
-                        // SendInitiateFileCopy (now legal — channel is Ready) so a file
-                        // copy made before Ready still pastes as files instead of
-                        // degrading to a plain copy ("no file list available"). Else a
-                        // plain SendInitiateCopy.
-                        let has_files = rdp_formats.iter().any(|f| {
-                            f.name
+                    let rdp_formats: Vec<ironrdp_cliprdr::pdu::ClipboardFormat> = formats_to_send
+                        .iter()
+                        .map(|f| {
+                            let name = f
+                                .name
                                 .as_ref()
-                                .is_some_and(|n| n.value() == "FileGroupDescriptorW")
-                        });
-                        let message = if has_files {
-                            match Self::prepare_outgoing_file_copy(
-                                clipboard_provider,
-                                file_transfer_backend,
-                            )
-                            .await
-                            {
-                                Some(files) => ClipboardMessage::SendInitiateFileCopy(files),
-                                None => ClipboardMessage::SendInitiateCopy(rdp_formats),
+                                .map(|n| ironrdp_cliprdr::pdu::ClipboardFormatName::new(n.clone()));
+                            ironrdp_cliprdr::pdu::ClipboardFormat {
+                                id: ironrdp_cliprdr::pdu::ClipboardFormatId(f.id),
+                                name,
                             }
-                        } else {
-                            ClipboardMessage::SendInitiateCopy(rdp_formats)
-                        };
+                        })
+                        .collect();
 
-                        info!("Re-announcing cached Linux clipboard formats to RDP client");
-                        if let Err(e) = sender.send(ironrdp_server::ServerEvent::Clipboard(message))
-                        {
-                            error!("Failed to re-send FormatList: {:?}", e);
-                        }
+                    // File-aware re-announce: if the cached offer includes a file
+                    // descriptor, re-register the files and send
+                    // SendInitiateFileCopy (now legal — channel is Ready) so a file
+                    // copy made before Ready still pastes as files instead of
+                    // degrading to a plain copy ("no file list available"). Else a
+                    // plain SendInitiateCopy.
+                    let has_files = rdp_formats.iter().any(|f| {
+                        f.name
+                            .as_ref()
+                            .is_some_and(|n| n.value() == "FileGroupDescriptorW")
+                    });
+                    // Payload is built once; the closure re-wraps it per sender
+                    // (`ClipboardMessage` itself is not `Clone`, its contents are).
+                    let file_copy = if has_files {
+                        Self::prepare_outgoing_file_copy(clipboard_provider, file_transfer_backend)
+                            .await
+                    } else {
+                        None
+                    };
+
+                    info!("Re-announcing cached Linux clipboard formats to RDP client");
+                    if !broadcast_server_event(server_event_sender, || {
+                        ironrdp_server::ServerEvent::Clipboard(match file_copy.clone() {
+                            Some(files) => ClipboardMessage::SendInitiateFileCopy(files),
+                            None => ClipboardMessage::SendInitiateCopy(rdp_formats.clone()),
+                        })
+                    })
+                    .await
+                    {
+                        error!("Failed to re-send FormatList: no live server event channel");
                     }
                 } else {
                     debug!("No cached Linux clipboard formats to announce");
@@ -1180,11 +1223,8 @@ impl ClipboardOrchestrator {
                 is_size_request,
             } => {
                 // Route through file transfer backend
-                let sender = match server_event_sender.read().await.as_ref() {
-                    Some(s) => s.clone(),
-                    None => {
-                        return Err(ClipboardError::NotInitialized);
-                    }
+                let Some(sender) = first_live_sender(server_event_sender).await else {
+                    return Err(ClipboardError::NotInitialized);
                 };
                 let backend = file_transfer_backend.read().await;
                 backend
@@ -1242,6 +1282,7 @@ impl ClipboardOrchestrator {
                     file_transfer_backend,
                     rdp_ready,
                     remote_owns_selection,
+                    transfer_data_cache,
                 )
                 .await
             }
@@ -1313,24 +1354,19 @@ impl ClipboardOrchestrator {
 
     /// Send error response for FormatDataRequest
     async fn send_format_data_error(server_event_sender: &ServerEventSender) {
-        let sender_opt = server_event_sender.read().await.clone();
-        if let Some(sender) = sender_opt {
-            use ironrdp_cliprdr::{backend::ClipboardMessage, pdu::FormatDataResponse};
-            use ironrdp_pdu::IntoOwned;
+        use ironrdp_cliprdr::{backend::ClipboardMessage, pdu::FormatDataResponse};
+        use ironrdp_pdu::IntoOwned;
 
-            let response = FormatDataResponse::new_error();
-            let owned_response = response.into_owned();
-
-            match sender.send(ironrdp_server::ServerEvent::Clipboard(
-                ClipboardMessage::SendFormatData(owned_response),
-            )) {
-                Err(e) => {
-                    error!("Failed to send error FormatDataResponse: {:?}", e);
-                }
-                _ => {
-                    debug!("Sent error FormatDataResponse to RDP client");
-                }
-            }
+        if broadcast_server_event(server_event_sender, || {
+            ironrdp_server::ServerEvent::Clipboard(ClipboardMessage::SendFormatData(
+                FormatDataResponse::new_error().into_owned(),
+            ))
+        })
+        .await
+        {
+            debug!("Sent error FormatDataResponse to RDP client");
+        } else {
+            warn!("Failed to send error FormatDataResponse: no live server event channel");
         }
     }
 

@@ -1014,11 +1014,14 @@ impl LamcoRdpServer {
             // Clipboard for self-sufficient strategies:
             // - wlr-direct: wl-clipboard-rs (data-control protocol)
             // - portal-generic: embedded DataControl backend from session handle
+            // - kwin-virtual: wl-clipboard-rs via the strategy's libei handle
             type CliprdrFactory = Box<dyn ironrdp_server::CliprdrServerFactory>;
             let (wlr_clipboard_manager, wlr_clipboard_factory): (
                 Option<Arc<Mutex<ClipboardOrchestrator>>>,
                 Option<CliprdrFactory>,
-            ) = if (is_wlr_direct || is_portal_generic) && config.clipboard.enabled {
+            ) = if (is_wlr_direct || is_portal_generic || is_kwin_virtual)
+                && config.clipboard.enabled
+            {
                 let all_allowed = config.clipboard.allowed_types.is_empty();
                 let has_type = |patterns: &[&str]| {
                     all_allowed
@@ -1071,7 +1074,9 @@ impl LamcoRdpServer {
                 (None, None)
             };
 
-            if (is_wlr_direct || is_portal_generic) && wlr_clipboard_manager.is_none() {
+            if (is_wlr_direct || is_portal_generic || is_kwin_virtual)
+                && wlr_clipboard_manager.is_none()
+            {
                 health_reporter.report(crate::health::HealthEvent::SubsystemNotAvailable {
                     subsystem: "clipboard".into(),
                 });

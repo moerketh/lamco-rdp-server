@@ -313,12 +313,15 @@ libei = ["reis", "wl-clipboard"]
 portal-generic = ["xdg-desktop-portal-generic", "dep:evdev", "dep:wayland-client"]
 # KWin zkde-screencast virtual output: native per-connection virtual display at
 # the client's requested size. Needs wayland-client + plasma protocol bindings;
-# input reuses the libei machinery (EIS via Portal RemoteDesktop).
+# input reuses the libei machinery (EIS via Portal RemoteDesktop), clipboard
+# the libei wl-clipboard data-control provider (see build_clipboard). The
+# strategy composes the libei session handle unconditionally, so the feature
+# depends on libei (which itself pulls wl-clipboard).
 kwin-virtual = [
   "dep:wayland-client",
   "wayland-protocols-plasma",
   "wayland-protocols",
-  "reis",
+  "libei",
 ]
 
 # Standalone Wayland data-control clipboard (ext-data-control / wlr-data-control)
