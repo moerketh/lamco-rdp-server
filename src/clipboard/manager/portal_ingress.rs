@@ -11,7 +11,8 @@ use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
 use super::{
-    ClipboardOrchestrator, ServerEventSender, SharedClipboardProvider, lookup_format_id_for_mime,
+    ClipboardOrchestrator, ServerEventSender, SharedClipboardProvider, broadcast_server_event,
+    lookup_format_id_for_mime,
 };
 use crate::clipboard::{FormatConverterExt, error::Result, sync::SyncManager};
 
@@ -39,6 +40,7 @@ impl ClipboardOrchestrator {
         >,
         rdp_ready: &Arc<std::sync::atomic::AtomicBool>,
         remote_owns_selection: &Arc<std::sync::atomic::AtomicBool>,
+        transfer_data_cache: &Arc<RwLock<HashMap<String, Vec<u8>>>>,
     ) -> Result<()> {
         use std::time::{Duration, SystemTime};
 
@@ -69,6 +71,13 @@ impl ClipboardOrchestrator {
                         "Local application took clipboard ownership; compositor reads re-enabled"
                     );
                 }
+                // The local copy also invalidates anything cached from the
+                // PREVIOUS remote copy: rdp_ingress serves data requests from
+                // that cache before consulting the compositor (Mutter refuses
+                // read-back of a selection we own), so leaving it stale made
+                // the client paste the old remote content instead of the new
+                // local copy — guest→host sync silently served the wrong data.
+                transfer_data_cache.write().await.clear();
             }
 
             crate::clipboard::sync::PortalSyncDecision::Block => {
@@ -260,38 +269,40 @@ impl ClipboardOrchestrator {
             None
         };
 
-        let sender_opt = server_event_sender.read().await.clone();
-        if let Some(sender) = sender_opt {
-            use ironrdp_cliprdr::backend::ClipboardMessage;
-
-            let message = match file_descriptors {
-                Some(files) => {
-                    info!(
-                        "Sending ServerEvent::Clipboard(SendInitiateFileCopy) with {} file(s) to event loop",
-                        files.len()
-                    );
-                    ClipboardMessage::SendInitiateFileCopy(files)
-                }
-                None => {
-                    info!(
-                        "Sending ServerEvent::Clipboard(SendInitiateCopy) with {} formats to event loop",
-                        ironrdp_formats.len()
-                    );
-                    ClipboardMessage::SendInitiateCopy(ironrdp_formats)
-                }
-            };
-
-            match sender.send(ironrdp_server::ServerEvent::Clipboard(message)) {
-                Ok(()) => {
-                    debug!(" ServerEvent::Clipboard sent successfully to IronRDP event loop");
-                }
-                Err(e) => {
-                    error!("Failed to send ServerEvent::Clipboard: {:?}", e);
-                    error!("   This means the event loop channel is closed/dropped!");
+        // Payload built once; the closure re-wraps it per sender
+        // (`ClipboardMessage` is not `Clone`, its contents are).
+        use ironrdp_cliprdr::backend::ClipboardMessage;
+        match file_descriptors {
+            Some(files) => {
+                info!(
+                    "Sending ServerEvent::Clipboard(SendInitiateFileCopy) with {} file(s) to event loop",
+                    files.len()
+                );
+                if !broadcast_server_event(server_event_sender, || {
+                    ironrdp_server::ServerEvent::Clipboard(ClipboardMessage::SendInitiateFileCopy(
+                        files.clone(),
+                    ))
+                })
+                .await
+                {
+                    warn!("Failed to announce formats to RDP: no live server event channel");
                 }
             }
-        } else {
-            warn!("ServerEvent sender not available - cannot announce formats to RDP");
+            None => {
+                info!(
+                    "Sending ServerEvent::Clipboard(SendInitiateCopy) with {} formats to event loop",
+                    ironrdp_formats.len()
+                );
+                if !broadcast_server_event(server_event_sender, || {
+                    ironrdp_server::ServerEvent::Clipboard(ClipboardMessage::SendInitiateCopy(
+                        ironrdp_formats.clone(),
+                    ))
+                })
+                .await
+                {
+                    warn!("Failed to announce formats to RDP: no live server event channel");
+                }
+            }
         }
 
         Ok(())
@@ -414,19 +425,14 @@ impl ClipboardOrchestrator {
             format_id, mime_type
         );
 
-        let sender_opt = server_event_sender.read().await.clone();
-        if let Some(sender) = sender_opt {
+        if !broadcast_server_event(server_event_sender, || {
             use ironrdp_cliprdr::{backend::ClipboardMessage, pdu::ClipboardFormatId};
-
-            if let Err(e) = sender.send(ironrdp_server::ServerEvent::Clipboard(
-                ClipboardMessage::SendInitiatePaste(ClipboardFormatId(format_id)),
-            )) {
-                error!(
-                    "Failed to send SendInitiatePaste for format {}: {:?}",
-                    format_id, e
-                );
-            }
-        } else {
+            ironrdp_server::ServerEvent::Clipboard(ClipboardMessage::SendInitiatePaste(
+                ClipboardFormatId(format_id),
+            ))
+        })
+        .await
+        {
             warn!(
                 "ServerEvent sender not available — cannot request format {} from RDP client",
                 format_id
