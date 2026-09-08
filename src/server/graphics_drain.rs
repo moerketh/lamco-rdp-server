@@ -113,7 +113,9 @@ pub(super) fn start_graphics_drain_task(
             {
                 let sender = update_sender.lock().await;
                 match sender.try_send(update) {
-                    Ok(()) => {}
+                    Ok(()) => {
+                        stats.frames_sent += 1;
+                    }
                     Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                         warn!("DisplayUpdate channel closed — drain task exiting");
                         return;
@@ -134,18 +136,20 @@ pub(super) fn start_graphics_drain_task(
                 }
             }
 
-            stats.frames_sent += 1;
             if stats.frames_sent % 100 == 0 {
                 debug!(
-                    "📊 Graphics drain stats: received={}, coalesced={}, sent={}",
-                    stats.frames_received, stats.frames_coalesced, stats.frames_sent
+                    "📊 Graphics drain stats: received={}, coalesced={}, sent={}, dropped={}",
+                    stats.frames_received,
+                    stats.frames_coalesced,
+                    stats.frames_sent,
+                    stats.frames_dropped
                 );
             }
         }
 
         info!(
-            "📊 Graphics drain task final stats: received={}, coalesced={}, sent={}",
-            stats.frames_received, stats.frames_coalesced, stats.frames_sent
+            "📊 Graphics drain task final stats: received={}, coalesced={}, sent={}, dropped={}",
+            stats.frames_received, stats.frames_coalesced, stats.frames_sent, stats.frames_dropped
         );
     })
 }

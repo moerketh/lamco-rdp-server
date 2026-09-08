@@ -553,6 +553,21 @@ pub struct LamcoDisplayHandler {
         parking_lot::RwLock<Option<Arc<dyn crate::session::strategy::SessionHandle>>>,
 }
 
+/// Result of pushing one frame's bitmap updates onto the DisplayUpdate
+/// channel (see `push_bitmap_updates`).
+#[derive(Debug)]
+enum BitmapPushOutcome {
+    /// Every rect was accepted; the frame is fully on the channel.
+    AllSent,
+    /// The channel is closed — client gone, caller should stop the pipeline.
+    ChannelClosed,
+    /// The channel was full: `un_sent` carries the rejected rect plus every
+    /// never-attempted one after it, as damage regions for re-queue.
+    Dropped {
+        un_sent: Vec<crate::damage::DamageRegion>,
+    },
+}
+
 impl LamcoDisplayHandler {
     #[expect(
         clippy::too_many_arguments,
@@ -4333,57 +4348,94 @@ impl LamcoDisplayHandler {
                     // (cursor updates, reset_update_channel) and the sole
                     // PipeWire frame drain. Unlike the cursor paths these
                     // updates carry screen content, so a Full drop must not
-                    // lose pixels: re-queue the frame's damage regions into
-                    // the accumulator so the next encoded frame repaints
-                    // them (same contract as the EGFX send-failure paths
-                    // above). Closed means the client is gone — bail out of
-                    // the pipeline rather than convert further frames.
+                    // lose pixels: re-queue every un-sent rect — the one
+                    // that hit Full AND every later rect in this frame's
+                    // list that was never attempted — into the accumulator
+                    // so the next encoded frame repaints them (same contract
+                    // as the EGFX send-failure paths above). Closed means the
+                    // client is gone — bail out of the pipeline rather than
+                    // convert further frames.
+                    //
+                    // absorb() has REPLACE semantics and its contract expects
+                    // the incoming set to already contain the prior debt;
+                    // passing only the un-sent rects is safe here because
+                    // `accumulated_damage.clear()` above (the "this frame
+                    // will be encoded" step) guarantees the debt is empty at
+                    // this point. If that clear ever moves or becomes
+                    // conditional, this call would silently discard debt —
+                    // the ordering dependency is deliberate.
                     let sender = handler.update_sender.lock().await;
-                    let mut channel_closed = false;
-                    for iron_bitmap in iron_updates {
-                        // Capture the rect before the bitmap moves into the
-                        // update, so a Full drop re-queues exactly the lost
-                        // region (accumulated_damage is the pipeline's
-                        // repaint-debt mechanism; see its declaration above).
-                        let dropped_rect = crate::damage::DamageRegion::new(
-                            u32::from(iron_bitmap.x),
-                            u32::from(iron_bitmap.y),
-                            u32::from(iron_bitmap.width.get()),
-                            u32::from(iron_bitmap.height.get()),
-                        );
-                        let update = DisplayUpdate::Bitmap(iron_bitmap);
-
-                        match sender.try_send(update) {
-                            Ok(()) => {}
-                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                                channel_closed = true;
-                                break;
-                            }
-                            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                                frames_dropped += 1;
-                                accumulated_damage.absorb(vec![dropped_rect]);
-                                static BITMAP_DROP_LOG: std::sync::atomic::AtomicU64 =
-                                    std::sync::atomic::AtomicU64::new(0);
-                                let n = BITMAP_DROP_LOG
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                if n.is_multiple_of(60) {
-                                    warn!(
-                                        "DisplayUpdate channel full — dropping frame and re-queueing damage \
-                                         ({} drops so far; client not draining?)",
-                                        n
-                                    );
-                                }
-                                break;
+                    match Self::push_bitmap_updates(&sender, iron_updates) {
+                        BitmapPushOutcome::AllSent => {}
+                        BitmapPushOutcome::ChannelClosed => {
+                            warn!("DisplayUpdate channel closed — client gone, stopping pipeline");
+                            return;
+                        }
+                        BitmapPushOutcome::Dropped { un_sent } => {
+                            frames_dropped += 1;
+                            accumulated_damage.absorb(un_sent);
+                            static BITMAP_DROP_LOG: std::sync::atomic::AtomicU64 =
+                                std::sync::atomic::AtomicU64::new(0);
+                            let n =
+                                BITMAP_DROP_LOG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if n.is_multiple_of(60) {
+                                warn!(
+                                    "DisplayUpdate channel full — dropping frame and re-queueing damage \
+                                     ({} drops so far; client not draining?)",
+                                    n
+                                );
                             }
                         }
-                    }
-                    if channel_closed {
-                        warn!("DisplayUpdate channel closed — client gone, stopping pipeline");
-                        return;
                     }
                 }
             }
         });
+    }
+
+    /// Push a frame's bitmap updates into the DisplayUpdate channel without
+    /// ever awaiting while holding the sender. Returns every rect that did
+    /// NOT make it onto the channel (the Full one and all never-attempted
+    /// ones after it), as `DamageRegion`s for the caller to re-queue.
+    fn push_bitmap_updates(
+        sender: &mpsc::Sender<DisplayUpdate>,
+        iron_updates: Vec<IronBitmapUpdate>,
+    ) -> BitmapPushOutcome {
+        fn rect_of(b: &IronBitmapUpdate) -> crate::damage::DamageRegion {
+            crate::damage::DamageRegion::new(
+                u32::from(b.x),
+                u32::from(b.y),
+                u32::from(b.width.get()),
+                u32::from(b.height.get()),
+            )
+        }
+
+        let mut iter = iron_updates.into_iter();
+        loop {
+            let iron_bitmap = match iter.next() {
+                Some(b) => b,
+                None => return BitmapPushOutcome::AllSent,
+            };
+            // Capture the rect before the bitmap moves into the update, so a
+            // rejection can still re-queue it.
+            let rect = rect_of(&iron_bitmap);
+            let update = DisplayUpdate::Bitmap(iron_bitmap);
+            match sender.try_send(update) {
+                Ok(()) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    return BitmapPushOutcome::ChannelClosed;
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    // The rejected rect plus every remaining rect in the
+                    // list never reached the client — collect them ALL as
+                    // debt, or the never-attempted ones would stay stale on
+                    // the client until the next periodic IDR.
+                    let mut un_sent = Vec::with_capacity(1 + iter.len());
+                    un_sent.push(rect);
+                    un_sent.extend(iter.by_ref().map(|rest| rect_of(&rest)));
+                    return BitmapPushOutcome::Dropped { un_sent };
+                }
+            }
+        }
     }
 
     /// Convert video frame to RDP bitmap
@@ -5536,5 +5588,71 @@ mod tests {
             new_sender.try_send(DisplayUpdate::HidePointer).is_ok(),
             "fresh channel must accept sends"
         );
+    }
+
+    fn test_iron_bitmap(x: u16, y: u16, w: u16, h: u16) -> IronBitmapUpdate {
+        use bytes::Bytes;
+        IronBitmapUpdate {
+            x,
+            y,
+            width: std::num::NonZeroU16::new(w).expect("width nonzero"),
+            height: std::num::NonZeroU16::new(h).expect("height nonzero"),
+            format: IronPixelFormat::BgrX32,
+            data: Bytes::from(vec![0u8; (w as usize) * (h as usize) * 4]),
+            stride: std::num::NonZeroUsize::new(w as usize * 4).expect("stride nonzero"),
+        }
+    }
+
+    /// A frame with several bitmap rects against a channel with room for only
+    /// the first must leave ALL un-sent rects — the Full one AND every
+    /// never-attempted one after it — in the returned debt. The original
+    /// inline loop absorbed only the failing rect and broke, silently losing
+    /// the rest until the next periodic IDR.
+    #[tokio::test]
+    async fn test_bitmap_push_requeues_all_unsent_rects() {
+        // Channel with room for exactly one update.
+        let (tx, mut rx) = mpsc::channel(1);
+
+        let frame = vec![
+            test_iron_bitmap(0, 0, 16, 16),
+            test_iron_bitmap(16, 0, 16, 16),
+            test_iron_bitmap(32, 0, 16, 16),
+            test_iron_bitmap(48, 0, 16, 16),
+        ];
+
+        let outcome = LamcoDisplayHandler::push_bitmap_updates(&tx, frame);
+
+        // The first rect made it onto the channel.
+        assert!(matches!(rx.try_recv(), Ok(_)), "first rect must be sent");
+
+        match outcome {
+            BitmapPushOutcome::Dropped { un_sent } => {
+                // The Full rect PLUS all three never-attempted ones.
+                assert_eq!(
+                    un_sent.len(),
+                    3,
+                    "must re-queue the rejected rect and every never-attempted one"
+                );
+                // And they must be the RIGHT rects: x=16/32/48, in order.
+                let xs: Vec<u32> = un_sent.iter().map(|r| r.x).collect();
+                assert_eq!(
+                    xs,
+                    vec![16, 32, 48],
+                    "un-sent rects must be the remaining ones in order"
+                );
+            }
+            other => panic!("expected Dropped, got {other:?}"),
+        }
+    }
+
+    /// A closed channel must report ChannelClosed, not spin or lose data.
+    #[tokio::test]
+    async fn test_bitmap_push_bails_on_closed_channel() {
+        let (tx, rx) = mpsc::channel::<DisplayUpdate>(64);
+        drop(rx); // close
+
+        let outcome =
+            LamcoDisplayHandler::push_bitmap_updates(&tx, vec![test_iron_bitmap(0, 0, 16, 16)]);
+        assert!(matches!(outcome, BitmapPushOutcome::ChannelClosed));
     }
 }
