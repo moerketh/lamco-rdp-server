@@ -46,6 +46,9 @@ pub(super) struct GraphicsDrainStats {
     pub frames_coalesced: u64,
     /// Frames sent to IronRDP
     pub frames_sent: u64,
+    /// Frames dropped because the DisplayUpdate channel was full
+    /// (dead peer not draining)
+    pub frames_dropped: u64,
 }
 
 /// Start the graphics drain task
@@ -101,9 +104,34 @@ pub(super) fn start_graphics_drain_task(
             // Send already-converted IronBitmapUpdate directly (no double conversion!)
             let update = DisplayUpdate::Bitmap(latest_frame.iron_bitmap);
 
-            if let Err(e) = update_sender.lock().await.send(update).await {
-                warn!("Failed to send display update: {}", e);
-                return;
+            // try_send, never .await: the MutexGuard is held across this
+            // statement, and an awaited send on a full channel (dead peer
+            // stops draining it) would park this task holding the lock and
+            // wedge every other display path. Drop on Full (the coalescing
+            // policy already favors the latest frame; a dropped frame is
+            // repainted by the next one's damage regions), bail on Closed.
+            {
+                let sender = update_sender.lock().await;
+                match sender.try_send(update) {
+                    Ok(()) => {}
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                        warn!("DisplayUpdate channel closed — drain task exiting");
+                        return;
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        stats.frames_dropped += 1;
+                        static DRAIN_DROP_LOG: std::sync::atomic::AtomicU64 =
+                            std::sync::atomic::AtomicU64::new(0);
+                        let n = DRAIN_DROP_LOG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if n.is_multiple_of(60) {
+                            warn!(
+                                "DisplayUpdate channel full — dropping coalesced frame \
+                                 ({} drops so far; client not draining?)",
+                                n
+                            );
+                        }
+                    }
+                }
             }
 
             stats.frames_sent += 1;

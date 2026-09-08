@@ -1495,10 +1495,20 @@ impl LamcoDisplayHandler {
                     x: x as u16,
                     y: y as u16,
                 };
+                // try_send, never .await: this loop ticks at cursor_update_fps
+                // (default 60) whenever the client is active, so an awaited
+                // send on a full channel (dead peer) would park this task
+                // holding the update_sender mutex and wedge every other
+                // display path. Positions are idempotent state — the next
+                // tick re-sends a fresh one; drop on Full, bail on Closed.
                 let sender = self.get_update_sender();
                 let sender = sender.lock().await;
-                if let Err(e) = sender.send(DisplayUpdate::PointerPosition(position)).await {
-                    debug!("Failed to send predicted cursor position update: {e}");
+                match sender.try_send(DisplayUpdate::PointerPosition(position)) {
+                    Ok(()) => {}
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        debug!("DisplayUpdate channel full — dropped predicted cursor position");
+                    }
                 }
             }
         });
@@ -3950,7 +3960,7 @@ impl LamcoDisplayHandler {
                         let encode_start = std::time::Instant::now();
                         let encode_result = tokio::task::block_in_place(|| {
                             encoder.encode_bgra(
-                                &frame_data,
+                                frame_data,
                                 aligned_width,
                                 aligned_height,
                                 timestamp_ms,
@@ -4316,14 +4326,60 @@ impl LamcoDisplayHandler {
                         }
                     }
                 } else {
+                    // Non-multiplexer bitmap path. try_send, never .await: a
+                    // dead peer stops draining this bounded channel and an
+                    // awaited send here parks the pipeline task holding the
+                    // update_sender mutex, freezing every other display path
+                    // (cursor updates, reset_update_channel) and the sole
+                    // PipeWire frame drain. Unlike the cursor paths these
+                    // updates carry screen content, so a Full drop must not
+                    // lose pixels: re-queue the frame's damage regions into
+                    // the accumulator so the next encoded frame repaints
+                    // them (same contract as the EGFX send-failure paths
+                    // above). Closed means the client is gone — bail out of
+                    // the pipeline rather than convert further frames.
                     let sender = handler.update_sender.lock().await;
+                    let mut channel_closed = false;
                     for iron_bitmap in iron_updates {
+                        // Capture the rect before the bitmap moves into the
+                        // update, so a Full drop re-queues exactly the lost
+                        // region (accumulated_damage is the pipeline's
+                        // repaint-debt mechanism; see its declaration above).
+                        let dropped_rect = crate::damage::DamageRegion::new(
+                            u32::from(iron_bitmap.x),
+                            u32::from(iron_bitmap.y),
+                            u32::from(iron_bitmap.width.get()),
+                            u32::from(iron_bitmap.height.get()),
+                        );
                         let update = DisplayUpdate::Bitmap(iron_bitmap);
 
-                        if let Err(e) = sender.send(update).await {
-                            error!("Failed to send display update: {}", e);
-                            return;
+                        match sender.try_send(update) {
+                            Ok(()) => {}
+                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                channel_closed = true;
+                                break;
+                            }
+                            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                frames_dropped += 1;
+                                accumulated_damage.absorb(vec![dropped_rect]);
+                                static BITMAP_DROP_LOG: std::sync::atomic::AtomicU64 =
+                                    std::sync::atomic::AtomicU64::new(0);
+                                let n = BITMAP_DROP_LOG
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                if n.is_multiple_of(60) {
+                                    warn!(
+                                        "DisplayUpdate channel full — dropping frame and re-queueing damage \
+                                         ({} drops so far; client not draining?)",
+                                        n
+                                    );
+                                }
+                                break;
+                            }
                         }
+                    }
+                    if channel_closed {
+                        warn!("DisplayUpdate channel closed — client gone, stopping pipeline");
+                        return;
                     }
                 }
             }
@@ -4494,9 +4550,21 @@ impl LamcoDisplayHandler {
                     // which is capability-gated.
                     xor_mask: vec![0x00; 32 * 32 * 3],
                 };
+                // try_send, never .await: a dead peer stops draining this
+                // bounded channel, and an awaited send while holding the
+                // update_sender mutex would wedge every other display path
+                // (including reset_update_channel). These updates are
+                // idempotent state re-asserted by later frames, so dropping
+                // on Full is safe; Closed means the client is gone.
                 let sender = sender.lock().await;
-                if let Err(e) = sender.send(DisplayUpdate::ColorPointer(transparent)).await {
-                    debug!("Failed to send painted-mode transparent cursor: {e}");
+                match sender.try_send(DisplayUpdate::ColorPointer(transparent)) {
+                    Ok(()) => {}
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return,
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        debug!(
+                            "DisplayUpdate channel full — dropped painted-mode transparent cursor"
+                        );
+                    }
                 }
             }
             return;
@@ -4511,9 +4579,14 @@ impl LamcoDisplayHandler {
         let mode_hidden = strategy.mode() == crate::cursor::CursorMode::Hidden;
         if cursor.id == 0 || mode_hidden {
             if strategy.needs_hide_update() {
+                // See the Painted branch above for why try_send, not send().await.
                 let sender = sender.lock().await;
-                if let Err(e) = sender.send(DisplayUpdate::HidePointer).await {
-                    debug!("Failed to send cursor hide update: {e}");
+                match sender.try_send(DisplayUpdate::HidePointer) {
+                    Ok(()) => {}
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return,
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        debug!("DisplayUpdate channel full — dropped cursor hide update");
+                    }
                 }
             }
             return;
@@ -4552,9 +4625,14 @@ impl LamcoDisplayHandler {
         // once a shape has actually been encoded and is about to be sent —
         // see CursorShapeCache::insert's doc for why that ordering matters.
         if let Some(cache_index) = strategy.lookup_shape_cache(cursor.id) {
+            // See the Painted branch above for why try_send, not send().await.
             let sender = sender.lock().await;
-            if let Err(e) = sender.send(DisplayUpdate::CachedPointer(cache_index)).await {
-                debug!("Failed to send cached cursor pointer update: {e}");
+            match sender.try_send(DisplayUpdate::CachedPointer(cache_index)) {
+                Ok(()) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return,
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    debug!("DisplayUpdate channel full — dropped cached cursor update");
+                }
             }
         } else if let Some(ref bitmap) = cursor.bitmap {
             match crate::cursor::convert_cursor_bitmap(bitmap, cursor.hotspot) {
@@ -4579,9 +4657,14 @@ impl LamcoDisplayHandler {
                             DisplayUpdate::LargePointer(p)
                         }
                     };
+                    // See the Painted branch above for why try_send, not send().await.
                     let sender = sender.lock().await;
-                    if let Err(e) = sender.send(update).await {
-                        debug!("Failed to send cursor shape update: {e}");
+                    match sender.try_send(update) {
+                        Ok(()) => {}
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return,
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                            debug!("DisplayUpdate channel full — dropped cursor shape update");
+                        }
                     }
                 }
                 Err(e) => {
@@ -4605,9 +4688,14 @@ impl LamcoDisplayHandler {
                 x: render_x as u16,
                 y: render_y as u16,
             };
+            // See the Painted branch above for why try_send, not send().await.
             let sender = sender.lock().await;
-            if let Err(e) = sender.send(DisplayUpdate::PointerPosition(position)).await {
-                debug!("Failed to send cursor position update: {e}");
+            match sender.try_send(DisplayUpdate::PointerPosition(position)) {
+                Ok(()) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return,
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    debug!("DisplayUpdate channel full — dropped cursor position update");
+                }
             }
         }
     }
@@ -5288,5 +5376,165 @@ mod tests {
         assert_eq!(data.rectangle.right, 100);
         assert_eq!(data.rectangle.bottom, 100);
         assert_eq!(data.data.len(), 100 * 100 * 4);
+    }
+
+    // === Dead-peer wedge regression tests ===
+    //
+    // A vmconnect client over AF_VSOCK can die (host sleep) with no FIN or
+    // RST. The IronRDP writer then stops draining the bounded DisplayUpdate
+    // channel, and the pre-fix code PARKED on `sender.send(...).await` while
+    // holding the update_sender mutex — wedging every other display path
+    // (cursor updates, reset_update_channel) and the sole PipeWire frame
+    // drain until service restart. These tests pin the containment
+    // invariants: sends on a full channel must return promptly, the mutex
+    // must be acquirable immediately afterwards, and a closed channel must
+    // make the paths bail instead of spin.
+
+    /// Build a display handler whose update channel is the real one
+    /// (capacity 64) with the receiver intentionally never drained, plus a
+    /// filler that saturates it — the on-disk reproduction of a dead peer.
+    async fn wedged_handler() -> (LamcoDisplayHandler, mpsc::Receiver<DisplayUpdate>) {
+        let (_raw_tx, raw_rx) = std::sync::mpsc::channel();
+        let config = Arc::new(crate::config::Config::default());
+        let registry = Arc::new(crate::services::ServiceRegistry::from_compositor(
+            crate::compositor::CompositorCapabilities::new(
+                crate::compositor::CompositorType::Kde { version: None },
+                crate::compositor::PortalCapabilities::default(),
+                Vec::new(),
+            ),
+        ));
+        let handler = LamcoDisplayHandler::new_direct(
+            64,
+            64,
+            raw_rx,
+            Vec::new(),
+            None,
+            None,
+            None,
+            config,
+            registry,
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        )
+        .await
+        .expect("handler construction");
+
+        // Separate saturated channel standing in for the real one: fill a
+        // fresh channel to capacity so try_send hits Full deterministically.
+        let (full_tx, full_rx) = mpsc::channel(1);
+        assert!(
+            full_tx.try_send(DisplayUpdate::HidePointer).is_ok(),
+            "filler send must succeed"
+        );
+
+        // Replace the handler's channel with the saturated one so the code
+        // under test observes a dead-peer-full channel. `reset_update_channel`
+        // creates the same (tx, rx) shape; here we hand it a pre-filled pair.
+        {
+            let sender_guard = handler.update_sender.lock().await;
+            // Cannot mutate through the guard's Sender; instead verify the
+            // real channel saturates the same way by filling it directly.
+            for i in 0..64 {
+                assert!(
+                    sender_guard.try_send(DisplayUpdate::HidePointer).is_ok(),
+                    "filling real channel: send {i} must fit (capacity 64)"
+                );
+            }
+        }
+        let receiver = handler
+            .update_receiver
+            .lock()
+            .await
+            .take()
+            .expect("receiver present");
+        let _ = full_rx; // keep the filler channel alive
+        (handler, receiver)
+    }
+
+    fn test_cursor() -> lamco_pipewire::meta::CursorMeta {
+        lamco_pipewire::meta::CursorMeta {
+            id: 1,
+            position: (10, 10),
+            hotspot: (0, 0),
+            bitmap_offset: 0,
+            bitmap: None,
+        }
+    }
+
+    /// process_cursor_update must return promptly on a FULL channel and must
+    /// not hold the update_sender mutex afterwards.
+    #[tokio::test]
+    async fn test_cursor_update_returns_promptly_on_full_channel() {
+        let (handler, _receiver) = wedged_handler().await;
+
+        let cursor = test_cursor();
+
+        // The call itself: with the channel full this used to park forever
+        // holding the mutex. Wrap in a timeout so a regression fails the
+        // test instead of hanging the suite.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            handler.process_cursor_update(Some(cursor), 0),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "process_cursor_update must not park on a full channel"
+        );
+
+        // The deadlock regression: the mutex must be acquirable immediately.
+        // (reset_update_channel and every other display path need it.)
+        let lock = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            handler.update_sender.lock(),
+        )
+        .await;
+        assert!(
+            lock.is_ok(),
+            "update_sender mutex must be free after a full-channel drop"
+        );
+    }
+
+    /// A closed update channel must make the cursor path return rather than
+    /// spin or park.
+    #[tokio::test]
+    async fn test_cursor_update_bails_on_closed_channel() {
+        let (handler, receiver) = wedged_handler().await;
+        drop(receiver); // close the channel
+
+        let cursor = test_cursor();
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            handler.process_cursor_update(Some(cursor), 0),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "process_cursor_update must return on a closed channel"
+        );
+    }
+
+    /// reset_update_channel must be able to run while the (dead-peer-full)
+    /// old channel still exists — the recovery path the wedge used to block.
+    #[tokio::test]
+    async fn test_reset_update_channel_works_under_full_channel() {
+        let (mut handler, _receiver) = wedged_handler().await;
+
+        let reset = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            handler.reset_update_channel(),
+        )
+        .await;
+        assert!(
+            reset.is_ok(),
+            "reset_update_channel must not deadlock on the wedge"
+        );
+
+        // The new channel must be usable.
+        let new_sender = handler.update_sender.lock().await;
+        assert!(
+            new_sender.try_send(DisplayUpdate::HidePointer).is_ok(),
+            "fresh channel must accept sends"
+        );
     }
 }
