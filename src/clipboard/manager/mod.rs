@@ -222,6 +222,27 @@ pub enum ClipboardEvent {
         clip_data_id: Option<u32>,
     },
 
+    /// Staging file-transfer backend finished materializing all files from a
+    /// Windows copy. The paths are real local files (~/Downloads); the
+    /// orchestrator must answer the pending eager-fetch serial and materialize
+    /// the wl-clipboard selection with their URIs, or local apps paste nothing
+    /// (or stale text) — the pre-wiring gap that made host→guest file paste a
+    /// no-op while staging silently succeeded.
+    FileTransferReady {
+        /// Materialized file paths to announce via text/uri-list
+        paths: Vec<std::path::PathBuf>,
+        /// Portal serial of the pending eager-fetch request to answer
+        portal_serial: u32,
+    },
+
+    /// Staging file-transfer backend failed to materialize files.
+    FileTransferFailed {
+        /// Failure reason
+        reason: String,
+        /// Portal serial of the pending request to answer with an error
+        portal_serial: u32,
+    },
+
     /// Portal announced available MIME types
     /// The bool indicates if this is from D-Bus extension (true = authoritative, force sync)
     /// vs Portal echo (false = may be blocked if RDP owns clipboard)
@@ -271,6 +292,22 @@ impl std::fmt::Debug for ClipboardEvent {
             Self::RdpRemoteFileList { files, .. } => {
                 write!(f, "RdpRemoteFileList({} files)", files.len())
             }
+            Self::FileTransferReady {
+                paths,
+                portal_serial,
+            } => write!(
+                f,
+                "FileTransferReady({} paths, serial={})",
+                paths.len(),
+                portal_serial
+            ),
+            Self::FileTransferFailed {
+                reason,
+                portal_serial,
+            } => write!(
+                f,
+                "FileTransferFailed(\"{reason}\", serial={portal_serial})"
+            ),
             Self::PortalFormatsAvailable(mimes, force) => {
                 write!(f, "PortalFormatsAvailable({mimes:?}, force={force})")
             }
@@ -571,6 +608,10 @@ impl ClipboardOrchestrator {
             Arc::new(tokio::sync::RwLock::new(backend))
         };
 
+        // Clone for the struct field; the original stays borrowable below for
+        // the event-channel subscription.
+        let file_transfer_backend_for_struct = Arc::clone(&file_transfer_backend);
+
         let klipper_info = crate::clipboard::klipper::KlipperMonitor::detect().await;
         // Klipper's clear-after-takeover behavior is KDE-only; tell the sync state
         // machine whether Klipper actually runs so it doesn't treat a normal empty
@@ -609,12 +650,47 @@ impl ClipboardOrchestrator {
             cooperation_content_cache: Arc::new(RwLock::new(None)),
             shutdown_broadcast: Arc::clone(&shutdown_broadcast),
             task_handles: Arc::clone(&task_handles),
-            file_transfer_backend,
+            file_transfer_backend: file_transfer_backend_for_struct,
             rdp_ready: Arc::new(AtomicBool::new(false)),
             remote_owns_selection: Arc::new(AtomicBool::new(false)),
         };
 
         manager.start_event_processor(event_rx);
+
+        // Wire the file-transfer backend's event channel into the orchestrator
+        // loop. Staging emits FileTransferEvent::FilesReady when a Windows→Linux
+        // copy finishes downloading — nothing consumed it before, so the staged
+        // files landed in ~/Downloads and the clipboard never learned: local
+        // pastes saw no uri-list (Dolphin fell back to text). Forward both it
+        // and TransferFailed as ClipboardEvents.
+        {
+            use crate::clipboard::file_transfer::FileTransferEvent;
+
+            let mut transfer_rx = file_transfer_backend.read().await.subscribe();
+            let event_tx = manager.event_tx.clone();
+            let mut shutdown_rx = shutdown_broadcast.subscribe();
+            let handle = tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        evt = transfer_rx.recv() => match evt {
+                            Some(FileTransferEvent::FilesReady { paths, portal_serial }) => {
+                                let _ = event_tx
+                                    .send(ClipboardEvent::FileTransferReady { paths, portal_serial })
+                                    .await;
+                            }
+                            Some(FileTransferEvent::TransferFailed { reason, portal_serial }) => {
+                                let _ = event_tx
+                                    .send(ClipboardEvent::FileTransferFailed { reason, portal_serial })
+                                    .await;
+                            }
+                            None => break,
+                        },
+                        _ = shutdown_rx.recv() => break,
+                    }
+                }
+            });
+            task_handles.lock().await.push(handle);
+        }
 
         debug!("Clipboard manager initialized");
 
@@ -1347,6 +1423,87 @@ impl ClipboardOrchestrator {
             ClipboardEvent::PortalDataResponse(_) => {
                 // PortalDataResponse is unused — data flows through
                 // handle_rdp_data_request → Portal read_data → SendFormatData
+                Ok(())
+            }
+
+            ClipboardEvent::FileTransferReady {
+                paths,
+                portal_serial,
+            } => {
+                // Staging finished downloading the Windows copy. Two things
+                // must happen for a local paste to work:
+                // 1. Answer the pending eager-fetch serial whose FGD response
+                //    started the download — wl-clipboard materializes its
+                //    selection in complete_transfer, and until it runs the
+                //    selection is an unfulfilled announce.
+                // 2. Cache both file MIME variants so an RDP-side re-request
+                //    (or a second local paste) serves consistent URIs.
+                use crate::clipboard::file_transfer::{
+                    generate_gnome_copied_files_content, generate_uri_list_content,
+                };
+
+                info!(
+                    "File transfer ready: {} file(s) staged; materializing clipboard URIs",
+                    paths.len()
+                );
+                for p in &paths {
+                    info!("  staged: {}", p.display());
+                }
+
+                let urilist_bytes = generate_uri_list_content(&paths).into_bytes();
+                let gnome_bytes = generate_gnome_copied_files_content(&paths).into_bytes();
+
+                // Drop the now-answered serial from the pending queue (it was
+                // matched FIFO by handle_rdp_data_response before staging began).
+                pending_portal_requests
+                    .write()
+                    .await
+                    .retain(|(s, _, _)| *s != portal_serial);
+
+                if let Some(provider) = clipboard_provider.read().await.as_ref() {
+                    let _ = provider
+                        .complete_transfer(
+                            portal_serial,
+                            "text/uri-list",
+                            urilist_bytes.clone(),
+                            true,
+                        )
+                        .await;
+                    // complete_transfer re-copies every accumulated format, so a
+                    // second call with the gnome variant would also carry the
+                    // urilist again — harmless (same selection, both formats).
+                    let _ = provider
+                        .complete_transfer(
+                            portal_serial,
+                            "x-special/gnome-copied-files",
+                            gnome_bytes.clone(),
+                            true,
+                        )
+                        .await;
+                } else {
+                    warn!("FileTransferReady: no clipboard provider — URIs not materialized");
+                }
+
+                let mut cache = transfer_data_cache.write().await;
+                cache.insert("text/uri-list".to_string(), urilist_bytes);
+                cache.insert("x-special/gnome-copied-files".to_string(), gnome_bytes);
+                Ok(())
+            }
+
+            ClipboardEvent::FileTransferFailed {
+                reason,
+                portal_serial,
+            } => {
+                warn!("File transfer failed: {reason}");
+                pending_portal_requests
+                    .write()
+                    .await
+                    .retain(|(s, _, _)| *s != portal_serial);
+                if let Some(provider) = clipboard_provider.read().await.as_ref() {
+                    let _ = provider
+                        .complete_transfer(portal_serial, "text/uri-list", vec![], false)
+                        .await;
+                }
                 Ok(())
             }
         }
