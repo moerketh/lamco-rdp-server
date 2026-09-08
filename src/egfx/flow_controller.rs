@@ -58,7 +58,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Default activation threshold — at minimum require 2 unacked frames before
 /// considering throttling. Matches GNOME RD `ACTIVATE_THROTTLING_TH_DEFAULT`.
@@ -83,6 +83,15 @@ const RTT_AVG_WINDOW: Duration = Duration::from_millis(500);
               this in ms preserves a single mental model for flow-control timing."
 )]
 const RATE_WINDOW: Duration = Duration::from_millis(1000);
+
+/// Consecutive `check_ack_timeout` firings before the encoder is latched
+/// HALTED (see `FlowController::consecutive_ack_stalls`). With the default
+/// `frame_ack_timeout = 5000ms`, 12 stalls ≈ 60s of a client acking
+/// nothing — far beyond any legitimate decoder hiccup, well within the
+/// memory-growth window of a dead peer filling the unbounded ServerEvent
+/// channel. Tunable constant, not config: the semantic is "peer is gone",
+/// not a latency preference.
+const MAX_CONSECUTIVE_ACK_STALLS: u32 = 12;
 
 /// Bound the frame history. At 60fps with 1s RTT we'd track ~60 frames; double
 /// it for safety. Old entries get garbage-collected on each unack/ack call.
@@ -173,6 +182,21 @@ pub struct FlowController {
     stats_throttle_entries: u64,
     stats_throttle_exits: u64,
 
+    /// Consecutive `check_ack_timeout` firings without any ack in between.
+    /// Each firing means the client has ignored every outstanding frame for
+    /// a full `frame_ack_timeout` window. A live client decodes and acks;
+    /// a few consecutive stalls are a decoder hiccup (the pre-existing
+    /// recovery path handles those), but many in a row mean the peer is
+    /// gone. Once `MAX_CONSECUTIVE_ACK_STALLS` is reached the controller
+    /// latches HALTED: `should_throttle()` stays true, the encoder stops
+    /// producing frames, and the unbounded ServerEvent channel stops
+    /// filling. Any real ack clears the latch — if the peer was merely
+    /// slow, it resumes seamlessly.
+    consecutive_ack_stalls: u32,
+
+    /// Latched by sustained ack stalls; cleared by `ack_frame`.
+    stall_halted: bool,
+
     /// Optional NetworkAutoDetect RTT handle (milliseconds, `u32::MAX` until
     /// measured), shared with the RDP server that writes the latest probe RTT.
     /// Freshness floor: when no FrameAck-derived sample is recent, the threshold
@@ -195,6 +219,8 @@ impl FlowController {
             total_frame_slots: UNLIMITED_FRAME_SLOTS,
             stats_throttle_entries: 0,
             stats_throttle_exits: 0,
+            consecutive_ack_stalls: 0,
+            stall_halted: false,
             autodetect_rtt: None,
         }
     }
@@ -269,6 +295,19 @@ impl FlowController {
             self.rtt_samples.push_back((now, rtt));
             self.update_avg_rtt(now);
         }
+
+        // A real ack is proof of peer liveness: clear the stall latch and
+        // counter. If we were halted, resume unlimited encoding — the
+        // post-recovery IDR comes from the caller's stall path / L1 reinit.
+        if self.stall_halted {
+            info!(
+                "EGFX flow controller: FrameAcknowledge received after sustained \
+                 stall — resuming encoder"
+            );
+            self.stall_halted = false;
+            self.total_frame_slots = UNLIMITED_FRAME_SLOTS;
+        }
+        self.consecutive_ack_stalls = 0;
 
         let n_unacked = self.unacked_count();
 
@@ -352,6 +391,20 @@ impl FlowController {
         }
         let stalled_ms = stalled.as_millis() as u64;
 
+        self.consecutive_ack_stalls = self.consecutive_ack_stalls.saturating_add(1);
+        if self.consecutive_ack_stalls >= MAX_CONSECUTIVE_ACK_STALLS && !self.stall_halted {
+            self.stall_halted = true;
+            // Keep total_frame_slots at 0 so should_throttle() holds even
+            // though the Inactive reset below would normally restore
+            // UNLIMITED_FRAME_SLOTS. The latch is the memory bound; the
+            // state-machine reset below is for the diagnostic fields.
+            error!(
+                stalls = self.consecutive_ack_stalls,
+                "EGFX flow controller: sustained ack stall — HALTING encoder \
+                 (client considered gone; any FrameAcknowledge resumes)"
+            );
+        }
+
         warn!(
             stalled_ms,
             unacked = self.unacked_count(),
@@ -363,7 +416,11 @@ impl FlowController {
         self.rtt_samples.clear();
         self.state = ThrottlingState::Inactive;
         self.activate_th = self.config.activate_th_floor;
-        self.total_frame_slots = UNLIMITED_FRAME_SLOTS;
+        self.total_frame_slots = if self.stall_halted {
+            0
+        } else {
+            UNLIMITED_FRAME_SLOTS
+        };
         self.stats_throttle_exits += 1;
         Some(stalled_ms)
     }
@@ -371,7 +428,7 @@ impl FlowController {
     /// Should the encoder pause? Returns true when `total_frame_slots == 0`.
     /// Display loop checks this before encoding each frame.
     pub fn should_throttle(&self) -> bool {
-        self.total_frame_slots == 0
+        self.total_frame_slots == 0 || self.stall_halted
     }
 
     /// Diagnostic accessors.
@@ -570,6 +627,55 @@ mod tests {
         // n_unacked=0, deactivate_th=1 → released
         assert_eq!(fc.state(), ThrottlingState::Inactive);
         assert!(!fc.should_throttle());
+    }
+
+    #[test]
+    fn sustained_stalls_latch_halt_and_ack_releases() {
+        // A dead peer: check_ack_timeout fires every window, and each firing
+        // clears the frames — so the next unack_frame re-arms a fresh stall.
+        // The latch must survive the per-firing Inactive reset and hold
+        // should_throttle() true so the encoder stops producing into the
+        // unbounded ServerEvent channel.
+        let timeout = Duration::from_millis(0); // every check fires immediately
+        let mut fc = FlowController::new(cfg());
+
+        // First stall: normal recovery path (counter armed, not yet halted).
+        fc.unack_frame(1, 1);
+        assert!(fc.check_ack_timeout(timeout).is_some());
+        assert!(!fc.should_throttle(), "first stall must resume, not halt");
+
+        // Sustained stalls: unack → stall → clear, repeated past the limit.
+        for frame_id in 2..(MAX_CONSECUTIVE_ACK_STALLS + 2) {
+            fc.unack_frame(frame_id, 1);
+            assert!(fc.check_ack_timeout(timeout).is_some());
+        }
+        assert!(fc.should_throttle(), "sustained stalls must latch the halt");
+
+        // The latch survives further stall/clear cycles (halt is sticky).
+        fc.unack_frame(999, 1);
+        assert!(fc.check_ack_timeout(timeout).is_some());
+        assert!(fc.should_throttle(), "halt must be sticky across cycles");
+
+        // A real ack releases the latch and resumes encoding.
+        fc.ack_frame(999);
+        assert!(!fc.should_throttle(), "ack must release the halt");
+    }
+
+    #[test]
+    fn intermittent_acks_never_latch_halt() {
+        // A slow-but-alive client acks between stalls often enough that the
+        // consecutive counter never reaches the limit: no halt.
+        let timeout = Duration::from_millis(0);
+        let mut fc = FlowController::new(cfg());
+        for frame_id in 1..(MAX_CONSECUTIVE_ACK_STALLS * 10) {
+            fc.unack_frame(frame_id, 1);
+            // ack immediately — client alive
+            fc.ack_frame(frame_id);
+            // a stall may still fire (e.g. another frame outstanding); even
+            // if it does, the ack already zeroed the counter.
+            let _ = fc.check_ack_timeout(timeout);
+        }
+        assert!(!fc.should_throttle(), "live client must never latch");
     }
 
     #[test]

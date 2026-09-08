@@ -445,16 +445,25 @@ impl RdpServerManager {
 
     /// Disconnect a client by ID.
     ///
-    /// If a command channel is configured, sends a DisconnectClient command
-    /// to the server runtime which will close the RDP connection.
-    /// Also removes the client from the local tracking list.
+    /// Requires a command channel to the server runtime
+    /// (`with_command_channel`); without one there is no per-connection
+    /// teardown path, so this reports failure honestly instead of
+    /// removing the client from the tracking list and claiming success
+    /// while the RDP connection stays fully established.
     async fn disconnect_client(&self, client_id: String, reason: String) -> bool {
-        if let Some(tx) = &self.command_tx {
-            let _ = tx.send(ServerCommand::DisconnectClient {
-                client_id: client_id.clone(),
-                reason,
-            });
-        }
+        let Some(tx) = &self.command_tx else {
+            tracing::warn!(
+                "D-Bus DisconnectClient for '{client_id}' ({reason}): no command channel — \
+                 administrative disconnect is not implemented in this build; \
+                 the connection remains active"
+            );
+            return false;
+        };
+
+        let _ = tx.send(ServerCommand::DisconnectClient {
+            client_id: client_id.clone(),
+            reason,
+        });
 
         if let Some(_info) = self.remove_client(&client_id).await {
             tracing::info!("Client {} disconnected via D-Bus", client_id);

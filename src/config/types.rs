@@ -11,9 +11,17 @@ pub struct ServerConfig {
     pub listen_addr: String,
 
     /// Maximum number of concurrent connections
+    ///
+    /// NOT ENFORCED at runtime: the accept loop is serial (one client at a
+    /// time), and no code reads this value outside `src/gui/`. Kept for
+    /// schema compatibility and future concurrent-accept work.
     pub max_connections: usize,
 
     /// Session timeout in seconds (0 = no timeout)
+    ///
+    /// NOT ENFORCED at runtime: no code reads this value outside `src/gui/`
+    /// (it was assumed load-bearing during a wedge diagnosis and was not).
+    /// Implementing it needs a per-connection teardown path. 0 = no timeout.
     pub session_timeout: u64,
 
     /// Use XDG Desktop Portals for screen capture

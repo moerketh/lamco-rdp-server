@@ -136,6 +136,26 @@ pub fn start_signal_relay(
                         s.active_connections += 1;
                     }
 
+                    // Track the client so GetConnections / disconnect_client
+                    // operate on real data. Nothing populated this list before:
+                    // add_client was only ever called from tests, so the GUI's
+                    // connection view was permanently empty in production.
+                    let iface_ref: Result<
+                        zbus::object_server::InterfaceRef<RdpServerManager>,
+                        zbus::Error,
+                    > = connection.object_server().interface(OBJECT_PATH).await;
+                    if let Ok(iface_ref) = iface_ref {
+                        let manager = iface_ref.get().await;
+                        manager
+                            .add_client(super::ClientInfo {
+                                client_id: client_id.clone(),
+                                peer_address: peer_address.clone(),
+                                username: String::new(),
+                                connected_at: *timestamp,
+                            })
+                            .await;
+                    }
+
                     if let Err(e) =
                         emit_client_connected(&connection, client_id, peer_address, *timestamp)
                             .await
@@ -153,6 +173,16 @@ pub fn start_signal_relay(
                     {
                         let mut s = state.write().await;
                         s.active_connections = s.active_connections.saturating_sub(1);
+                    }
+
+                    // Keep the tracked client list in sync (see ClientConnected).
+                    let iface_ref: Result<
+                        zbus::object_server::InterfaceRef<RdpServerManager>,
+                        zbus::Error,
+                    > = connection.object_server().interface(OBJECT_PATH).await;
+                    if let Ok(iface_ref) = iface_ref {
+                        let manager = iface_ref.get().await;
+                        manager.remove_client(client_id).await;
                     }
 
                     if let Err(e) =
