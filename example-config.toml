@@ -24,8 +24,11 @@
 # to force IPv4-only.
 listen_addr = "[::]:3389"
 # Maximum concurrent connections (0 = unlimited)
+# NOTE: not enforced at runtime — the accept loop serves one client at a
+# time; queued/multiple concurrent connections are not implemented.
 max_connections = 10
 # Session timeout in seconds (0 = no timeout)
+# NOTE: not enforced at runtime — idle-timeout tracking is not implemented.
 session_timeout = 0
 # Use XDG Desktop Portals for screen capture (recommended)
 use_portals = true

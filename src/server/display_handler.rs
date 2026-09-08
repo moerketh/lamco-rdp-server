@@ -5627,7 +5627,8 @@ mod tests {
 
         match outcome {
             BitmapPushOutcome::Dropped { un_sent } => {
-                // The Full rect PLUS all three never-attempted ones.
+                // Of the 4 rects, 1 was sent; the returned debt is the Full
+                // rect (x=16) plus the 2 never-attempted ones after it.
                 assert_eq!(
                     un_sent.len(),
                     3,

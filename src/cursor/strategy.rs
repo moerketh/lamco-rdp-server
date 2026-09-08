@@ -729,10 +729,12 @@ mod tests {
 
     #[test]
     fn test_runtime_auto_select_is_transition_guarded() {
-        // On a metadata-less path the counter keeps growing past the limit;
-        // the mode must stay Painted and state must remain stable (the
-        // `active_mode != Painted` guard makes the flip-and-log fire once
-        // per transition instead of every frame).
+        // On a metadata-less path the counter keeps growing past the limit
+        // (saturating at u32::MAX far beyond this test's reach); the mode
+        // must stay Painted and the transition must fire once, not per
+        // frame. This is a transition-stability test, not a counter-
+        // saturation test — 1,105 iterations exercise the guard, not
+        // integer overflow.
         let mut strategy = CursorStrategy::new(CursorStrategyConfig::default());
         for _ in 0..(METADATA_ABSENT_FRAMES_LIMIT + 100) {
             strategy.observe_metadata_cursors(false);
