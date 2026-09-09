@@ -346,8 +346,6 @@ stage_install_set() {  # $1 = destination root
   install -Dm644 packaging/polkit/io.lamco.RdpServer.policy "$dest/usr/share/polkit-1/actions/io.lamco.RdpServer.policy"
   install -dm755 "$dest/etc/lamco-rdp-server"
   install -Dm644 example-config.toml "$dest/usr/share/doc/lamco-rdp-server/examples/example-config.toml"
-  install -Dm644 INSTALL.md "$dest/usr/share/doc/lamco-rdp-server/INSTALL.md"
-  gzip -9n "$dest/usr/share/doc/lamco-rdp-server/INSTALL.md"
   install -Dm644 licenses/OpenH264-BINARY_LICENSE.txt "$dest/usr/share/doc/lamco-rdp-server/OpenH264-BINARY_LICENSE.txt"
   install -Dm644 LICENSE "$dest/usr/share/doc/lamco-rdp-server/LICENSE"
   install -Dm644 data/io.lamco.rdp-server.desktop "$dest/usr/share/applications/io.lamco.rdp-server.desktop"
