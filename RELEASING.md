@@ -94,7 +94,7 @@ lamco-rdp-server --version          # /usr/local/bin
   linger locally. The safety bundle (`../lamco-rdp-server-backup.bundle`)
   predates the v2 rewrite.
 - **Local dry-run** without tagging: `bash scripts/build-release-artifacts.sh`
-  from a WSL checkout (see INSTALL.md "From source" for system deps).
+  from a WSL checkout (see README "Building from Source" for system deps).
 - **Deleting the old pre-v2 branch**: once this lineage is verified across a
   release or two, `git push origin --delete feature/hyperv-enhanced-session`
   (the pre-rewrite backup) is safe.
