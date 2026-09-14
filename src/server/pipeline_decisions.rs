@@ -10,6 +10,23 @@ use std::time::{Duration, Instant};
 
 use crate::damage::DamageRegion;
 
+// DamageAccumulator and subtract_regions are extracted to the
+// hyperv-rdp-extras crate (MIT; see that repo's PROVENANCE.md). They are
+// re-typed here on the fork's `DamageRegion` via `From`/`Into` at the
+// boundary, so all fork call sites keep their existing types.
+
+impl From<DamageRegion> for hyperv_rdp_extras::geometry::Region {
+    fn from(r: DamageRegion) -> Self {
+        Self::new(r.x, r.y, r.width, r.height)
+    }
+}
+
+impl From<hyperv_rdp_extras::geometry::Region> for DamageRegion {
+    fn from(r: hyperv_rdp_extras::geometry::Region) -> Self {
+        Self::new(r.x, r.y, r.width, r.height)
+    }
+}
+
 /// Per-frame presentation timestamp for the H.264 encode path.
 ///
 /// Prefers the PipeWire PTS (nanoseconds → milliseconds) when present;
@@ -62,20 +79,13 @@ pub(crate) fn compute_damage_ratio(regions: &[DamageRegion], width: u32, height:
 ///   the debt cannot grow without bound and `compute_damage_ratio` over
 ///   `take()`-ed output cannot double-count area.
 pub(crate) struct DamageAccumulator {
-    regions: Vec<DamageRegion>,
-    cap: usize,
+    inner: hyperv_rdp_extras::geometry::DebtAccumulator,
 }
 
 impl DamageAccumulator {
-    /// Maximum number of rects retained as debt. The cap is never silently
-    /// exceeded: when it binds, the whole debt is replaced by its bounding
-    /// union — oversending the safe superset rather than dropping updates.
-    pub(crate) const DEFAULT_CAP: usize = 1024;
-
     pub(crate) fn new() -> Self {
         Self {
-            regions: Vec::new(),
-            cap: Self::DEFAULT_CAP,
+            inner: hyperv_rdp_extras::geometry::DebtAccumulator::new(),
         }
     }
 
@@ -83,43 +93,28 @@ impl DamageAccumulator {
     /// Called on the skip/wait paths where the frame was consumed but will
     /// not be encoded.
     pub(crate) fn absorb(&mut self, send_set: Vec<DamageRegion>) {
-        self.regions = Self::normalize(send_set, self.cap);
+        self.inner
+            .absorb(send_set.into_iter().map(Into::into).collect());
     }
 
     /// Take the entire debt, leaving the accumulator empty. The pipeline
     /// prepends the returned regions to the next encoded frame's set.
     pub(crate) fn take(&mut self) -> Vec<DamageRegion> {
-        std::mem::take(&mut self.regions)
+        self.inner.take().into_iter().map(Into::into).collect()
     }
 
     /// Drop all debt (e.g. on reconnect/resize where the coordinate space
     /// changed or the client will be fully re-initialized anyway).
     pub(crate) fn clear(&mut self) {
-        self.regions.clear();
+        self.inner.clear();
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.regions.is_empty()
+        self.inner.is_empty()
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.regions.len()
-    }
-
-    /// Merge overlapping/adjacent regions; if the merged set still exceeds
-    /// the cap, collapse it to a single bounding union.
-    fn normalize(mut regions: Vec<DamageRegion>, cap: usize) -> Vec<DamageRegion> {
-        if regions.len() <= 1 {
-            return regions;
-        }
-        regions = crate::damage::merge_regions(regions, 0);
-        if regions.len() > cap
-            && let Some(first) = regions.first()
-        {
-            let union = regions.iter().skip(1).fold(*first, |acc, r| acc.union(r));
-            return vec![union];
-        }
-        regions
+        self.inner.len()
     }
 }
 
@@ -399,76 +394,16 @@ pub(crate) fn subtract_regions(
     frame_width: u32,
     frame_height: u32,
 ) -> Vec<DamageRegion> {
-    /// Per-region cap on fragmentation pieces before falling back to the
-    /// un-subtracted region. Generous for real workloads (compositor hints
-    /// arrive tile-aligned and coarse), while bounding the exponential.
-    const MAX_PIECES: usize = 256;
-
-    // Fast paths: nothing to subtract from / by.
-    if regions.is_empty() || covered.is_empty() {
-        return regions.to_vec();
-    }
-    // A covered region spanning the whole frame erases everything.
-    let full_coverage = covered
-        .iter()
-        .any(|c| c.x == 0 && c.y == 0 && c.width >= frame_width && c.height >= frame_height);
-    if full_coverage {
-        return Vec::new();
-    }
-
-    let mut result: Vec<DamageRegion> = Vec::new();
-    for r in regions {
-        // Worklist of uncovered pieces of `r`.
-        let mut pieces = vec![*r];
-        for c in covered {
-            let mut next_pieces = Vec::new();
-            for p in pieces {
-                // Intersection of p and c (empty when disjoint).
-                let ix = p.x.max(c.x);
-                let iy = p.y.max(c.y);
-                let ix2 = (p.x + p.width).min(c.x + c.width);
-                let iy2 = (p.y + p.height).min(c.y + c.height);
-                if ix >= ix2 || iy >= iy2 {
-                    // Disjoint: p survives untouched.
-                    next_pieces.push(p);
-                    continue;
-                }
-                // Clip p against the intersection, emitting the 4 side bands.
-                // Left band.
-                if ix > p.x {
-                    next_pieces.push(DamageRegion::new(p.x, p.y, ix - p.x, p.height));
-                }
-                // Right band.
-                let p_x2 = p.x + p.width;
-                if ix2 < p_x2 {
-                    next_pieces.push(DamageRegion::new(ix2, p.y, p_x2 - ix2, p.height));
-                }
-                // Top band (between left/right clip).
-                if iy > p.y {
-                    next_pieces.push(DamageRegion::new(ix, p.y, ix2 - ix, iy - p.y));
-                }
-                // Bottom band (between left/right clip).
-                let p_y2 = p.y + p.height;
-                if iy2 < p_y2 {
-                    next_pieces.push(DamageRegion::new(ix, iy2, ix2 - ix, p_y2 - iy2));
-                }
-            }
-            pieces = next_pieces;
-            if pieces.is_empty() {
-                break;
-            }
-            if pieces.len() > MAX_PIECES {
-                // Fragmentation cap: return the region un-subtracted rather
-                // than let the worklist multiply further. Oversending is
-                // always safe here (probe-union semantics); under-sending
-                // would leave stale pixels.
-                pieces = vec![*r];
-                break;
-            }
-        }
-        result.extend(pieces);
-    }
-    result
+    // Delegates to hyperv_rdp_extras::geometry (MIT, fork-authored; see that
+    // repo's PROVENANCE.md). Exact axis-aligned subtraction with a
+    // fragmentation cap; the full doc lives in the crate.
+    let out = hyperv_rdp_extras::geometry::subtract_regions(
+        &regions.iter().copied().map(Into::into).collect::<Vec<_>>(),
+        &covered.iter().copied().map(Into::into).collect::<Vec<_>>(),
+        frame_width,
+        frame_height,
+    );
+    out.into_iter().map(Into::into).collect()
 }
 
 #[cfg(test)]
@@ -520,9 +455,10 @@ mod tests {
             DamageRegion::new(0, 0, 100, 100),
             DamageRegion::new(0, 0, 100, 100),
         ]);
-        assert_eq!(acc.len(), 1, "overlaps must merge: {:?}", acc.regions);
+        assert_eq!(acc.len(), 1, "overlaps must merge");
         // Ratio over merged debt cannot double-count area.
-        let ratio = compute_damage_ratio(&acc.regions, 200, 200);
+        let taken = acc.take();
+        let ratio = compute_damage_ratio(&taken, 200, 200);
         assert!((ratio - 0.25).abs() < 1e-6, "ratio {ratio}");
     }
 
@@ -531,14 +467,14 @@ mod tests {
         let mut acc = DamageAccumulator::new();
         // Push well past the cap with mutually non-adjacent regions.
         let mut set = Vec::new();
-        for i in 0..(DamageAccumulator::DEFAULT_CAP + 64) {
+        for i in 0..(hyperv_rdp_extras::geometry::DebtAccumulator::DEFAULT_CAP + 64) {
             let x = u32::try_from(i % 64).unwrap() * 1000;
             let y = u32::try_from(i / 64).unwrap() * 1000;
             set.push(DamageRegion::new(x, y, 10, 10));
         }
         acc.absorb(set);
         assert!(
-            acc.len() <= DamageAccumulator::DEFAULT_CAP,
+            acc.len() <= hyperv_rdp_extras::geometry::DebtAccumulator::DEFAULT_CAP,
             "cap must bind, got {}",
             acc.len()
         );

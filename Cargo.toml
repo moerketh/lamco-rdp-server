@@ -44,9 +44,15 @@ lamco-rdp = "0.8.0"
 lamco-portal = { version = "0.4.5", features = ["dbus-clipboard"] }
 lamco-pipewire = { version = "0.6.13", features = ["audio", "damage"] }
 lamco-video = "0.3.0"
-lamco-rdp-input = "0.2.0"
+lamco-rdp-input = { version = "0.2.0" }
 lamco-clipboard-core = { version = "0.6.1", features = ["image"] }
 lamco-rdp-clipboard = "0.5.0"
+
+# Fork-authored standalone modules extracted from this repo (MIT; see that
+# repo's PROVENANCE.md). geometry: region subtraction + debt accumulation;
+# transport: first-byte handshake deadline. Local path during Phase 1 —
+# switch to the git rev pin when the crate repo is pushed.
+hyperv-rdp-extras = { path = "../hyperv-rdp-extras", default-features = false, features = ["geometry", "transport"] }
 
 # -----------------------------------------------------------------------------
 # Async runtime

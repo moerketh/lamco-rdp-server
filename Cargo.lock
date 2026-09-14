@@ -2883,6 +2883,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyperv-rdp-extras"
+version = "0.1.0"
+dependencies = [
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "iana-time-zone"
 version = "0.1.65"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3848,6 +3856,7 @@ dependencies = [
  "futures-util",
  "hkdf 0.12.4",
  "hostname",
+ "hyperv-rdp-extras",
  "iced",
  "image",
  "ironrdp",
