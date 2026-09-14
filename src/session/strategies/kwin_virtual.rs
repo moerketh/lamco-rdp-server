@@ -231,7 +231,12 @@ impl SessionHandle for KwinVirtualSessionHandle {
         let _node = self.recreate_stream(w, h).await?;
 
         if self.layout_guard.read().await.is_none() {
-            let guard = OutputLayoutGuard::engage().await;
+            // engage_with, not engage(): the guard's kscreen exclusion must
+            // match THIS strategy's output identity (Virtual-lamco) — the
+            // crate's neutral default (Virtual-rdp) would leave our own
+            // output unexcluded, and the guard would disable it as if it
+            // were a physical output.
+            let guard = OutputLayoutGuard::engage_with(VirtualOutputConfig::new(OUTPUT_NAME)).await;
             *self.layout_guard.write().await = Some(Arc::new(guard));
         }
 
