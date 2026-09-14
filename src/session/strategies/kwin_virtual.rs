@@ -27,10 +27,20 @@ use tracing::info;
 use crate::session::strategy::{
     ClipboardSource, PipeWireAccess, SessionHandle, SessionLifecyclePolicy, SessionType, StreamInfo,
 };
-use hyperv_rdp_extras::session::{OutputLayoutGuard, VirtualOutputManager};
+use hyperv_rdp_extras::session::{OutputLayoutGuard, VirtualOutputConfig, VirtualOutputManager};
 
-// Re-exported for the parser tests below and external callers.
-pub use hyperv_rdp_extras::session::{OUTPUT_NAME, parse_enabled_physical_outputs, strip_ansi};
+// Re-exported for the parser tests below and external callers. The kscreen
+// parser is parameterized by the excluded kscreen name (exact match; see
+// the crate docs) — the fork's output identity stays "lamco".
+pub use hyperv_rdp_extras::session::{parse_enabled_physical_outputs, strip_ansi};
+
+/// The output name this fork passes to `stream_virtual_output`; KWin lists
+/// the output as `Virtual-{OUTPUT_NAME}` in kscreen. Behaviorally pinned
+/// by the parser tests below.
+pub const OUTPUT_NAME: &str = "lamco";
+
+/// The kscreen exclusion name matching [`OUTPUT_NAME`].
+pub const VIRTUAL_OUTPUT_KSCREEN_NAME: &str = "Virtual-lamco";
 
 /// The session handle: video state + libei input state.
 pub struct KwinVirtualSessionHandle {
@@ -51,7 +61,9 @@ pub struct KwinVirtualSessionHandle {
 impl KwinVirtualSessionHandle {
     fn new(libei: Arc<crate::session::strategies::libei::LibeiSessionHandleImpl>) -> Self {
         Self {
-            wl: RwLock::new(VirtualOutputManager::new()),
+            wl: RwLock::new(VirtualOutputManager::with_config(VirtualOutputConfig::new(
+                OUTPUT_NAME,
+            ))),
             libei,
             streams: RwLock::new(Vec::new()),
             layout_guard: RwLock::new(None),
@@ -399,7 +411,8 @@ mod tests {
         // hyperv_drm's `Virtual-1` is a PHYSICAL
         // output here — it must appear (be disabled by the guard), not be
         // excluded by a Virtual- prefix.
-        let names = parse_enabled_physical_outputs(KSCREEN_TWO_OUTPUTS);
+        let names =
+            parse_enabled_physical_outputs(KSCREEN_TWO_OUTPUTS, VIRTUAL_OUTPUT_KSCREEN_NAME);
         assert!(
             names.contains(&"Virtual-1".to_string()),
             "hyperv_drm's Virtual-1 must be managed; got {names:?}"
@@ -408,7 +421,8 @@ mod tests {
 
     #[test]
     fn test_parser_excludes_own_virtual_output() {
-        let names = parse_enabled_physical_outputs(KSCREEN_TWO_OUTPUTS);
+        let names =
+            parse_enabled_physical_outputs(KSCREEN_TWO_OUTPUTS, VIRTUAL_OUTPUT_KSCREEN_NAME);
         assert!(
             !names.contains(&"Virtual-lamco".to_string()),
             "our own virtual output must NOT be disabled; got {names:?}"
@@ -418,7 +432,7 @@ mod tests {
     #[test]
     fn test_parser_single_drm_output() {
         let text = "Output: 1 Virtual-1\n        enabled\n        connected\n        Geometry: 0,0 1920x1080\n";
-        let names = parse_enabled_physical_outputs(text);
+        let names = parse_enabled_physical_outputs(text, VIRTUAL_OUTPUT_KSCREEN_NAME);
         assert_eq!(names, vec!["Virtual-1".to_string()]);
     }
 
@@ -429,7 +443,7 @@ mod tests {
         // re-disable bookkeeping relies on the list being exactly "currently
         // enabled".
         let text = "Output: 1 Virtual-1\n        enabled\nOutput: 2 HDMI-A-1\n        disabled\n";
-        let names = parse_enabled_physical_outputs(text);
+        let names = parse_enabled_physical_outputs(text, VIRTUAL_OUTPUT_KSCREEN_NAME);
         assert_eq!(names, vec!["Virtual-1".to_string()]);
     }
 
@@ -437,16 +451,25 @@ mod tests {
     fn test_parser_real_connector_names() {
         // Bare-metal KDE naming (DP-1/HDMI-A-1) — the common case.
         let text = "Output: 1 DP-1\n        enabled\nOutput: 2 HDMI-A-1\n        enabled\nOutput: 3 Virtual-lamco\n        enabled\n";
-        let names = parse_enabled_physical_outputs(text);
+        let names = parse_enabled_physical_outputs(text, VIRTUAL_OUTPUT_KSCREEN_NAME);
         assert_eq!(names, vec!["DP-1".to_string(), "HDMI-A-1".to_string()]);
     }
 
     #[test]
     fn test_parser_empty_and_garbage_input() {
-        assert!(parse_enabled_physical_outputs("").is_empty());
-        assert!(parse_enabled_physical_outputs("random noise\nno outputs here\n").is_empty());
+        assert!(parse_enabled_physical_outputs("", VIRTUAL_OUTPUT_KSCREEN_NAME).is_empty());
+        assert!(
+            parse_enabled_physical_outputs(
+                "random noise\nno outputs here\n",
+                VIRTUAL_OUTPUT_KSCREEN_NAME
+            )
+            .is_empty()
+        );
         // "enabled" without a preceding Output block is ignored.
-        assert!(parse_enabled_physical_outputs("enabled\nenabled\n").is_empty());
+        assert!(
+            parse_enabled_physical_outputs("enabled\nenabled\n", VIRTUAL_OUTPUT_KSCREEN_NAME)
+                .is_empty()
+        );
     }
 
     #[test]
@@ -454,7 +477,7 @@ mod tests {
         // The final block flush must not require a trailing newline after
         // the last block — kscreen output shape varies.
         let text = "Output: 1 Virtual-1\n        enabled";
-        let names = parse_enabled_physical_outputs(text);
+        let names = parse_enabled_physical_outputs(text, VIRTUAL_OUTPUT_KSCREEN_NAME);
         assert_eq!(names, vec!["Virtual-1".to_string()]);
     }
 }
