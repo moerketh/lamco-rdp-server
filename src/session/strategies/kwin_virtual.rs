@@ -1,81 +1,42 @@
 //! KWin zkde-screencast virtual output strategy (KDE Plasma 6+).
 //!
-//! Native-resolution video for KDE: instead of capturing the physical output
-//! (capped by hyperv_drm's fixed mode list) and scaling, this strategy asks
-//! KWin to CREATE a virtual output at exactly the client's requested
-//! resolution and stream it — via the private `zkde_screencast_unstable_v1`
-//! protocol that xdg-desktop-portal-kde itself wraps.
+//! The zkde-screencast Wayland machinery — virtual-output creation via the
+//! private `zkde_screencast_unstable_v1` protocol, the create-before-close
+//! stream lifecycle, and the kscreen physical-output layout management —
+//! lives in the `hyperv-rdp-extras` crate (MIT; see that repo's
+//! PROVENANCE.md). This module keeps the strategy shell: the libei input
+//! composition and the `SessionHandle` implementation.
 //!
-//! One request (`stream_virtual_output`) creates the output AND its PipeWire
-//! stream — no portal session, no consent dialog, no source picker. Capture
-//! size == desktop size, so no capture-to-desktop scaling, coordinate
-//! remapping, or stride compaction machinery is needed between the
-//! stream and the encoder.
+//! One request (`stream_virtual_output`) creates the output AND its
+//! PipeWire stream — no portal session, no consent dialog, no source
+//! picker. Capture size == desktop size, so no capture-to-desktop scaling,
+//! coordinate remapping, or stride compaction machinery is needed between
+//! the stream and the encoder.
 //!
 //! Input reuses the libei machinery (EIS via Portal RemoteDesktop) — KWin's
 //! only supported injection route. The input consent dialog still applies
 //! (one-time via restore token); the VIDEO path is dialog-free.
-//!
-//! This strategy reproduces the krfb-virtualmonitor + portal-picker +
-//! DRM-output-off recipe, done in-process and per-connection.
-//!
-//! Architecture:
-//!
-//! ```text
-//! mstsc (client WxH)
-//!    │
-//!    ├─ video: zkde_screencast.stream_virtual_output("lamco", W, H, 1.0)
-//!    │         → KWin creates Virtual-lamco @ WxH → stream `created(node)`
-//!    │         → bind PipeWire node (shared daemon FD, MemFd buffers)
-//!    │
-//!    └─ input:  Portal RemoteDesktop + EIS (libei machinery, unchanged)
-//! ```
-//!
-//! Wayland plumbing lives on a dedicated thread (the connection is not
-//! async); commands flow in via std mpsc, results back via tokio oneshot.
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::Arc;
 
-use anyhow::{Context as _, Result};
+use anyhow::Result;
 use async_trait::async_trait;
 use tokio::sync::RwLock;
-use tracing::{error, info, warn};
+use tracing::info;
 
 use crate::session::strategy::{
     ClipboardSource, PipeWireAccess, SessionHandle, SessionLifecyclePolicy, SessionType, StreamInfo,
 };
+use hyperv_rdp_extras::session::{OutputLayoutGuard, VirtualOutputManager};
 
-/// Default output name KWin will assign/connect (`Virtual-<name>` in kscreen).
-pub const OUTPUT_NAME: &str = "lamco";
-
-/// The full kscreen connector name of our virtual output (`Virtual-{OUTPUT_NAME}`).
-const VIRTUAL_OUTPUT_KSCREEN_NAME: &str = "Virtual-lamco";
-
-/// Commands sent to the Wayland connection thread.
-enum WlCommand {
-    /// Create a virtual output at the given size; replies with the PipeWire node id.
-    CreateStream {
-        width: i32,
-        height: i32,
-        reply: tokio::sync::oneshot::Sender<Result<u32, String>>,
-    },
-    /// Close the current stream (destroys the virtual output server-side).
-    Close,
-}
-
-/// Events reported from the Wayland thread back to the strategy.
-struct WlState {
-    /// Sender side for commands; None once the thread has exited.
-    tx: Option<std::sync::mpsc::Sender<WlCommand>>,
-}
+// Re-exported for the parser tests below and external callers.
+pub use hyperv_rdp_extras::session::{OUTPUT_NAME, parse_enabled_physical_outputs, strip_ansi};
 
 /// The session handle: video state + libei input state.
 pub struct KwinVirtualSessionHandle {
-    /// Command channel to the Wayland thread.
-    wl: RwLock<WlState>,
+    /// Virtual-output stream manager (Wayland thread + create-before-close
+    /// lifecycle; crate-owned).
+    wl: RwLock<VirtualOutputManager>,
     /// The libei handle providing input injection (EIS).
     libei: Arc<crate::session::strategies::libei::LibeiSessionHandleImpl>,
     /// Current stream info (node id + geometry), updated on establish/release.
@@ -85,62 +46,24 @@ pub struct KwinVirtualSessionHandle {
     /// idles), dropped on release_after_client (physical outputs
     /// re-enable first — the sunshine rule).
     layout_guard: RwLock<Option<Arc<OutputLayoutGuard>>>,
-    /// Set when the Wayland thread has died (compositor gone); next
-    /// establish_for_client will rebuild it.
-    wl_dead: AtomicBool,
 }
 
 impl KwinVirtualSessionHandle {
     fn new(libei: Arc<crate::session::strategies::libei::LibeiSessionHandleImpl>) -> Self {
         Self {
-            wl: RwLock::new(WlState { tx: None }),
+            wl: RwLock::new(VirtualOutputManager::new()),
             libei,
             streams: RwLock::new(Vec::new()),
             layout_guard: RwLock::new(None),
-            wl_dead: AtomicBool::new(true),
         }
-    }
-
-    /// Ensure the Wayland thread exists, creating it if needed.
-    async fn ensure_wl_thread(&self) -> Result<std::sync::mpsc::Sender<WlCommand>> {
-        if self.wl_dead.load(Ordering::Acquire) {
-            let mut guard = self.wl.write().await;
-            if guard.tx.is_none() {
-                let (tx, rx) = std::sync::mpsc::channel::<WlCommand>();
-                std::thread::Builder::new()
-                    .name("kwin-zkde-screencast".into())
-                    .spawn(move || wayland_thread(rx))
-                    .context("Failed to spawn zkde-screencast thread")?;
-                guard.tx = Some(tx);
-                self.wl_dead.store(false, Ordering::Release);
-                info!("[kwin-virtual] Wayland thread started");
-            }
-        }
-        self.wl
-            .read()
-            .await
-            .tx
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("zkde-screencast thread unavailable"))
     }
 
     /// (Re-)create the virtual output stream at the given size.
     async fn recreate_stream(&self, width: u16, height: u16) -> Result<u32> {
-        let tx = self.ensure_wl_thread().await?;
-
-        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        tx.send(WlCommand::CreateStream {
-            width: width as i32,
-            height: height as i32,
-            reply: reply_tx,
-        })
-        .map_err(|_| anyhow::anyhow!("zkde-screencast thread exited"))?;
-
-        let node_id = tokio::time::timeout(std::time::Duration::from_secs(10), reply_rx)
-            .await
-            .map_err(|_| anyhow::anyhow!("timed out waiting for zkde stream creation"))?
-            .map_err(|_| anyhow::anyhow!("zkde stream reply dropped"))?
-            .map_err(|e| anyhow::anyhow!("zkde stream creation failed: {e}"))?;
+        // The crate's manager owns the Wayland thread (created on demand),
+        // the create-before-close swap, the enable-after-every-create
+        // black-screen guard, and the created-reply timeout.
+        let node_id = self.wl.read().await.recreate_stream(width, height).await?;
 
         let info = StreamInfo {
             node_id,
@@ -152,29 +75,6 @@ impl KwinVirtualSessionHandle {
             position_y: 0,
         };
         *self.streams.write().await = vec![info];
-        info!(
-            "[kwin-virtual] virtual output '{}' @ {width}x{height} streaming on node {node_id}",
-            OUTPUT_NAME
-        );
-        // Ensure the fresh output is ENABLED — after EVERY create, not just
-        // the first (a resize recreate can be born disabled exactly like the
-        // initial one; see establish_for_client). A disabled output never
-        // gets rendered into: the screencast buffers stay untouched
-        // (all-zero, alpha 0x00) — the black-screen signature. Enable is
-        // idempotent.
-        let enabled =
-            tokio::task::spawn_blocking(move || enable_output(VIRTUAL_OUTPUT_KSCREEN_NAME))
-                .await
-                .unwrap_or(false);
-        if enabled {
-            info!("[kwin-virtual] virtual output '{}' enabled", OUTPUT_NAME);
-        } else {
-            warn!(
-                "[kwin-virtual] virtual output '{}' could NOT be enabled — \
-                 session may show a black screen",
-                OUTPUT_NAME
-            );
-        }
         Ok(node_id)
     }
 }
@@ -296,9 +196,9 @@ impl SessionHandle for KwinVirtualSessionHandle {
         // initial size only needs to be valid.
         let (w, h) = (1920u16, 1200u16);
 
-        // CREATE the virtual output FIRST (recreate_stream also ensures it
-        // is ENABLED), then disable the physical one. Order matters twice
-        // over:
+        // CREATE the virtual output FIRST (the crate's recreate_stream
+        // also ensures it is ENABLED), then disable the physical one. Order
+        // matters twice over:
         //
         // 1. zkde's stream_virtual_output can create the output in a
         //    DISABLED state — notably when a previous manual
@@ -313,8 +213,9 @@ impl SessionHandle for KwinVirtualSessionHandle {
         //    (same guard, for the born-enabled case before the virtual is
         //    up).
         //
-        // So: create (→ enabled inside recreate_stream; position/mode
-        // are already right from creation) → disable physical.
+        // So: create (→ enabled inside the crate's recreate_stream;
+        // position/mode are already right from creation) → disable
+        // physical.
         let _node = self.recreate_stream(w, h).await?;
 
         if self.layout_guard.read().await.is_none() {
@@ -327,10 +228,9 @@ impl SessionHandle for KwinVirtualSessionHandle {
     }
 
     async fn release_after_client(&self) {
-        // Close the stream — KWin destroys the virtual output on stream close.
-        if let Some(tx) = self.wl.read().await.tx.as_ref() {
-            let _ = tx.send(WlCommand::Close);
-        }
+        // Close the stream — KWin destroys the virtual output on stream
+        // close (the crate's manager sends Close and destroys the proxy).
+        self.wl.read().await.close_stream().await;
         self.streams.write().await.clear();
         // Restore the physical outputs — the console must come back the
         // moment the client is gone (also on abnormal paths: drop order
@@ -352,14 +252,17 @@ impl SessionHandle for KwinVirtualSessionHandle {
         // size would swap the output (close+create+rebind) for nothing.
         {
             let cur = self.streams.read().await;
-            if let Some(s) = cur.first() {
-                if s.width == width as u32 && s.height == height as u32 {
-                    return Some((width, height));
-                }
+            if let Some(s) = cur.first()
+                && s.width == width as u32
+                && s.height == height as u32
+            {
+                return Some((width, height));
             }
         }
-        if let Err(e) = self.recreate_stream(width, height).await {
-            warn!("[kwin-virtual] resize to {width}x{height} failed: {e} — keeping current stream");
+        if let Err(_e) = self.recreate_stream(width, height).await {
+            tracing::warn!(
+                "[kwin-virtual] resize to {width}x{height} failed: {_e} — keeping current stream"
+            );
             let cur = self.streams.read().await;
             return cur.first().map(|s| (s.width as u16, s.height as u16));
         }
@@ -387,701 +290,8 @@ impl SessionHandle for KwinVirtualSessionHandle {
     }
 }
 
-/// Wayland connection thread: owns the zkde-screencast objects.
-///
-/// Runs a blocking dispatch loop around a std mpsc of commands. The
-/// `created`/`failed`/`closed` events of the stream object are collected
-/// into per-request oneshot replies.
-/// State machine for one zkde stream request: which conclusive event
-/// (Created/Failed/Closed) has arrived, if any.
-///
-/// Invariants (exactly what the off-compositor tests pin):
-/// 1. The FIRST conclusive event decides the outcome; later events are
-///    ignored (a `Closed` following a `Failed` must not double-deliver).
-/// 2. A new request (`reset`) re-arms the machine.
-///
-/// Hoisted to module scope so the logic is directly unit-testable — the
-/// Wayland objects can't exist off-compositor, but these rules can and
-/// must be tested (the double-delivery bug class is silent: a second
-/// `reply.send` on a consumed oneshot is a no-op that masks real
-/// state confusion).
-#[derive(Debug)]
-struct StreamRequestMachine {
-    /// A conclusive event has already been delivered for this request.
-    done: bool,
-}
-
-impl StreamRequestMachine {
-    fn new() -> Self {
-        Self { done: false }
-    }
-
-    /// Re-arm for a fresh request (new stream_virtual_output call).
-    fn reset(&mut self) {
-        self.done = false;
-    }
-
-    /// Apply a stream event: returns the outcome to deliver if this event
-    /// is the FIRST conclusive one, else None. See the struct docs for the
-    /// invariants.
-    fn transition(
-        &mut self,
-        event: &wayland_protocols_plasma::screencast::v1::client::zkde_screencast_stream_unstable_v1::Event,
-    ) -> Option<Result<u32, String>> {
-        use wayland_protocols_plasma::screencast::v1::client::zkde_screencast_stream_unstable_v1::Event;
-        if self.done {
-            // Late event after conclusion: log Closed for observability only.
-            if matches!(event, Event::Closed) {
-                info!("[kwin-virtual] stream closed by compositor (request already concluded)");
-            }
-            return None;
-        }
-        match event {
-            Event::Created { node } => {
-                self.done = true;
-                info!("[kwin-virtual] stream created: PipeWire node {node}");
-                Some(Ok(*node))
-            }
-            Event::Failed { error } => {
-                self.done = true;
-                warn!("[kwin-virtual] stream failed: {error}");
-                Some(Err(error.clone()))
-            }
-            Event::Closed => {
-                self.done = true;
-                info!("[kwin-virtual] stream closed by compositor");
-                Some(Err("stream closed by compositor".into()))
-            }
-            _ => None,
-        }
-    }
-}
-
-fn wayland_thread(rx: std::sync::mpsc::Receiver<WlCommand>) {
-    use std::os::fd::AsFd as _;
-    use wayland_client::{Connection, Dispatch, QueueHandle, protocol::wl_registry};
-
-    use wayland_protocols_plasma::screencast::v1::client::{
-        zkde_screencast_stream_unstable_v1::Event as StreamEvent,
-        zkde_screencast_stream_unstable_v1::ZkdeScreencastStreamUnstableV1,
-        zkde_screencast_unstable_v1::{Event as ManagerEvent, Pointer, ZkdeScreencastUnstableV1},
-    };
-
-    /// Per-thread dispatch state.
-    struct State {
-        screencast: Option<ZkdeScreencastUnstableV1>,
-        /// Pending request: the object + where to send the result. The
-        /// reply is consumed on the FIRST conclusive event; the proxy itself
-        /// is RETAINED here after conclusion so a later Close command can
-        /// destroy the stream (KWin keeps the virtual output alive until
-        /// the stream object is destroyed — dropping the proxy too early
-        /// leaves a zombie output that blocks every subsequent create).
-        pending: Option<(
-            ZkdeScreencastStreamUnstableV1,
-            Option<tokio::sync::oneshot::Sender<Result<u32, String>>>,
-        )>,
-        /// The PREVIOUS stream's proxy, kept alive while its replacement is
-        /// being created (create-before-close). Destroying it only AFTER the
-        /// replacement's `created` event guarantees the enabled-output set
-        /// never empties mid-session — a zero-outputs window sends
-        /// plasmashell to its placeholder screen (field-observed: it does
-        /// not re-latch — black screen). Restored as the active stream when
-        /// the replacement fails, so the caller's "keep the current
-        /// stream" fallback stays truthful.
-        retiring: Option<ZkdeScreencastStreamUnstableV1>,
-        /// Stream request state machine (conclusive-event bookkeeping).
-        stream_sm: StreamRequestMachine,
-    }
-
-    impl Dispatch<wl_registry::WlRegistry, ()> for State {
-        fn event(
-            state: &mut Self,
-            registry: &wl_registry::WlRegistry,
-            event: wl_registry::Event,
-            _: &(),
-            _: &Connection,
-            qh: &QueueHandle<Self>,
-        ) {
-            if let wl_registry::Event::Global {
-                name,
-                interface,
-                version,
-            } = event
-            {
-                if interface == "zkde_screencast_unstable_v1" {
-                    // KWin advertises version 6; the plasma bindings (XML v4)
-                    // cap us at 4 — bind min(server, 4).
-                    let bind_version = version.min(4);
-                    let screencast = registry.bind::<ZkdeScreencastUnstableV1, _, State>(
-                        name,
-                        bind_version,
-                        qh,
-                        (),
-                    );
-                    state.screencast = Some(screencast);
-                    info!(
-                        "[kwin-virtual] bound zkde_screencast_unstable_v1 (global v{version}, bound v{bind_version})"
-                    );
-                }
-            }
-        }
-    }
-
-    impl Dispatch<ZkdeScreencastUnstableV1, ()> for State {
-        fn event(
-            _: &mut Self,
-            _: &ZkdeScreencastUnstableV1,
-            _: ManagerEvent,
-            _: &(),
-            _: &Connection,
-            _: &QueueHandle<Self>,
-        ) {
-            // The manager object has no events.
-        }
-    }
-
-    // NOTE: the manager interface has no events; a blanket empty impl is
-    // impossible with the generic Dispatch trait, so we provide the one
-    // above. The stream object's events are dispatched below via a macro-free
-    // impl — see `Dispatch<ZkdeScreencastStreamUnstableV1, ()>`.
-
-    impl Dispatch<ZkdeScreencastStreamUnstableV1, ()> for State {
-        fn event(
-            state: &mut Self,
-            _stream: &ZkdeScreencastStreamUnstableV1,
-            event: StreamEvent,
-            _: &(),
-            _: &Connection,
-            _: &QueueHandle<Self>,
-        ) {
-            // Pure transition, then deliver: the state machine decides if
-            // the event concludes the pending request (first conclusive
-            // event wins). Consume ONLY the reply — the stream PROXY is
-            // retained in state.pending so a later Close command can
-            // destroy the stream (KWin removes the virtual output only on
-            // stream destruction; dropping the proxy early leaves a zombie
-            // output that wedges all reconnects).
-            if let Some(outcome) = state.stream_sm.transition(&event) {
-                // Deliver the reply, then finalize the swap: the retiring
-                // stream is destroyed only now (replacement live) or handed
-                // back (replacement failed).
-                if let Some(pending) = state.pending.as_mut() {
-                    if let Some(reply) = pending.1.take() {
-                        let _ = reply.send(outcome.clone());
-                    }
-                }
-                match &outcome {
-                    Ok(_) => {
-                        // Replacement is live: destroy the previous stream
-                        // NOW — this close removes the old virtual output,
-                        // and it happens only AFTER the new one exists, so
-                        // the enabled-output set never empties mid-session
-                        // (a zero-outputs window sends plasmashell to its
-                        // placeholder screen — field-observed to never
-                        // re-latch: black screen). The main loop flushes
-                        // before its next poll, which delivers the close
-                        // promptly enough for a removal.
-                        if let Some(old) = state.retiring.take() {
-                            old.close();
-                            info!("[kwin-virtual] previous stream destroyed after swap");
-                        }
-                    }
-                    Err(_) => {
-                        // Replacement failed: hand the previous stream back
-                        // as the active one — its output never died, so the
-                        // session keeps working and the caller's "keep the
-                        // current stream" fallback stays truthful. The
-                        // failed proxy is simply dropped — `Failed` means
-                        // no output was ever created, so nothing lingers
-                        // server-side.
-                        if let Some(old) = state.retiring.take() {
-                            state.pending = Some((old, None));
-                            info!("[kwin-virtual] replacement failed — previous stream restored");
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    impl Dispatch<wayland_client::protocol::wl_display::WlDisplay, ()> for State {
-        fn event(
-            _: &mut Self,
-            _: &wayland_client::protocol::wl_display::WlDisplay,
-            _: wayland_client::protocol::wl_display::Event,
-            _: &(),
-            _: &Connection,
-            _: &QueueHandle<Self>,
-        ) {
-        }
-    }
-
-    let conn = match Connection::connect_to_env() {
-        Ok(c) => c,
-        Err(e) => {
-            error!("[kwin-virtual] cannot connect to Wayland: {e}");
-            // Reply with errors until the channel drains, then exit.
-            while let Ok(cmd) = rx.recv() {
-                if let WlCommand::CreateStream { reply, .. } = cmd {
-                    let _ = reply.send(Err(format!("wayland connection failed: {e}")));
-                }
-            }
-            return;
-        }
-    };
-
-    let mut event_queue = conn.new_event_queue();
-    let qh = event_queue.handle();
-    let display = conn.display();
-    let _registry = display.get_registry(&qh, ());
-
-    let mut state = State {
-        screencast: None,
-        pending: None,
-        retiring: None,
-        stream_sm: StreamRequestMachine::new(),
-    };
-
-    // Initial roundtrip: binds the zkde global (if advertised).
-    if let Err(e) = event_queue.roundtrip(&mut state) {
-        error!("[kwin-virtual] initial roundtrip failed: {e}");
-    }
-
-    if state.screencast.is_none() {
-        warn!(
-            "[kwin-virtual] zkde_screencast_unstable_v1 not advertised — \
-             is this KWin? (The global appears once the screencast plugin \
-             has loaded; it may also be absent on non-KDE compositors.)"
-        );
-    }
-
-    loop {
-        // Poll the Wayland socket with a short timeout so queued commands
-        // are picked up promptly. blocking_dispatch only wakes on
-        // COMPOSITOR events, and an idle desktop (fresh virtual output
-        // showing nothing) produces none — commands would then sit
-        // unprocessed until a long timeout, wedging resize on connect
-        // and every reconnect. std mpsc has no pollable fd, so the
-        // command side is a 50ms poll timeout; ≤50ms command latency is
-        // fine (the `created` reply is what gates callers, not this loop).
-        let mut poll_fds = [nix::poll::PollFd::new(
-            conn.as_fd(),
-            nix::poll::PollFlags::POLLIN,
-        )];
-        let rc = match nix::poll::poll(&mut poll_fds, 50u16) {
-            Ok(n) => n,
-            Err(nix::errno::Errno::EINTR) => continue,
-            Err(e) => {
-                error!("[kwin-virtual] poll failed: {e} — thread exiting");
-                if let Some(pending) = state.pending.take() {
-                    if let Some(reply) = pending.1 {
-                        let _ = reply.send(Err(format!("poll failed: {e}")));
-                    }
-                }
-                return;
-            }
-        };
-
-        // Wayland socket ready: read + dispatch compositor events.
-        if rc > 0
-            && poll_fds[0]
-                .revents()
-                .is_some_and(|f| f.contains(nix::poll::PollFlags::POLLIN))
-        {
-            if let Some(guard) = event_queue.prepare_read() {
-                match guard.read() {
-                    Ok(_) => {}
-                    Err(e) => {
-                        error!("[kwin-virtual] wayland socket read failed: {e} — thread exiting");
-                        if let Some(pending) = state.pending.take() {
-                            if let Some(reply) = pending.1 {
-                                let _ = reply.send(Err(format!("wayland read failed: {e}")));
-                            }
-                        }
-                        return;
-                    }
-                }
-            }
-            if let Err(e) = event_queue.dispatch_pending(&mut state) {
-                error!("[kwin-virtual] dispatch failed: {e} — thread exiting");
-                if let Some(pending) = state.pending.take() {
-                    if let Some(reply) = pending.1 {
-                        let _ = reply.send(Err(format!("dispatch failed: {e}")));
-                    }
-                }
-                return;
-            }
-        }
-
-        // Drain queued commands (arriving while parked or during the poll
-        // window — try_recv is cheap, and this also covers the case where
-        // the channel filled between the poll and now).
-        loop {
-            match rx.try_recv() {
-                Ok(WlCommand::CreateStream {
-                    width,
-                    height,
-                    reply,
-                }) => {
-                    let Some(screencast) = state.screencast.as_ref() else {
-                        let _ = reply.send(Err("zkde_screencast global not bound".into()));
-                        continue;
-                    };
-                    // CREATE-BEFORE-CLOSE: the previous stream (if any)
-                    // moves to `retiring` — kept alive, NOT destroyed yet —
-                    // so the enabled-output set never empties while the
-                    // replacement is being created (see `retiring`). It is
-                    // destroyed only after the replacement's `created`
-                    // event, or restored if the replacement fails.
-                    //
-                    // An abandoned swap (a create whose reply timed out
-                    // against a wedged KWin, followed by another create) is
-                    // cleaned up here: destroy the orphaned previous proxy
-                    // so it cannot linger as a zombie output.
-                    if let Some(orphan) = state.retiring.take() {
-                        warn!(
-                            "[kwin-virtual] destroying orphaned stream left by an abandoned swap"
-                        );
-                        orphan.close();
-                    }
-                    if let Some((prev, _)) = state.pending.take() {
-                        state.retiring = Some(prev);
-                    }
-                    state.stream_sm.reset();
-                    // Pointer mode argument: measured 2026-09-06 on KWin
-                    // 6.3.6 (Parrot 7.3) — this argument does NOT control
-                    // whether KWin paints the cursor into the virtual
-                    // output's frames. Requesting Metadata still yielded a
-                    // composited cursor (two pointers with the client's
-                    // arrow); requesting Hidden did too. It also does not
-                    // yield SPA_META_Cursor: with Metadata requested, cursor
-                    // meta was absent on every frame of a whole live session
-                    // while the consumer provably requested SPA_META_Cursor
-                    // (lamco-pipewire requests it unconditionally). Embedded
-                    // (=2) is kept as the declared intent — it matches the
-                    // observed behaviour (composited cursor, context-aware
-                    // shapes) — but the value passed here is not the lever
-                    // it appears to be. The client-side arrow is suppressed
-                    // by the Painted-mode HidePointer re-send instead (see
-                    // process_cursor_update).
-                    let stream = screencast.stream_virtual_output(
-                        OUTPUT_NAME.to_string(),
-                        width,
-                        height,
-                        // scale: 1.0 — RDP clients express size in physical
-                        // pixels; no compositor-side scaling wanted.
-                        1.0,
-                        u32::from(Pointer::Embedded),
-                        &qh,
-                        (),
-                    );
-                    state.pending = Some((stream, Some(reply)));
-                    if let Err(e) = conn.flush() {
-                        warn!("[kwin-virtual] flush failed: {e}");
-                    }
-                }
-                Ok(WlCommand::Close) => {
-                    // The ONLY place the stream is destroyed — this is what
-                    // makes KWin remove the virtual output (the proxy was
-                    // retained past the concluded request for exactly this
-                    // call). A mid-swap retirement goes too: release means
-                    // NO virtual output may survive.
-                    let mut destroyed = false;
-                    if let Some((stream, _)) = state.pending.take() {
-                        stream.close();
-                        destroyed = true;
-                    }
-                    if let Some(old) = state.retiring.take() {
-                        old.close();
-                        destroyed = true;
-                    }
-                    if destroyed {
-                        state.stream_sm.reset();
-                        if let Err(e) = conn.flush() {
-                            warn!("[kwin-virtual] flush failed: {e}");
-                        }
-                        info!("[kwin-virtual] stream destroyed on Close command");
-                    }
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    // Strategy dropped the channel — exit thread.
-                    info!("[kwin-virtual] command channel closed, thread exiting");
-                    return;
-                }
-            }
-        }
-
-        // Always flush before the next poll iteration so requests reach KWin.
-        if let Err(e) = conn.flush() {
-            warn!("[kwin-virtual] flush failed: {e}");
-        }
-    }
-}
-
-// ============================================================================
-// Strategy: session creation (composes libei input + virtual output video)
-// ============================================================================
-
-/// Output-management for the session: disable the physical (DRM) outputs so
-/// the virtual output becomes the primary at (0,0) — the layout that makes
-/// the session fully interactive (panel+windows relocate; pointer coordinate
-/// chain closes). Re-enables them on drop, physical FIRST (sunshine rule:
-/// never leave the host blind).
-///
-/// `kscreen-doctor` is invoked in a blocking thread; both directions are
-/// best-effort — if it fails, the session still works (the virtual output is
-/// usable as a secondary screen, just with the panel elsewhere).
-struct OutputLayoutGuard {
-    /// Connector names that were disabled by this guard.
-    disabled: Vec<String>,
-}
-
-impl OutputLayoutGuard {
-    /// Snapshot enabled non-virtual outputs, then disable them.
-    async fn engage() -> Self {
-        let mut names = tokio::task::spawn_blocking(list_enabled_physical_outputs)
-            .await
-            .unwrap_or_default();
-        if names.is_empty() {
-            info!("[kwin-virtual] no physical outputs to manage (already headless?)");
-            return Self {
-                disabled: Vec::new(),
-            };
-        }
-        info!(
-            "[kwin-virtual] disabling physical output(s) for session: [{}]",
-            names.join(", ")
-        );
-        for name in names.iter() {
-            let n = name.clone();
-            let _ = tokio::task::spawn_blocking(move || disable_output(&n))
-                .await
-                .unwrap_or(false);
-        }
-        // VERIFY the disables stuck. KWin/kscreen can silently refuse —
-        // notably disabling the only enabled output, which is reverted
-        // immediately (the physical output comes back enabled at (0,0)
-        // and the captured virtual output stays an empty secondary:
-        // black screen). Callers of engage() must have created the virtual
-        // output FIRST so a disable here leaves a valid layout; if a
-        // disable still bounced, retry once after the compositor settles.
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        let still_enabled = tokio::task::spawn_blocking(list_enabled_physical_outputs)
-            .await
-            .unwrap_or_default();
-        let bounced: Vec<String> = names
-            .iter()
-            .filter(|n| still_enabled.contains(n))
-            .cloned()
-            .collect();
-        if !bounced.is_empty() {
-            warn!(
-                "[kwin-virtual] disable bounced for [{}] — retrying once after settle",
-                bounced.join(", ")
-            );
-            for name in bounced.iter() {
-                let n = name.clone();
-                let _ = tokio::task::spawn_blocking(move || disable_output(&n))
-                    .await
-                    .unwrap_or(false);
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-            let final_enabled = tokio::task::spawn_blocking(list_enabled_physical_outputs)
-                .await
-                .unwrap_or_default();
-            let stuck: Vec<String> = names
-                .iter()
-                .filter(|n| final_enabled.contains(n))
-                .cloned()
-                .collect();
-            if !stuck.is_empty() {
-                warn!(
-                    "[kwin-virtual] outputs still enabled after retry: [{}] — continuing (panel may be elsewhere)",
-                    stuck.join(", ")
-                );
-            }
-            // Only bookkeep the ones that actually disabled.
-            names.retain(|n| !final_enabled.contains(n));
-        }
-        Self { disabled: names }
-    }
-}
-
-impl Drop for OutputLayoutGuard {
-    fn drop(&mut self) {
-        // Physical FIRST — the machine must never be left without a display
-        // if the virtual output died first.
-        let names = std::mem::take(&mut self.disabled);
-        for name in &names {
-            let n = name.clone();
-            let _ = std::thread::spawn(move || {
-                enable_output(&n);
-            })
-            .join();
-        }
-        if !names.is_empty() {
-            info!(
-                "[kwin-virtual] physical output(s) re-enabled: [{}]",
-                names.join(", ")
-            );
-        }
-    }
-}
-
-/// Parse `kscreen-doctor -o` output: names of ENABLED outputs that are not
-/// OUR virtual one. Best-effort — returns empty on any failure.
-///
-/// NOTE on naming: the exclusion is EXACT (`Virtual-lamco` — the name KWin
-/// assigns our zkde-created output). It must NOT be a "Virtual-" prefix
-/// match: hyperv_drm's connector is itself named `Virtual-1`, and that IS
-/// a physical output this guard must manage (disabling it is the whole
-/// point — panel relocation + origin placement). A prefix exclusion would
-/// skip the DRM output entirely and leave a two-screen layout that breaks
-/// pointer coordinate mapping.
-fn list_enabled_physical_outputs() -> Vec<String> {
-    let out = match std::process::Command::new("kscreen-doctor")
-        .arg("-o")
-        .stdin(std::process::Stdio::null())
-        .output()
-    {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
-        Ok(o) => {
-            // Non-zero exit: the compositor may be mid-restart or kscreen
-            // not ready. Log it — an empty list here would otherwise look
-            // identical to "already headless" in the journal.
-            warn!(
-                "[kwin-virtual] kscreen-doctor -o failed (exit {:?}): {}",
-                o.status.code(),
-                String::from_utf8_lossy(&o.stderr).trim()
-            );
-            return Vec::new();
-        }
-        Err(e) => {
-            warn!("[kwin-virtual] cannot run kscreen-doctor: {e}");
-            return Vec::new();
-        }
-    };
-
-    let names = parse_enabled_physical_outputs(&out);
-    if names.is_empty() {
-        // Either genuinely headless, or kscreen reported nothing usable.
-        // The first 400 chars make the difference diagnosable in the journal.
-        warn!(
-            "[kwin-virtual] kscreen-doctor listed no enabled physical outputs. Raw output head: {:?}",
-            out.chars().take(400).collect::<String>()
-        );
-    }
-    names
-}
-
-/// Pure parser: given `kscreen-doctor -o` text, return enabled output names
-/// excluding our own virtual output (`Virtual-{OUTPUT_NAME}`).
-///
-/// The text form is a sequence of blocks:
-/// ```text
-/// Output: 1 Virtual-1
-///     enabled
-///     connected
-///     priority 1
-///     ...
-/// ```
-/// We walk blocks; an "Output: N <name>" line opens a block, and a bare
-/// "enabled" line marks it enabled. Only enabled, non-virtual names are
-/// collected, in order.
-fn parse_enabled_physical_outputs(kscreen_text: &str) -> Vec<String> {
-    /// The exact name KWin gives our zkde-created virtual output.
-    const VIRTUAL_OUTPUT_NAME: &str = "Virtual-lamco";
-
-    // kscreen-doctor colorizes its output unconditionally (even piped), so
-    // ANSI escape sequences sit between the marker words and the values
-    // (e.g. "\u{1b}[01;32mOutput: \u{1b}[0;0m1 Virtual-1").
-    // Strip them BEFORE matching, or every comparison misses.
-    let stripped = strip_ansi(kscreen_text);
-
-    let mut result = Vec::new();
-    let mut current_name: Option<String> = None;
-    let mut current_enabled = false;
-    for line in stripped.lines() {
-        let line = line.trim();
-        if let Some(rest) = line.strip_prefix("Output: ") {
-            // Flush previous block.
-            if let (Some(name), true) = (&current_name, current_enabled) {
-                if name != VIRTUAL_OUTPUT_NAME {
-                    result.push(name.clone());
-                }
-            }
-            // "1 Virtual-1" -> name is everything after the index.
-            current_name = rest.split_once(' ').map(|(_, n)| n.to_string());
-            current_enabled = false;
-        } else if line == "enabled" {
-            current_enabled = true;
-        }
-    }
-    // Flush the final block (no trailing "Output:" line).
-    if let (Some(name), true) = (&current_name, current_enabled) {
-        if name != VIRTUAL_OUTPUT_NAME {
-            result.push(name.clone());
-        }
-    }
-    result
-}
-
-/// Remove ANSI escape sequences (ESC [ ... final-byte). kscreen-doctor
-/// emits color codes even when stdout is a pipe.
-fn strip_ansi(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut chars = text.chars();
-    while let Some(c) = chars.next() {
-        if c != '\u{1b}' {
-            out.push(c);
-            continue;
-        }
-        // ESC '[' → CSI sequence: consume params/intermediates until the
-        // final byte (0x40–0x7E).
-        if chars.next() == Some('[') {
-            for c in chars.by_ref() {
-                if ('@'..='~').contains(&c) {
-                    break;
-                }
-            }
-        }
-        // A bare ESC with no '[' is dropped (rare/undefined here).
-    }
-    out
-}
-
-fn disable_output(name: &str) -> bool {
-    std::process::Command::new("kscreen-doctor")
-        .arg(format!("output.{name}.disable"))
-        .stdin(std::process::Stdio::null())
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
-fn enable_output(name: &str) -> bool {
-    match std::process::Command::new("kscreen-doctor")
-        .arg(format!("output.{name}.enable"))
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .output()
-    {
-        Ok(o) if o.status.success() => true,
-        Ok(o) => {
-            // kscreen-doctor prints its locale nag to stdout; the actual
-            // error is the last stderr line.
-            let err = String::from_utf8_lossy(&o.stderr);
-            let err = err.lines().last().unwrap_or("").trim();
-            warn!("[kwin-virtual] kscreen-doctor failed to enable '{name}': {err}");
-            false
-        }
-        Err(e) => {
-            warn!("[kwin-virtual] could not run kscreen-doctor: {e}");
-            false
-        }
-    }
-}
+// NOTE: no adapter needed — create_session_concrete guarantees the concrete
+// libei handle type for direct input delegation.
 
 /// Session strategy: KWin zkde-screencast virtual output.
 pub struct KwinVirtualStrategy {
@@ -1161,24 +371,20 @@ impl crate::session::strategy::SessionStrategy for KwinVirtualStrategy {
     }
 }
 
-// NOTE: no adapter needed — create_session_concrete guarantees the concrete
-// libei handle type for direct input delegation.
-
 #[cfg(test)]
 mod tests {
     //! kwin-virtual strategy unit tests.
     //!
-    //! The Wayland object layer can't be exercised off-compositor, so the
-    //! testable seams are the pure logic: the kscreen output parser (with
-    //! its exact-name exclusion rule — see the regression test) and
-    //! the stream-event state machine (Created/Failed/Closed ordering
-    //! rules).
+    //! The Wayland object layer can't be exercised off-compositor. The
+    //! pure-logic seams — the kscreen output parser (with its exact-name
+    //! exclusion rule) and the stream-event state machine — moved to the
+    //! hyperv-rdp-extras crate and are tested there (session module). The
+    //! tests below keep the fork-side regression coverage: the parser tests
+    //! exercise the SAME crate function through this module's re-exports,
+    //! including the real-world Hyper-V sample that pins the exact-name
+    //! exclusion against hyperv_drm's `Virtual-1`.
 
     use super::*;
-
-    // ========================================================================
-    // parse_enabled_physical_outputs
-    // ========================================================================
 
     /// Real-world connector naming on Hyper-V: hyperv_drm's
     /// connector is named `Virtual-1` and MUST be managed (disabled) by the
@@ -1250,189 +456,5 @@ mod tests {
         let text = "Output: 1 Virtual-1\n        enabled";
         let names = parse_enabled_physical_outputs(text);
         assert_eq!(names, vec!["Virtual-1".to_string()]);
-    }
-
-    #[test]
-    fn test_parser_ansi_colored_output_is_parsed() {
-        // kscreen-doctor colorizes unconditionally — even piped. The
-        // parser must strip ANSI sequences before comparing: without
-        // stripping, the ANSI bytes between "Output: " and the values
-        // make every comparison miss, so the guard would never disable
-        // Virtual-1, the desktop would stay on the physical output, and
-        // the captured virtual output would be a black, frame-idle
-        // screen. The fixture contains ANSI sequences for this reason.
-        let text = "\u{1b}[01;32mOutput: \u{1b}[0;0m1 Virtual-1\n\t\u{1b}[01;32menabled\u{1b}[0;0m\n\t\u{1b}[01;32mconnected\u{1b}[0;0m\n\t\u{1b}[01;32mpriority 1\u{1b}[0;0m\n\t\u{1b}[01;33mUnknown\u{1b}[0;0m\n\t\u{1b}[01;34mModes: \u{1b}[0;0m 1:1024x768@60!  2:1920x1080@60* \nOutput: 2 Virtual-lamco\n\tenabled\n";
-        let names = parse_enabled_physical_outputs(text);
-        assert_eq!(names, vec!["Virtual-1".to_string()]);
-    }
-
-    #[test]
-    fn test_strip_ansi_removes_all_csi_sequences() {
-        assert_eq!(strip_ansi("plain text"), "plain text");
-        assert_eq!(
-            strip_ansi("\u{1b}[01;32mOutput: \u{1b}[0;0m1 Virtual-1"),
-            "Output: 1 Virtual-1"
-        );
-        assert_eq!(
-            strip_ansi("\u{1b}[0m enabled \u{1b}[01;32mx\u{1b}[0m"),
-            " enabled x"
-        );
-        // Empty and multi-line inputs survive.
-        assert_eq!(strip_ansi(""), "");
-        assert_eq!(strip_ansi("\u{1b}[1mA\n\u{1b}[0mB"), "A\nB");
-    }
-
-    // ========================================================================
-    // Stream request state machine (StreamRequestMachine)
-    // ========================================================================
-
-    fn stream_event(
-        kind: &str,
-    ) -> wayland_protocols_plasma::screencast::v1::client::zkde_screencast_stream_unstable_v1::Event
-    {
-        stream_event_with_node(kind, 42)
-    }
-
-    fn stream_event_with_node(
-        kind: &str,
-        node: u32,
-    ) -> wayland_protocols_plasma::screencast::v1::client::zkde_screencast_stream_unstable_v1::Event
-    {
-        use wayland_protocols_plasma::screencast::v1::client::zkde_screencast_stream_unstable_v1::Event;
-        match kind {
-            "created" => Event::Created { node },
-            "failed" => Event::Failed {
-                error: "compositor refused".to_string(),
-            },
-            "closed" => Event::Closed,
-            _ => unreachable!("unknown kind {kind}"),
-        }
-    }
-
-    #[test]
-    fn test_stream_sm_created_succeeds_once() {
-        let mut sm = StreamRequestMachine::new();
-        // First Created delivers the node id.
-        assert_eq!(sm.transition(&stream_event("created")), Some(Ok(42)));
-        // A second event of any kind is ignored (no double-delivery).
-        assert_eq!(sm.transition(&stream_event("closed")), None);
-        assert_eq!(sm.transition(&stream_event("created")), None);
-    }
-
-    #[test]
-    fn test_stream_sm_failed_fails_once_then_closed_ignored() {
-        let mut sm = StreamRequestMachine::new();
-        // Failed delivers the compositor's error message.
-        assert_eq!(
-            sm.transition(&stream_event("failed")),
-            Some(Err("compositor refused".to_string()))
-        );
-        // A subsequent Closed (compositor closing the failed stream's
-        // object) must NOT deliver again — the reply channel is consumed.
-        assert_eq!(sm.transition(&stream_event("closed")), None);
-    }
-
-    #[test]
-    fn test_stream_sm_closed_fails_with_generic_error() {
-        let mut sm = StreamRequestMachine::new();
-        // Closed before any other event: the request fails with the
-        // generic message (no payload on the protocol event).
-        assert_eq!(
-            sm.transition(&stream_event("closed")),
-            Some(Err("stream closed by compositor".to_string()))
-        );
-    }
-
-    #[test]
-    fn test_stream_sm_reset_rearms_after_conclusion() {
-        // The per-connection lifecycle: Close then CreateStream re-arms the
-        // machine; the new request must be able to deliver again.
-        let mut sm = StreamRequestMachine::new();
-        assert_eq!(
-            sm.transition(&stream_event("failed")),
-            Some(Err("compositor refused".to_string()))
-        );
-        sm.reset();
-        assert_eq!(
-            sm.transition(&stream_event_with_node("created", 7)),
-            Some(Ok(7))
-        );
-        // And once more: concluded again.
-        assert_eq!(sm.transition(&stream_event("closed")), None);
-    }
-
-    #[test]
-    fn test_stream_sm_reset_on_fresh_request_allows_new_outcome() {
-        // Mirrors the Close command path: reset without a conclusive event
-        // (explicit user Close), then a fresh request succeeds.
-        let mut sm = StreamRequestMachine::new();
-        sm.reset(); // Close path resets even without an event.
-        assert_eq!(
-            sm.transition(&stream_event_with_node("created", 99)),
-            Some(Ok(99))
-        );
-    }
-
-    // ========================================================================
-    // Strategy surface
-    // ========================================================================
-
-    #[test]
-    fn test_output_name_constant() {
-        // KWin prefixes "Virtual-" to the name we pass: stream_virtual_output
-        // receives OUTPUT_NAME, and kscreen lists "Virtual-{OUTPUT_NAME}".
-        // The parser's exclusion constant must match that construction.
-        assert_eq!(OUTPUT_NAME, "lamco");
-        assert_eq!(
-            "Virtual-OUTPUT",
-            format!("Virtual-{OUTPUT_NAME}").replace("lamco", "OUTPUT")
-        );
-        // The parser excludes exactly "Virtual-lamco".
-        let text = "Output: 1 Virtual-lamco\n        enabled\n";
-        assert!(parse_enabled_physical_outputs(text).is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_resize_capture_source_default_is_none() {
-        // The trait's default (non-elastic strategies) must be None —
-        // capture size is fixed by the compositor and the display
-        // handler silently adopts the client's requested desktop size
-        // instead of recreating the capture source.
-        // Use a minimal anonymous handle to prove the default.
-        struct NoElastic;
-        #[async_trait]
-        impl crate::session::strategy::SessionHandle for NoElastic {
-            fn pipewire_access(&self) -> crate::session::strategy::PipeWireAccess {
-                crate::session::strategy::PipeWireAccess::NodeId(0)
-            }
-            fn streams(&self) -> Vec<StreamInfo> {
-                Vec::new()
-            }
-            fn session_type(&self) -> SessionType {
-                SessionType::Portal
-            }
-            async fn notify_keyboard_keycode(&self, _k: i32, _p: bool) -> Result<()> {
-                Ok(())
-            }
-            async fn notify_pointer_motion_absolute(
-                &self,
-                _s: u32,
-                _x: f64,
-                _y: f64,
-            ) -> Result<()> {
-                Ok(())
-            }
-            async fn notify_pointer_button(&self, _b: i32, _p: bool) -> Result<()> {
-                Ok(())
-            }
-            async fn notify_pointer_axis(&self, _dx: f64, _dy: f64) -> Result<()> {
-                Ok(())
-            }
-            fn clipboard_source(&self) -> ClipboardSource {
-                ClipboardSource::None
-            }
-        }
-        let h = NoElastic;
-        assert!(h.resize_capture_source(1920, 1200).await.is_none());
     }
 }

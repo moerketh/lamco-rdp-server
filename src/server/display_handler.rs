@@ -117,23 +117,10 @@ struct ResizeRequest {
 const PAINTED_SHAPE_INTERVAL: u32 = 60;
 
 /// Frame counter gating the periodic Painted-mode transparent-shape
-/// re-send. Interior-mutable (shared atomic) so the frame loop can tick it
-/// without a mutex, and `Clone` so handler clones share one counter.
-#[derive(Debug, Clone, Default)]
-struct PaintedShapeCounter {
-    frames: std::sync::Arc<std::sync::atomic::AtomicU32>,
-}
-
-impl PaintedShapeCounter {
-    /// Whether this frame should carry a periodic transparent-shape
-    /// re-send. Ticks the counter on every call.
-    fn should_send(&self) -> bool {
-        let n = self
-            .frames
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        n > 0 && n.is_multiple_of(PAINTED_SHAPE_INTERVAL)
-    }
-}
+/// re-send — the crate's ResendCounter (hyperv_rdp_extras::cursor),
+/// aliased for the handler field's name. First call sends immediately;
+/// then every PAINTED_SHAPE_INTERVAL-th call.
+type PaintedShapeCounter = hyperv_rdp_extras::cursor::ResendCounter;
 
 /// Video encoder abstraction for codec-agnostic frame encoding
 ///
@@ -671,7 +658,7 @@ impl LamcoDisplayHandler {
             cursor_strategy: Arc::new(Mutex::new(crate::cursor::CursorStrategy::new(
                 (&config.cursor).into(),
             ))),
-            painted_shape_counter: PaintedShapeCounter::default(),
+            painted_shape_counter: PaintedShapeCounter::new(PAINTED_SHAPE_INTERVAL),
             autodetect_rtt: Arc::new(RwLock::new(None)),
             stream_info: Arc::new(RwLock::new(stream_info)),
             gfx_server_handle,
@@ -772,7 +759,7 @@ impl LamcoDisplayHandler {
             cursor_strategy: Arc::new(Mutex::new(crate::cursor::CursorStrategy::new(
                 (&config.cursor).into(),
             ))),
-            painted_shape_counter: PaintedShapeCounter::default(),
+            painted_shape_counter: PaintedShapeCounter::new(PAINTED_SHAPE_INTERVAL),
             autodetect_rtt: Arc::new(RwLock::new(None)),
             stream_info: Arc::new(RwLock::new(stream_info)),
             gfx_server_handle,
@@ -4616,40 +4603,37 @@ impl LamcoDisplayHandler {
         // Deactivate/Reactivate, capability re-exchange). The PDU is small
         // and idempotent, so re-sending every PAINTED_SHAPE_INTERVAL frames
         // is cheap insurance.
-        if strategy.mode() == crate::cursor::CursorMode::Painted {
-            if strategy.needs_hide_update() || self.painted_shape_counter.should_send() {
-                let transparent = ColorPointer {
-                    cache_index: 0,
-                    width: 32,
-                    height: 32,
-                    hot_x: 0,
-                    hot_y: 0,
-                    // AND mask: one bit per pixel, 32px = 4 bytes/row,
-                    // 32 rows, all bits set (opaque "screen" pixel).
-                    and_mask: vec![0xFF; 32 * 4],
-                    // XOR mask: TS_COLORPOINTERATTRIBUTE fixes this at 24
-                    // bpp — 32px * 3 bytes/row * 32 rows, all zero.
-                    // AND=1/XOR=0 leaves every screen pixel unchanged
-                    // (fully transparent cursor). 32 bpp would only be
-                    // legal via New Pointer Update's xorBpp (RGBAPointer),
-                    // which is capability-gated.
-                    xor_mask: vec![0x00; 32 * 32 * 3],
-                };
-                // try_send, never .await: a dead peer stops draining this
-                // bounded channel, and an awaited send while holding the
-                // update_sender mutex would wedge every other display path
-                // (including reset_update_channel). These updates are
-                // idempotent state re-asserted by later frames, so dropping
-                // on Full is safe; Closed means the client is gone.
-                let sender = sender.lock().await;
-                match sender.try_send(DisplayUpdate::ColorPointer(transparent)) {
-                    Ok(()) => {}
-                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return,
-                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                        debug!(
-                            "DisplayUpdate channel full — dropped painted-mode transparent cursor"
-                        );
-                    }
+        if strategy.mode() == crate::cursor::CursorMode::Painted
+            && (strategy.needs_hide_update() || self.painted_shape_counter.should_send())
+        {
+            // The transparent shape's field values (all-opaque AND, all-zero
+            // 24-bpp XOR, 32×32) come from the crate's spec-derived
+            // TransparentPointer (hyperv_rdp_extras::cursor); see the Painted
+            // branch docs in process_cursor_update for the vmconnect
+            // measurements behind the approach. Adapted into IronRDP's
+            // ColorPointer here at the protocol boundary.
+            let t = hyperv_rdp_extras::cursor::TransparentPointer::new_32x32();
+            let transparent = ColorPointer {
+                cache_index: t.cache_index,
+                width: t.width,
+                height: t.height,
+                hot_x: t.hot_x,
+                hot_y: t.hot_y,
+                and_mask: t.and_mask,
+                xor_mask: t.xor_mask,
+            };
+            // try_send, never .await: a dead peer stops draining this
+            // bounded channel, and an awaited send while holding the
+            // update_sender mutex would wedge every other display path
+            // (including reset_update_channel). These updates are
+            // idempotent state re-asserted by later frames, so dropping
+            // on Full is safe; Closed means the client is gone.
+            let sender = sender.lock().await;
+            match sender.try_send(DisplayUpdate::ColorPointer(transparent)) {
+                Ok(()) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return,
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    debug!("DisplayUpdate channel full — dropped painted-mode transparent cursor");
                 }
             }
             return;

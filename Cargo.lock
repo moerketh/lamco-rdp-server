@@ -2886,8 +2886,12 @@ dependencies = [
 name = "hyperv-rdp-extras"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "nix 0.31.3",
  "tokio",
  "tracing",
+ "wayland-client",
+ "wayland-protocols-plasma",
 ]
 
 [[package]]
