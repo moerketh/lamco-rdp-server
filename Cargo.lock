@@ -2885,6 +2885,7 @@ dependencies = [
 [[package]]
 name = "hyperv-rdp-extras"
 version = "0.1.0"
+source = "git+https://github.com/moerketh/hyperv-rdp-extras?rev=3871f8438e99b39ab704d7804ca0206c32682248#3871f8438e99b39ab704d7804ca0206c32682248"
 dependencies = [
  "anyhow",
  "nix 0.31.3",

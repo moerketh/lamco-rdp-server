@@ -52,9 +52,9 @@ lamco-rdp-clipboard = "0.5.0"
 # repo's PROVENANCE.md). geometry: region subtraction + debt accumulation;
 # transport: first-byte handshake deadline; cursor: transparent pointer
 # shape fields; kwin-virtual: zkde-screencast virtual-output machinery.
-# Local path during Phase 1 — switch to the git rev pin when the crate
-# repo is pushed.
-hyperv-rdp-extras = { path = "../hyperv-rdp-extras", default-features = false, features = ["geometry", "transport", "cursor", "kwin-virtual"] }
+# Pinned by rev (IronRDP house pattern): reproducible vendored release
+# tarballs; bump via `cargo update -p hyperv-rdp-extras` after re-pinning.
+hyperv-rdp-extras = { git = "https://github.com/moerketh/hyperv-rdp-extras", rev = "3871f8438e99b39ab704d7804ca0206c32682248", default-features = false, features = ["geometry", "transport", "cursor", "kwin-virtual"] }
 
 # -----------------------------------------------------------------------------
 # Async runtime

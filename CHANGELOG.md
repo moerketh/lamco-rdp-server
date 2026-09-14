@@ -9,6 +9,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Add entries here as work lands; retitle to the release version and date when the release is cut.
 
+## [1.4.5-hyperv.3] - 2026-09-14
+
+The fork-authored, upstream-absent modules move into the standalone
+MIT crate [hyperv-rdp-extras](https://github.com/moerketh/hyperv-rdp-extras)
+(consumed here as a rev-pinned git dependency, the same pattern as the
+IronRDP pins), with no functional change to the server. The extraction
+gives the fork's original modules a permissive license of their own while
+keeping the fork tree building exactly as before.
+
+### Changed
+
+**Extraction of fork-authored modules to `hyperv-rdp-extras`** — no
+behavior change; the fork delegates and re-exports:
+- `src/transport/handshake_deadline.rs` becomes a re-export shim; the
+  first-byte deadline wrapper now lives in the crate's `transport`
+  module, generic over any `AsyncRead + AsyncWrite + Unpin` stream.
+- `pipeline_decisions::subtract_regions` + `DamageAccumulator` delegate
+  to the crate's `geometry` module (`Region`, `subtract_regions` with
+  the fragmentation cap, `DebtAccumulator`), converting at the
+  `DamageRegion` boundary; the fork API surface is unchanged.
+- `kwin-virtual`: the zkde-screencast Wayland thread (create-before-close
+  stream swap), `OutputLayoutGuard` (physical-first restore), and the
+  kscreen parsers live in the crate's `session` module; the fork file
+  slims from 1438 to ~470 lines and keeps only the libei input
+  composition and the `SessionHandle` implementation. The kscreen
+  parser exclusion is parameterized by the caller — this fork passes
+  its own `Virtual-lamco` identity explicitly at both the manager and
+  the guard (the crate's neutral default is `rdp`).
+- The Painted-mode transparent pointer shape comes from the crate's
+  spec-derived `TransparentPointer` (MS-RDPBCGR), adapted into IronRDP's
+  `ColorPointer` at the protocol boundary; the re-send cadence uses the
+  crate's `ResendCounter` (immediate first send, then every
+  `PAINTED_SHAPE_INTERVAL` frames — same wire behavior).
+- See the crate's `PROVENANCE.md` for the per-module audit trail
+  (origin files, upstream-absence searches, re-typing notes).
+
+### Fixed
+
+- `strip_ansi` (crate `session`): a bare ESC not followed by `[` no
+  longer consumes the character after it (a latent bug in the fork's
+  original helper, fixed in the crate rewrite).
+
 ## [1.4.5-hyperv.2] - 2026-09-08
 
 Clipboard, file transfer, and dead-peer resilience for the Hyper-V /
