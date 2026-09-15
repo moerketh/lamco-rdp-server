@@ -861,7 +861,14 @@ impl LamcoRdpServer {
                     // capable virtio-gpu (venus=on,blob=on on the host) can
                     // genuinely back CPU-readable DMA-BUF, so only force
                     // MemFd when the actual capset query says Venus is
-                    // absent, not on driver name alone.
+                    // absent, not on driver name alone. NOTE: deliberately NO
+                    // no-render-node forcing: display-only drivers
+                    // (hyperv_drm) still DELIVER DmaBuf frames backed by
+                    // system memory, and the capture CPU copy reads them;
+                    // compositors that negotiate DmaBuf but deliver nothing
+                    // are covered by the zero-frame fallback, and compositors
+                    // that only produce on SHM select it via the same
+                    // fallback (measured both ways on live systems).
                     let rendering_recommends_software =
                         crate::capabilities::probes::rendering::is_display_gpu_virgl()
                             && !crate::capabilities::probes::rendering::is_display_gpu_venus_capable();
@@ -1567,6 +1574,12 @@ impl LamcoRdpServer {
             info!("EGFX factory created for H.264/AVC420+AVC444 streaming");
         }
 
+        // Same gate as the portal-source construction above: non-Venus
+        // virtio-gpu returns all-zero mmap data, so force MemFd there.
+        // Deliberately NO no-render-node forcing — display-only drivers
+        // still deliver readable DmaBuf (system-memory backed); the
+        // zero-frame fallback covers the delivers-nothing case per
+        // compositor behavior.
         let rendering_recommends_software =
             crate::capabilities::probes::rendering::is_display_gpu_virgl()
                 && !crate::capabilities::probes::rendering::is_display_gpu_venus_capable();
