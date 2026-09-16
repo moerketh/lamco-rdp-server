@@ -2429,6 +2429,46 @@ impl LamcoDisplayHandler {
                         f
                     }
                     None => {
+                        // Per-connection state reset MUST run before any deadline
+                        // keyed off session_start (zero-frame, EGFX gate) in
+                        // this arm. The old code reset only at the bottom of
+                        // the loop body, so on the FIRST no-frame iteration
+                        // after a client connected — the normal state at
+                        // connect, damage-driven capture delivers nothing
+                        // until the desktop changes — the zero-frame check
+                        // evaluated against the stale server-start clock and
+                        // fired instantly if the server had been up longer
+                        // than the threshold (measured: 62683ms elapsed
+                        // reported ~73ms after stream creation), spurious-
+                        // rebinding DmaBuf→MemFd and failing session health
+                        // before any frame could possibly arrive.
+                        let client_now_active = handler
+                            .client_active
+                            .load(std::sync::atomic::Ordering::Relaxed);
+                        if client_now_active && !was_client_active {
+                            was_client_active = true;
+                            session_start = std::time::Instant::now();
+                            egfx_gate_bypassed = false;
+                            first_frame_received = false;
+                            zero_frame_reported = false;
+                            frames_sent = 0;
+                            frames_dropped = 0;
+                            frames_paced = 0;
+                            egfx_frames_sent = 0;
+                            video_encoder = None;
+                            egfx_sender = None;
+                            compositor_hint_distrusted = false;
+                            consecutive_high_divergence = 0;
+                            frames_since_connect = 0;
+                            accumulated_damage.clear();
+                            handler
+                                .egfx_needs_init
+                                .store(true, std::sync::atomic::Ordering::SeqCst);
+                            info!(
+                                "Pipeline state reset for new client connection (no-frame path, pre-deadline)"
+                            );
+                        }
+
                         // Stall detection: if we previously received frames (cached_frame
                         // exists) and haven't gotten one for 3+ seconds, the stream may be
                         // stuck. Static desktops normally produce no frames (damage-driven),
@@ -2510,9 +2550,18 @@ impl LamcoDisplayHandler {
                             }
                         }
 
-                        // Zero-frame detection: if no frame has EVER arrived since session
-                        // start, the capture protocol may be non-functional (e.g., ext-capture
-                        // on a compositor with incomplete implementation).
+                        // Zero-frame detection: if no frame has EVER arrived since the
+                        // CLIENT connected, the capture protocol may be non-functional
+                        // (e.g., ext-capture on a compositor with incomplete
+                        // implementation).
+                        //
+                        // session_start is reset on the client-connection
+                        // transition at the top of this arm, so this window
+                        // measures from the client's connect, not from server
+                        // start. Before that fix, an idle server that had been
+                        // up longer than the threshold fired the fallback
+                        // instantly at connect — the client was judged on
+                        // uptime it never participated in.
                         //
                         // Only while a client is actually connected. The window opens when
                         // one connects, but nothing used to close it when that client left,
@@ -2532,7 +2581,7 @@ impl LamcoDisplayHandler {
                                 zero_frame_reported = true;
                                 tracing::warn!(
                                     elapsed_ms = since_start.as_millis() as u64,
-                                    "No video frames received since session start"
+                                    "No video frames received since client connected"
                                 );
 
                                 // One-shot DmaBuf→MemFd fallback: some virtual
@@ -2594,34 +2643,13 @@ impl LamcoDisplayHandler {
                             .client_active
                             .load(std::sync::atomic::Ordering::Relaxed);
 
-                        // Also reset per-connection state from the None arm,
-                        // in case PipeWire hasn't delivered a frame yet
+                        // Disconnect transition only. The connect transition
+                        // (with the full per-connection state reset) now runs
+                        // at the TOP of this arm, before any session_start-
+                        // keyed deadline (zero-frame, EGFX gate) evaluates.
                         if !client_waiting {
                             // Client disconnected while in no-frame path
                             was_client_active = false;
-                        } else if client_waiting && !was_client_active {
-                            was_client_active = true;
-                            session_start = std::time::Instant::now();
-                            egfx_gate_bypassed = false;
-                            first_frame_received = false;
-                            zero_frame_reported = false;
-                            frames_sent = 0;
-                            frames_dropped = 0;
-                            frames_paced = 0;
-                            egfx_frames_sent = 0;
-                            video_encoder = None;
-                            egfx_sender = None;
-                            compositor_hint_distrusted = false;
-                            consecutive_high_divergence = 0;
-                            // Mirror the Some(frame) reconnect block: re-arm
-                            // the eager-probe window and drop stale debt for
-                            // the new client.
-                            frames_since_connect = 0;
-                            accumulated_damage.clear();
-                            handler
-                                .egfx_needs_init
-                                .store(true, std::sync::atomic::Ordering::SeqCst);
-                            info!("Pipeline state reset for new client connection (no-frame path)");
                         }
 
                         let needs_init = handler
