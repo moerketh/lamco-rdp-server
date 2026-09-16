@@ -1876,7 +1876,12 @@ impl LamcoDisplayHandler {
             let mut blank_frame_streak: u32 = 0;
             let mut saw_real_content = false;
             let mut blank_capture_reported = false;
-            let blank_frame_streak_threshold: u32 = 30;
+            // 3, not 30: on a wedged DmaBuf capture the damage refresh
+            // delivers ~one frame per MINUTE, so a 30-frame streak means a
+            // half hour of black screen before the remedy fires. The false-
+            // positive guards are the saw_real_content latch plus the
+            // was_dmabuf check below — not the streak length.
+            let blank_frame_streak_threshold: u32 = 3;
             fn buffer_is_uniform(data: &[u8]) -> bool {
                 if data.is_empty() {
                     return true;
@@ -2362,14 +2367,18 @@ impl LamcoDisplayHandler {
                                 blank_frame_streak += 1;
                                 if blank_frame_streak >= blank_frame_streak_threshold {
                                     blank_capture_reported = true;
-                                    tracing::warn!(
-                                        streak = blank_frame_streak,
-                                        "Capture delivers uniform (all-zero) frames while a client is connected — DmaBuf copy is reading zeros"
-                                    );
                                     let was_dmabuf = handler
                                         .use_dmabuf
                                         .swap(false, std::sync::atomic::Ordering::AcqRel);
+                                    // Log the FLIP only when DmaBuf was active.
+                                    // A uniformly-blank desktop over a working
+                                    // MemFd capture is not a fault — one INFO,
+                                    // no rebind, no health impact.
                                     if was_dmabuf {
+                                        tracing::warn!(
+                                            streak = blank_frame_streak,
+                                            "Capture delivers uniform (all-zero) frames while a client is connected — DmaBuf copy is reading zeros"
+                                        );
                                         let node = handler
                                             .capture_node
                                             .load(std::sync::atomic::Ordering::Relaxed);
@@ -2393,6 +2402,11 @@ impl LamcoDisplayHandler {
                                         // rebind's first real frame
                                         // repopulates the cache.
                                         cached_frame = None;
+                                    } else {
+                                        info!(
+                                            streak = blank_frame_streak,
+                                            "Capture delivers uniformly blank frames over MemFd — a genuinely empty desktop, not a fault"
+                                        );
                                     }
                                 }
                             } else {

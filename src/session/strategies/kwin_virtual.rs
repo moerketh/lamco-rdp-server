@@ -44,6 +44,17 @@ pub const VIRTUAL_OUTPUT_KSCREEN_NAME: &str = "Virtual-lamco";
 
 /// The session handle: video state + libei input state.
 pub struct KwinVirtualSessionHandle {
+    // FIELD ORDER IS LOAD-BEARING: Rust drops fields in declaration order.
+    // layout_guard MUST come first so an ABNORMAL drop (teardown without
+    // release_after_client — mid-establish failure, error path) re-enables
+    // the physical outputs BEFORE wl's VirtualOutputManager destroys the
+    // zkde virtual output. The normal path (release_after_client) does the
+    // same order explicitly; this makes the implicit path match.
+    /// Output layout guard for THIS connection: engaged on
+    /// establish_for_client (console stays visible while the server
+    /// idles), dropped on release_after_client (physical outputs
+    /// re-enable first — the sunshine rule).
+    layout_guard: RwLock<Option<Arc<OutputLayoutGuard>>>,
     /// Virtual-output stream manager (Wayland thread + create-before-close
     /// lifecycle; crate-owned).
     wl: RwLock<VirtualOutputManager>,
@@ -51,11 +62,6 @@ pub struct KwinVirtualSessionHandle {
     libei: Arc<crate::session::strategies::libei::LibeiSessionHandleImpl>,
     /// Current stream info (node id + geometry), updated on establish/release.
     streams: RwLock<Vec<StreamInfo>>,
-    /// Output layout guard for THIS connection: engaged on
-    /// establish_for_client (console stays visible while the server
-    /// idles), dropped on release_after_client (physical outputs
-    /// re-enable first — the sunshine rule).
-    layout_guard: RwLock<Option<Arc<OutputLayoutGuard>>>,
 }
 
 impl KwinVirtualSessionHandle {
