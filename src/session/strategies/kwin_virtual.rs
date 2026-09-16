@@ -258,7 +258,7 @@ impl SessionHandle for KwinVirtualSessionHandle {
         info!("[kwin-virtual] stream closed — virtual output removed, physical outputs restored");
     }
 
-    async fn resize_capture_source(&self, width: u16, height: u16) -> Option<(u16, u16)> {
+    async fn resize_capture_source(&self, width: u16, height: u16) -> Option<(u16, u16, Option<u32>)> {
         // The virtual output is elastic: recreate it at the requested size
         // and the stream follows. zkde-screencast accepts ANY resolution —
         // this is the whole point of the strategy (no DRM mode list).
@@ -267,23 +267,36 @@ impl SessionHandle for KwinVirtualSessionHandle {
         // creates (or reuses) the stream and request_initial_size follows
         // immediately with the client's request — recreating at the SAME
         // size would swap the output (close+create+rebind) for nothing.
+        // The short-circuit returns node=None: the caller must NOT rebind,
+        // because rebinding destroys the live PipeWire stream — which is
+        // bound to the zkde virtual output and tears it down with it.
+        // With the physical output disabled by the layout guard, that
+        // leaves ZERO enabled outputs and plasmashell falls back to its
+        // placeholder screen: the session then streams all-zero buffers
+        // forever (black screen on a healthy pipeline).
         {
             let cur = self.streams.read().await;
             if let Some(s) = cur.first()
                 && s.width == width as u32
                 && s.height == height as u32
             {
-                return Some((width, height));
+                return Some((width, height, None));
             }
         }
-        if let Err(_e) = self.recreate_stream(width, height).await {
-            tracing::warn!(
-                "[kwin-virtual] resize to {width}x{height} failed: {_e} — keeping current stream"
-            );
-            let cur = self.streams.read().await;
-            return cur.first().map(|s| (s.width as u16, s.height as u16));
+        match self.recreate_stream(width, height).await {
+            Ok(node) => {
+                // The source was actually recreated: report the new node so
+                // the caller rebinds the capture pipeline to it.
+                Some((width, height, Some(node)))
+            }
+            Err(_e) => {
+                tracing::warn!(
+                    "[kwin-virtual] resize to {width}x{height} failed: {_e} — keeping current stream"
+                );
+                let cur = self.streams.read().await;
+                cur.first().map(|s| (s.width as u16, s.height as u16, None))
+            }
         }
-        Some((width, height))
     }
 
     fn clipboard_source(&self) -> ClipboardSource {

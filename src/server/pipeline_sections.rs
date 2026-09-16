@@ -113,20 +113,44 @@ impl LamcoDisplayHandler {
             req_width, req_height
         );
         match session.resize_capture_source(req_width, req_height).await {
-            Some((w, h)) => {
+            // new_node is Some ONLY when the source was actually recreated.
+            // On the size-match short-circuit (None) the live stream MUST
+            // NOT be destroyed: it is bound to the zkde virtual output and
+            // tearing it down removes the only enabled output (the physical
+            // one is disabled by the layout guard) — plasmashell falls to
+            // its placeholder screen and the session streams all-zero
+            // buffers forever (black screen on a healthy pipeline).
+            Some((_w, _h, Some(new_node))) => {
                 // Rebind the PipeWire stream to the new node.
-                // resize_capture_source already updated the session's
-                // stream table; fetch the fresh node.
+                let old_node = self.capture_node.load(std::sync::atomic::Ordering::Relaxed);
                 let streams = session.streams();
                 if let Some(s) = streams.first() {
-                    let old_node = self.capture_node.load(std::sync::atomic::Ordering::Relaxed);
-                    self.rebind_capture_node(old_node, s.node_id, s.width, s.height)
+                    self.rebind_capture_node(old_node, new_node, s.width, s.height)
                         .await;
+                } else {
+                    self.rebind_capture_node(
+                        old_node,
+                        new_node,
+                        u32::from(req_width),
+                        u32::from(req_height),
+                    )
+                    .await;
                 }
                 // Record capture truth; desktop stays at the client's
                 // request (the stored size is updated by
                 // request_initial_size on the next activation).
-                info!("Elastic capture resized: source now delivers {}x{}", w, h);
+                info!(
+                    "Elastic capture resized: source now delivers {}x{} (node {})",
+                    _w, _h, new_node
+                );
+            }
+            Some((_w, _h, None)) => {
+                // Size-match short-circuit or resize failure with a live
+                // stream: nothing was recreated, keep the stream untouched.
+                info!(
+                    "Elastic capture: source already delivers {}x{} — stream untouched",
+                    _w, _h
+                );
             }
             None => {
                 warn!(

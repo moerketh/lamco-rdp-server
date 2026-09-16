@@ -4894,15 +4894,34 @@ impl RdpServerDisplay for LamcoDisplayHandler {
                     .resize_capture_source(client_size.width, client_size.height)
                     .await
                 {
-                    Some((w, h)) => {
-                        // Rebind the PipeWire stream to the (new) node of the
-                        // resized virtual output before the first frame flows.
+                    // new_node is Some ONLY when the resize actually recreated
+                    // the capture source. On the kwin-virtual path the live
+                    // PipeWire stream is bound to the zkde virtual output:
+                    // destroying it tears the output down, and with the
+                    // physical output disabled by the layout guard that
+                    // leaves ZERO enabled outputs — plasmashell falls back to
+                    // its placeholder screen and the session streams
+                    // all-zero buffers forever (black screen on a healthy
+                    // pipeline; observed 2026-09-16 as a same-node
+                    // destroy+recreate during the size-match short-circuit).
+                    // So: rebind ONLY when a genuinely new node exists.
+                    Some((_w, _h, Some(new_node))) => {
+                        let old_node =
+                            self.capture_node.load(std::sync::atomic::Ordering::Relaxed);
                         let streams = session.streams();
                         if let Some(s) = streams.first() {
-                            let old_node =
-                                self.capture_node.load(std::sync::atomic::Ordering::Relaxed);
-                            self.rebind_capture_node(old_node, s.node_id, s.width, s.height)
+                            self.rebind_capture_node(old_node, new_node, s.width, s.height)
                                 .await;
+                        } else {
+                            // New node reported but no stream info: rebind by
+                            // the reported node with the requested size.
+                            self.rebind_capture_node(
+                                old_node,
+                                new_node,
+                                u32::from(client_size.width),
+                                u32::from(client_size.height),
+                            )
+                            .await;
                         }
                         // Adopt the client's size WITHOUT signaling a
                         // resize: the activation is being negotiated at
@@ -4910,8 +4929,20 @@ impl RdpServerDisplay for LamcoDisplayHandler {
                         self.adopt_size_silently(client_size.width, client_size.height)
                             .await;
                         info!(
-                            "request_initial_size: adopted client desktop {}x{} via elastic capture (source delivers {}x{})",
-                            client_size.width, client_size.height, w, h
+                            "request_initial_size: adopted client desktop {}x{} via elastic capture (source recreated at {}x{}, node {})",
+                            client_size.width, client_size.height, _w, _h, new_node
+                        );
+                        return client_size;
+                    }
+                    // Size-match short-circuit (or resize failure): the
+                    // existing stream is live and healthy — DO NOT destroy
+                    // it. Adopt the size and let frames flow.
+                    Some((_w, _h, None)) => {
+                        self.adopt_size_silently(client_size.width, client_size.height)
+                            .await;
+                        info!(
+                            "request_initial_size: adopted client desktop {}x{} — capture source already at size ({}x{}), stream untouched",
+                            client_size.width, client_size.height, _w, _h
                         );
                         return client_size;
                     }
