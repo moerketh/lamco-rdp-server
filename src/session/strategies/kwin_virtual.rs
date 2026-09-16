@@ -245,16 +245,24 @@ impl SessionHandle for KwinVirtualSessionHandle {
     }
 
     async fn release_after_client(&self) {
+        // RESTORE THE PHYSICAL OUTPUTS *BEFORE* CLOSING THE STREAM.
+        //
+        // The stream close destroys the zkde virtual output. The previous
+        // order (close first, guard drop second) opened a guaranteed
+        // zero-outputs window on every disconnect: KWin tore the only
+        // enabled output down while Virtual-1 was still disabled, and
+        // plasmashell processed that before the guard's re-enable landed —
+        // Qt fell to its placeholder screen and NEVER re-latched, so every
+        // session after the first disconnect was a black screen with
+        // frames flowing (field-observed 2026-09-16). Restoring first
+        // turns the close into a plain output change for plasmashell.
+        if let Some(guard) = self.layout_guard.write().await.take() {
+            drop(guard);
+        }
         // Close the stream — KWin destroys the virtual output on stream
         // close (the crate's manager sends Close and destroys the proxy).
         self.wl.read().await.close_stream().await;
         self.streams.write().await.clear();
-        // Restore the physical outputs — the console must come back the
-        // moment the client is gone (also on abnormal paths: drop order
-        // guarantees the guard runs even if the release sequence errors).
-        if let Some(guard) = self.layout_guard.write().await.take() {
-            drop(guard);
-        }
         info!("[kwin-virtual] stream closed — virtual output removed, physical outputs restored");
     }
 

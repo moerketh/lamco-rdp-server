@@ -54,15 +54,16 @@ lamco-rdp-clipboard = "0.5.0"
 # shape fields; kwin-virtual: zkde-screencast virtual-output machinery.
 # Pinned by rev (IronRDP house pattern): reproducible vendored release
 # tarballs; bump via `cargo update -p hyperv-rdp-extras` after re-pinning.
-# a645934: guard settles 750ms before disabling physical outputs —
-# plasmashell otherwise processes the physical removal before binding the
-# new virtual output, falls to its placeholder screen, and never re-latches
-# (desktop renders into the placeholder; virtual output scans out empty;
-# frames flow with zero damage — black client).
+# b8a3c35: guard Drop verifies the physical re-enable (a bounced enable
+# raced the virtual output's teardown and left the machine headless;
+# plasmashell fell to its placeholder and never re-latched - every later
+# session black). Includes a645934: guard settles 750ms before disabling
+# physical outputs (plasmashell otherwise processes the removal before
+# binding the new output - placeholder, never re-latches).
 # 7e3a027 (superseded): kscreen parser handles KWin >= 6.7 uuid-suffixed
 # output names (the guard previously treated its own virtual output as
 # physical and every disable bounced - black screen under KWin 6.7.x).
-hyperv-rdp-extras = { git = "https://github.com/moerketh/hyperv-rdp-extras", rev = "a64593479fb9436215b6a385bde624fdfb2af854", default-features = false, features = ["geometry", "transport", "cursor", "kwin-virtual"] }
+hyperv-rdp-extras = { git = "https://github.com/moerketh/hyperv-rdp-extras", rev = "b8a3c351e08fd8b4be2b2a09ae29d09027f53765", default-features = false, features = ["geometry", "transport", "cursor", "kwin-virtual"] }
 
 # -----------------------------------------------------------------------------
 # Async runtime
