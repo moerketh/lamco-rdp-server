@@ -1869,6 +1869,26 @@ impl LamcoDisplayHandler {
             let mut first_frame_received = false;
             let mut zero_frame_reported = false;
 
+            // Blank-capture detection state (DmaBuf read-as-zeros): frames
+            // DELIVER but their content is uniform — the zero-CONTENT sibling
+            // of the zero-frame condition. See the check next to
+            // `first_frame_received = true` below.
+            let mut blank_frame_streak: u32 = 0;
+            let mut saw_real_content = false;
+            let mut blank_capture_reported = false;
+            let blank_frame_streak_threshold: u32 = 30;
+            fn buffer_is_uniform(data: &[u8]) -> bool {
+                if data.is_empty() {
+                    return true;
+                }
+                let first = data[0];
+                // Sample ~4096 bytes spread across the buffer: enough to
+                // distinguish any real desktop (gradients, panels, text)
+                // from a zero-filled or single-value mapping.
+                let step = (data.len() / 4096).max(1);
+                data.iter().step_by(step).all(|&b| b == first)
+            }
+
             // EGFX readiness timeout: if EGFX hasn't become ready within 5 seconds
             // of the first PipeWire frame, assume the client doesn't support DVC or
             // EGFX negotiation failed. Bypass the EGFX gate and deliver frames via
@@ -2313,6 +2333,73 @@ impl LamcoDisplayHandler {
                         // Mark that we've received at least one frame
                         first_frame_received = true;
 
+                        // Blank-capture detection: on some virtual-GPU +
+                        // compositor stacks (measured live 2026-09-16:
+                        // hyperv_drm + KWin 6.7.4 zkde-screencast) the
+                        // negotiated DmaBuf buffers DELIVER frames whose CPU
+                        // copy reads back all zeros (the PipeWire block lacks
+                        // SPA_DATA_FLAG_MAPPABLE — the copy is out of
+                        // contract) while the output itself renders real
+                        // content: pixel-diff then sees zero damage forever
+                        // and the client gets a black screen on a pipeline
+                        // that logs as healthy. One-shot remedy, mirroring
+                        // the zero-frame fallback: if a streak of frames at
+                        // the start of a connection is uniformly blank while
+                        // a client is connected, flip to MemFd and rebind.
+                        // Any non-uniform frame latches saw_real_content and
+                        // the check never runs again this connection.
+                        if !saw_real_content
+                            && !blank_capture_reported
+                            && handler
+                                .client_active
+                                .load(std::sync::atomic::Ordering::Relaxed)
+                        {
+                            let uniform = match f.data() {
+                                Some(arc) => buffer_is_uniform(arc),
+                                None => true,
+                            };
+                            if uniform {
+                                blank_frame_streak += 1;
+                                if blank_frame_streak >= blank_frame_streak_threshold {
+                                    blank_capture_reported = true;
+                                    tracing::warn!(
+                                        streak = blank_frame_streak,
+                                        "Capture delivers uniform (all-zero) frames while a client is connected — DmaBuf copy is reading zeros"
+                                    );
+                                    let was_dmabuf = handler
+                                        .use_dmabuf
+                                        .swap(false, std::sync::atomic::Ordering::AcqRel);
+                                    if was_dmabuf {
+                                        let node = handler
+                                            .capture_node
+                                            .load(std::sync::atomic::Ordering::Relaxed);
+                                        let size = handler.size.read().await.clone();
+                                        tracing::warn!(
+                                            node,
+                                            width = size.width,
+                                            height = size.height,
+                                            "Falling back to MemFd buffers and rebinding stream"
+                                        );
+                                        handler
+                                            .rebind_capture_node(
+                                                node,
+                                                node,
+                                                u32::from(size.width),
+                                                u32::from(size.height),
+                                            )
+                                            .await;
+                                        // Never replay the blank cached
+                                        // frame to the next EGFX init — the
+                                        // rebind's first real frame
+                                        // repopulates the cache.
+                                        cached_frame = None;
+                                    }
+                                }
+                            } else {
+                                saw_real_content = true;
+                            }
+                        }
+
                         // Finalize deferred resize using the frame's actual
                         // dimensions (set by PipeWire param_changed negotiation)
                         if pending_resize {
@@ -2398,6 +2485,9 @@ impl LamcoDisplayHandler {
                             egfx_gate_bypassed = false;
                             first_frame_received = false;
                             zero_frame_reported = false;
+                            blank_frame_streak = 0;
+                            saw_real_content = false;
+                            blank_capture_reported = false;
                             frames_sent = 0;
                             frames_dropped = 0;
                             frames_paced = 0;
@@ -2451,6 +2541,9 @@ impl LamcoDisplayHandler {
                             egfx_gate_bypassed = false;
                             first_frame_received = false;
                             zero_frame_reported = false;
+                            blank_frame_streak = 0;
+                            saw_real_content = false;
+                            blank_capture_reported = false;
                             frames_sent = 0;
                             frames_dropped = 0;
                             frames_paced = 0;
