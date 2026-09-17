@@ -92,7 +92,20 @@ void *lamco_x264_create(uint32_t width, uint32_t height, uint32_t fps,
     param.i_fps_den = 1;
     param.rc.i_qp_min = (int)qp_min;
     param.rc.i_qp_max = (int)qp_max;
-    param.i_threads = (int)threads;
+    /* Threading: zerolatency pins i_threads=1 (no frame delay). Re-raising
+     * i_threads WITHOUT sliced threading would switch x264 to FRAME
+     * threading: the first N encoded frames (including the connect-time IDR
+     * on a static desktop, which may be the ONLY frame for minutes) sit in
+     * the thread pipeline and x264_encoder_encode returns 0 output — the
+     * client gets an EGFX surface and never a single video frame. Sliced
+     * threading keeps the parallelism with per-frame synchronous output. */
+    if (threads > 1) {
+        param.i_threads = (int)threads;
+        param.b_sliced_threads = 1;
+    } else {
+        param.i_threads = 1;
+        param.b_sliced_threads = 0;
+    }
     param.i_keyint_max = 1000;
     param.i_keyint_min = 1000;
     param.i_scenecut_threshold = 0;
