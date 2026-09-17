@@ -251,19 +251,36 @@ impl SessionHandle for KwinVirtualSessionHandle {
     }
 
     async fn release_after_client(&self) {
-        // RESTORE THE PHYSICAL OUTPUTS *BEFORE* CLOSING THE STREAM.
+        // RESTORE THE PHYSICAL OUTPUTS *BEFORE* CLOSING THE STREAM — and
+        // SETTLE between the two.
         //
-        // The stream close destroys the zkde virtual output. The previous
-        // order (close first, guard drop second) opened a guaranteed
-        // zero-outputs window on every disconnect: KWin tore the only
-        // enabled output down while Virtual-1 was still disabled, and
-        // plasmashell processed that before the guard's re-enable landed —
-        // Qt fell to its placeholder screen and NEVER re-latched, so every
-        // session after the first disconnect was a black screen with
-        // frames flowing (field-observed 2026-09-16). Restoring first
-        // turns the close into a plain output change for plasmashell.
-        if let Some(guard) = self.layout_guard.write().await.take() {
-            drop(guard);
+        // The stream close destroys the zkde virtual output. KWin applies
+        // the physical re-enable instantly, but clients bind the
+        // re-announced wl_output ASYNCHRONOUSLY — closing the virtual
+        // output in the same breath can beat that bind: Qt sees zero
+        // outputs, creates its placeholder screen, and (KWin 6.7-era
+        // shells) never re-latches. Every reconnect after such a teardown
+        // renders a dead shell (field-observed on resolution-change
+        // disconnects). guard.finish() restores AND settles (750ms,
+        // mirroring the engage settle) so the removal becomes a plain
+        // output change for plasmashell.
+        {
+            let mut guard_slot = self.layout_guard.write().await;
+            if let Some(guard) = guard_slot.take() {
+                // The handle is the guard's only share (diagnostic readers
+                // clone-and-drop); try_unwrap yields the owned guard so
+                // finish() can restore+settle. On a stray clone, fall back
+                // to Drop-only restore (no settle — logged, not silent).
+                match std::sync::Arc::try_unwrap(guard) {
+                    Ok(mut owned) => owned.finish().await,
+                    Err(shared) => {
+                        tracing::warn!(
+                            "[kwin-virtual] guard still shared at release — restoring without settle"
+                        );
+                        drop(shared);
+                    }
+                }
+            }
         }
         // Close the stream — KWin destroys the virtual output on stream
         // close (the crate's manager sends Close and destroys the proxy).
