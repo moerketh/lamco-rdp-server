@@ -1882,6 +1882,17 @@ impl LamcoDisplayHandler {
             // positive guards are the saw_real_content latch plus the
             // was_dmabuf check below — not the streak length.
             let blank_frame_streak_threshold: u32 = 3;
+            // Frozen-capture detection (DmaBuf copy stuck at frame N): frames
+            // DELIVER at full rate but the CPU copy never changes, so
+            // pixel-diff finds zero damage forever and the encoder starves —
+            // the frozen-image sibling of the blank-frame condition. The
+            // discriminator from a genuinely static desktop: damage-driven
+            // capture goes SILENT when nothing changes (PipeWire pauses the
+            // stream); a continuous 60fps frame flow with zero detected
+            // damage for this many consecutive frames cannot be a live
+            // desktop — the copy is stale.
+            let mut frozen_capture_streak: u32 = 0;
+            let mut frozen_capture_streak_threshold: u32 = 150;
             fn buffer_is_uniform(data: &[u8]) -> bool {
                 if data.is_empty() {
                     return true;
@@ -2502,6 +2513,8 @@ impl LamcoDisplayHandler {
                             blank_frame_streak = 0;
                             saw_real_content = false;
                             blank_capture_reported = false;
+                            frozen_capture_streak = 0;
+                            frozen_capture_streak_threshold = 150;
                             frames_sent = 0;
                             frames_dropped = 0;
                             frames_paced = 0;
@@ -2558,6 +2571,8 @@ impl LamcoDisplayHandler {
                             blank_frame_streak = 0;
                             saw_real_content = false;
                             blank_capture_reported = false;
+                            frozen_capture_streak = 0;
+                            frozen_capture_streak_threshold = 150;
                             frames_sent = 0;
                             frames_dropped = 0;
                             frames_paced = 0;
@@ -4006,6 +4021,55 @@ impl LamcoDisplayHandler {
 
                         if damage_regions.is_empty() {
                             frames_skipped_damage += 1;
+                            // Frozen-capture check: this frame HAD no damage.
+                            // Count it toward the frozen streak only while a
+                            // client is connected and DmaBuf is active — the
+                            // remedy is the DmaBuf→MemFd flip. Any damaged
+                            // frame resets the streak (see the send path).
+                            if handler
+                                .client_active
+                                .load(std::sync::atomic::Ordering::Relaxed)
+                                && handler
+                                    .use_dmabuf
+                                    .load(std::sync::atomic::Ordering::Acquire)
+                            {
+                                frozen_capture_streak += 1;
+                                if frozen_capture_streak >= frozen_capture_streak_threshold {
+                                    let was_dmabuf = handler
+                                        .use_dmabuf
+                                        .swap(false, std::sync::atomic::Ordering::AcqRel);
+                                    if was_dmabuf {
+                                        tracing::warn!(
+                                            streak = frozen_capture_streak,
+                                            "Frames flow at full rate but pixel-diff has found zero damage — the DmaBuf CPU copy is frozen"
+                                        );
+                                        let node = handler
+                                            .capture_node
+                                            .load(std::sync::atomic::Ordering::Relaxed);
+                                        let size = handler.size.read().await.clone();
+                                        tracing::warn!(
+                                            node,
+                                            width = size.width,
+                                            height = size.height,
+                                            "Falling back to MemFd buffers and rebinding stream (frozen-copy remedy)"
+                                        );
+                                        handler
+                                            .rebind_capture_node(
+                                                node,
+                                                node,
+                                                u32::from(size.width),
+                                                u32::from(size.height),
+                                            )
+                                            .await;
+                                        // Drop the frozen cached frame: the
+                                        // rebind's first MemFd frame
+                                        // repopulates it.
+                                        cached_frame = None;
+                                    }
+                                    // One-shot per connection regardless.
+                                    frozen_capture_streak_threshold = u32::MAX;
+                                }
+                            }
                             if frames_skipped_damage.is_multiple_of(100)
                                 && let Some(ref detector) = damage_detector_opt
                             {
@@ -4026,6 +4090,9 @@ impl LamcoDisplayHandler {
                         // the accumulation debt is cleared (it was merged into
                         // damage_regions above).
                         accumulated_damage.clear();
+                        // Live damage: the capture copy is provably not
+                        // frozen — reset the frozen-capture streak.
+                        frozen_capture_streak = 0;
                         if should_log_telemetry {
                             last_telemetry_log = std::time::Instant::now();
                             if let Some(ref detector) = damage_detector_opt {
