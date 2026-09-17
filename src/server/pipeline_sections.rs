@@ -108,6 +108,15 @@ impl LamcoDisplayHandler {
         let Some(session) = elastic else {
             return false;
         };
+        // 16-align the resize target for the same reason as
+        // request_initial_size: the H.264 surface is aligned, and a
+        // non-aligned desktop lets the surface overhang — the client stops
+        // FrameAcknowledging and the flow controller throttles the session
+        // black.
+        let req_width =
+            crate::egfx::align_to_16(u32::from(req_width)).min(u32::from(u16::MAX)) as u16;
+        let req_height =
+            crate::egfx::align_to_16(u32::from(req_height)).min(u32::from(u16::MAX)) as u16;
         info!(
             "Elastic capture: recreating virtual output at {}x{}",
             req_width, req_height
