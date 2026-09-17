@@ -1905,6 +1905,37 @@ impl LamcoDisplayHandler {
                 data.iter().step_by(step).all(|&b| b == first)
             }
 
+            /// Blackness ratio over a BGRA buffer: fraction of sampled
+            /// pixels that are EXACTLY (0,0,0). A defective DmaBuf read on
+            /// this stack delivers an all-black image that often carries a
+            /// few stale non-black fragments — plain uniformity misses it
+            /// and latches saw_real_content. >=0.9 black is not a desktop.
+            fn buffer_black_ratio(data: &[u8]) -> f64 {
+                const BYTES_PER_PX: usize = 4;
+                if data.len() < BYTES_PER_PX {
+                    return 1.0;
+                }
+                // Sample every ~1024th pixel, spread across the buffer.
+                let px_count = data.len() / BYTES_PER_PX;
+                let step_px = (px_count / 1024).max(1);
+                let stride = step_px * BYTES_PER_PX;
+                let mut black = 0u64;
+                let mut total = 0u64;
+                let mut off = 0;
+                while off + BYTES_PER_PX <= data.len() {
+                    if data[off] == 0 && data[off + 1] == 0 && data[off + 2] == 0 {
+                        black += 1;
+                    }
+                    total += 1;
+                    off += stride;
+                }
+                if total == 0 {
+                    1.0
+                } else {
+                    black as f64 / total as f64
+                }
+            }
+
             // EGFX readiness timeout: if EGFX hasn't become ready within 5 seconds
             // of the first PipeWire frame, assume the client doesn't support DVC or
             // EGFX negotiation failed. Bypass the EGFX gate and deliver frames via
@@ -2371,7 +2402,7 @@ impl LamcoDisplayHandler {
                                 .load(std::sync::atomic::Ordering::Relaxed)
                         {
                             let uniform = match f.data() {
-                                Some(arc) => buffer_is_uniform(arc),
+                                Some(arc) => buffer_black_ratio(arc) >= 0.9,
                                 None => true,
                             };
                             if uniform {
@@ -4091,8 +4122,18 @@ impl LamcoDisplayHandler {
                         // damage_regions above).
                         accumulated_damage.clear();
                         // Live damage: the capture copy is provably not
-                        // frozen — reset the frozen-capture streak.
-                        frozen_capture_streak = 0;
+                        // frozen — but only SUBSTANTIAL damage counts. Tiny
+                        // regions (a blinking cursor, a clock) legitimately
+                        // appear on a wedged capture's stale patch and must
+                        // not reset the frozen-capture streak.
+                        const FROZEN_RESET_MIN_AREA: u64 = 8_100; // ~90x90 px
+                        let damaged_area: u64 = damage_regions
+                            .iter()
+                            .map(|r| u64::from(r.width) * u64::from(r.height))
+                            .sum();
+                        if damaged_area >= FROZEN_RESET_MIN_AREA {
+                            frozen_capture_streak = 0;
+                        }
                         if should_log_telemetry {
                             last_telemetry_log = std::time::Instant::now();
                             if let Some(ref detector) = damage_detector_opt {

@@ -191,6 +191,25 @@ impl LamcoDisplayHandler {
         {
             let backend = self.config.egfx.encoder_backend.to_lowercase();
             if backend == "x264" || backend == "auto" {
+                // ABI probe FIRST: the constructor defers dlopen to the
+                // first encode, so without this gate x264 gets selected on
+                // systems whose libx264 build (soname/X264_BUILD) differs
+                // from the vendored headers — every encode then fails
+                // InitFailed and the session is a black screen with no
+                // WARN until the first frame dies. Probe loudly instead.
+                if !X264Encoder::abi_available() {
+                    warn!(
+                        "x264 backend unavailable: this system's libx264 build does not match the compiled ABI gate (soname/open-symbol). \
+                         Falling back to OpenH264 — install a libx264 matching the build the server was compiled against to re-enable x264"
+                    );
+                    if backend == "x264" {
+                        // Explicit selection: the operator asked for x264
+                        // specifically. Still fall back (a working session
+                        // outranks the preference) but say it louder.
+                        warn!("encoder_backend=x264 was requested explicitly — running on the OpenH264 fallback");
+                    }
+                    return None;
+                }
                 match X264Encoder::new(config.clone()) {
                     Ok(mut encoder) => {
                         encoder.set_diagnostics(diagnostics.clone());

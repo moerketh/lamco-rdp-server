@@ -41,6 +41,29 @@ static void *load_symbol(void *library, const char *name) {
     return dlsym(library, name);
 }
 
+/* Selection-time probe: verifies the exact-ABI soname AND open symbol are
+ * loadable on THIS system, without building an encoder. Returns 1 when the
+ * backend can run, 0 when the ABI gate rejects the installed libx264 build.
+ * Callers use this to fall back to another backend BEFORE a session depends
+ * on x264 — the failure is loud (selector logs it) instead of a black
+ * screen. */
+int lamco_x264_probe(void) {
+    const char *names[] = {LAMCO_X264_SONAME, "libx264.so"};
+    void *library = NULL;
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
+        library = dlopen(names[i], RTLD_NOW | RTLD_LOCAL);
+        if (library) break;
+    }
+    if (!library) return 0;
+    void *open = load_symbol(library, LAMCO_X264_OPEN_SYMBOL);
+    if (!open) {
+        dlclose(library);
+        return 0;
+    }
+    dlclose(library);
+    return 1;
+}
+
 void *lamco_x264_create(uint32_t width, uint32_t height, uint32_t fps,
                         uint32_t qp_min, uint32_t qp_max, uint32_t threads,
                         uint32_t fullrange) {

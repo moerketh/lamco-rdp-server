@@ -62,6 +62,7 @@ impl X264Picture {
 
 #[cfg(feature = "x264")]
 unsafe extern "C" {
+    fn lamco_x264_probe() -> c_int;
     fn lamco_x264_create(
         width: u32,
         height: u32,
@@ -123,6 +124,22 @@ pub struct X264Encoder {
 unsafe impl Send for X264Encoder {}
 
 impl X264Encoder {
+    /// Selection-time ABI probe: can this system's libx264 be used at all?
+    /// False when the installed build's ABI differs from the vendored
+    /// headers (e.g. soname 165 vs the compiled 164 gate) — the backend
+    /// ladder must fall back to OpenH264 INSTEAD of selecting x264 and
+    /// failing at first encode (which black-screens the session).
+    #[cfg(feature = "x264")]
+    pub fn abi_available() -> bool {
+        // SAFETY: probe only dlopen/dlsym's and closes; no state escapes.
+        unsafe { lamco_x264_probe() == 1 }
+    }
+
+    #[cfg(not(feature = "x264"))]
+    pub fn abi_available() -> bool {
+        false
+    }
+
     pub fn new(config: EncoderConfig) -> EncoderResult<Self> {
         Ok(Self {
             #[cfg(feature = "x264")]
