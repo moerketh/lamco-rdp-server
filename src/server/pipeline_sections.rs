@@ -208,8 +208,8 @@ impl LamcoDisplayHandler {
                 // WARN until the first frame dies. Probe loudly instead.
                 if !X264Encoder::abi_available() {
                     warn!(
-                        "x264 backend unavailable: this system's libx264 build does not match the compiled ABI gate (soname/open-symbol). \
-                         Falling back to OpenH264 — install a libx264 matching the build the server was compiled against to re-enable x264"
+                        "x264 backend unavailable: this system's libx264 build matches none of the vendored ABI instances. \
+                         Falling back to OpenH264 — install a libx264 matching a vendored build (see src/egfx/x264/) to re-enable x264"
                     );
                     if backend == "x264" {
                         // Explicit selection: the operator asked for x264
@@ -219,6 +219,7 @@ impl LamcoDisplayHandler {
                     }
                     return None;
                 }
+                let active_build = X264Encoder::active_build();
                 match X264Encoder::new(config.clone()) {
                     Ok(mut encoder) => {
                         encoder.set_diagnostics(diagnostics.clone());
@@ -227,8 +228,8 @@ impl LamcoDisplayHandler {
                         // zkde hints).
                         encoder.configure_periodic_idr(self.config.egfx.periodic_idr_interval);
                         info!(
-                            "✅ x264 AVC420 encoder initialized for {}×{} ({})",
-                            aligned_width, aligned_height, context
+                            "✅ x264 AVC420 encoder initialized for {}×{} ({}, libx264 build {})",
+                            aligned_width, aligned_height, context, active_build
                         );
                         Some(VideoEncoder::X264(encoder))
                     }

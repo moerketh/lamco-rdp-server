@@ -32,11 +32,31 @@ fn cargo_lock_pkg_version(name: &str) -> String {
 
 fn main() {
     if std::env::var_os("CARGO_FEATURE_X264").is_some() {
+        // Multi-ABI shim: one TU per vendored x264 build (each compiled
+        // against its OWN headers — exact-ABI per path), plus the
+        // dispatcher exposing the unsuffixed public API. Adding a build:
+        // vendor headers under src/egfx/x264/<build>/, add the TU, add it
+        // here and in the dispatcher's backend table.
         cc::Build::new()
             .file("src/egfx/x264_shim.c")
             .warnings(true)
             .compile("lamco_x264_shim");
+        cc::Build::new()
+            .file("src/egfx/x264_164.c")
+            .include("src/egfx")
+            .warnings(true)
+            .compile("lamco_x264_164");
+        cc::Build::new()
+            .file("src/egfx/x264_165.c")
+            .include("src/egfx")
+            .warnings(true)
+            .compile("lamco_x264_165");
         println!("cargo:rerun-if-changed=src/egfx/x264_shim.c");
+        println!("cargo:rerun-if-changed=src/egfx/x264_164.c");
+        println!("cargo:rerun-if-changed=src/egfx/x264_165.c");
+        println!("cargo:rerun-if-changed=src/egfx/x264/x264_shim_impl.h");
+        println!("cargo:rerun-if-changed=src/egfx/x264/164/x264.h");
+        println!("cargo:rerun-if-changed=src/egfx/x264/165/x264.h");
     }
 
     let date_output = run_command("date", &["+%Y-%m-%d"], "unknown");

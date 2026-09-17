@@ -63,6 +63,7 @@ impl X264Picture {
 #[cfg(feature = "x264")]
 unsafe extern "C" {
     fn lamco_x264_probe() -> c_int;
+    fn lamco_x264_active_build() -> c_int;
     fn lamco_x264_create(
         width: u32,
         height: u32,
@@ -133,6 +134,15 @@ impl X264Encoder {
     pub fn abi_available() -> bool {
         // SAFETY: probe only dlopen/dlsym's and closes; no state escapes.
         unsafe { lamco_x264_probe() == 1 }
+    }
+
+    /// The x264 build the dispatcher selected (164, 165, ...). Zero when
+    /// none matched. Diagnostic: the selector logs this at backend choice
+    /// so support can see which vendored ABI instance is in play.
+    #[cfg(feature = "x264")]
+    pub fn active_build() -> u32 {
+        // SAFETY: returns a plain integer; no state.
+        unsafe { lamco_x264_active_build().max(0) as u32 }
     }
 
     #[cfg(not(feature = "x264"))]
