@@ -5087,12 +5087,35 @@ impl RdpServerDisplay for LamcoDisplayHandler {
             *s
         };
 
-        if client_size == current {
+        // SIZE-STATE vs LIVE-CAPTURE: `self.size` is the handler's belief;
+        // after session churn (mid-session restarts, wedged swaps, guard
+        // repairs) it can disagree with the actual zkde virtual output
+        // (state says 1366x768 while the compositor still scans out
+        // 1920x1200 — field-observed: the short-circuit skipped the resize,
+        // the encoder then read a 1920-wide buffer at 1376 stride, and the
+        // client rendered black on a fully acking pipeline). Only skip the
+        // resize when the LIVE stream agrees with both the state AND the
+        // request.
+        let live = {
+            let cap = self.capture_size.read().await;
+            DesktopSize {
+                width: cap.0.min(u32::from(u16::MAX)) as u16,
+                height: cap.1.min(u32::from(u16::MAX)) as u16,
+            }
+        };
+        if client_size == current && live.width > 0 && live == current {
             info!(
-                "request_initial_size: client requested {}x{} — matches current desktop",
+                "request_initial_size: client requested {}x{} — matches current desktop and live capture",
                 client_size.width, client_size.height
             );
             return current;
+        }
+        if client_size == current && live != current {
+            warn!(
+                "request_initial_size: size state {}x{} disagrees with live capture {}x{} — forcing resize to {}x{}",
+                current.width, current.height, live.width, live.height,
+                client_size.width, client_size.height
+            );
         }
 
         // Elastic capture (kwin-virtual): recreate the compositor-side virtual
