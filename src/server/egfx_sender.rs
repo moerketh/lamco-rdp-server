@@ -648,20 +648,23 @@ impl EgfxFrameSender {
         };
 
         let mut regions = if is_full_frame_update(damage_regions, display_width, display_height) {
-            // Full-frame regions must cover the 16-aligned encoded bitstream,
-            // but MUST NOT overhang the client's virtual desktop: the client
-            // validates metablock rects against the desktop dimensions, and
-            // an overhanging rect is what starved FrameAcknowledge on
-            // unaligned sizes (surface aligned 1376 vs desktop 1366: the
-            // full-frame rect ran to x=1375 > desktop width). Clamp to the
-            // DESKTOP rect — the padded encode content beyond it is never
-            // referenced, so leaving it out of the metablock is correct.
-            vec![Avc420Region::full_frame(display_width, display_height, self.qp())]
+            // Full-frame regions MUST cover the 16-ALIGNED encoded bitstream
+            // (MS-RDPEGFX: the client blits the metablock over the surface;
+            // a rect smaller than the bitstream leaves the tail unclaimed
+            // and the client stalls — measured: 3 frames in 16s with egfx:0
+            // against an AVC-capable client when this was clamped to the
+            // unaligned desktop width).
+            vec![Avc420Region::full_frame(
+                encoded_width,
+                encoded_height,
+                self.qp(),
+            )]
         } else {
             damage_regions_to_avc420(damage_regions, display_width, display_height, self.qp())
-                // Partial regions: clamp each to the desktop rect too — the
-                // 16-expansion in damage_regions_to_avc420 can push a rect
-                // past the desktop edge by up to one macroblock.
+                // Partial regions: clamp each to the desktop rect — the
+                // 16-expansion can push a rect past the desktop edge by up
+                // to one macroblock, and rects beyond the client's virtual
+                // desktop are never acked.
                 .into_iter()
                 .map(|mut r| {
                     r.right = r.right.min(u32::from(display_width).saturating_sub(1) as u16);
