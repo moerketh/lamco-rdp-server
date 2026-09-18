@@ -2358,7 +2358,30 @@ impl LamcoDisplayHandler {
 
                         // Always cache the latest frame for replay on EGFX init.
                         // Clone is cheap: VideoFrame.data is Arc<Vec<u8>>.
-                        cached_frame = Some(f.clone());
+                        // BLANK-FRAME GUARD: a uniformly-black frame is not
+                        // a desktop — it is a fault signature (DmaBuf
+                        // zeros, off-origin output, placeholder shell).
+                        // Caching it poisons the NEXT connection's init
+                        // replay: the new client's first frame is the stale
+                        // blank/wrong-size one (field-observed on a
+                        // reconnect: 1920x1200 cached frame replayed to a
+                        // 1366x768 client after the resize had been adopted
+                        // — half-painted screen). Only cache when the frame
+                        // carries real content OR no client is connected
+                        // (the console desktop between sessions can be
+                        // legitimately dark, and there is no replay
+                        // consumer to poison until a client arrives; the
+                        // arriving client's own frames repopulate).
+                        let frame_is_blank = f.data().is_some_and(|d| {
+                            buffer_black_ratio(d) >= 0.9
+                        });
+                        if !frame_is_blank
+                            || !handler
+                                .client_active
+                                .load(std::sync::atomic::Ordering::Relaxed)
+                        {
+                            cached_frame = Some(f.clone());
+                        }
                         last_frame_time = std::time::Instant::now();
 
                         // Track PTS intervals for heartbeat diagnostics
@@ -2447,8 +2470,51 @@ impl LamcoDisplayHandler {
                                     } else {
                                         info!(
                                             streak = blank_frame_streak,
-                                            "Capture delivers uniformly blank frames over MemFd — a genuinely empty desktop, not a fault"
+                                            "Capture delivers uniformly blank frames over MemFd — checking desktop layout before declaring an empty desktop"
                                         );
+                                        // LAYOUT HEAL (one-shot per
+                                        // connection): a uniformly blank
+                                        // capture over WORKING buffers is
+                                        // the signature of a compositor-
+                                        // side layout fault, not an empty
+                                        // desktop: KWin >= 6.7 parks the
+                                        // virtual output off-origin
+                                        // (stale side-by-side position,
+                                        // never normalized) and plasmashell
+                                        // maps its desktop containment to
+                                        // the wrong screen — nothing is
+                                        // rendered into the captured
+                                        // output while the frame pipeline
+                                        // logs fully healthy (measured
+                                        // live on Plasma 6.7.4: 327/330
+                                        // frames acked, client black; a
+                                        // wedged plasmashell placeholder
+                                        // produces the same signature).
+                                        // The elastic session's heal
+                                        // normalizes the output to (0,0)
+                                        // and restarts plasmashell; the
+                                        // next frames carry the real
+                                        // desktop. saw_real_content stays
+                                        // false so recovery is observable;
+                                        // if the heal fixes it, the very
+                                        // next frame latches it true.
+                                        let elastic = {
+                                            let hook =
+                                                self.elastic_capture.read().clone();
+                                            hook
+                                        };
+                                        if let Some(session) = elastic {
+                                            tracing::warn!(
+                                                streak = blank_frame_streak,
+                                                "Blank capture over working buffers with an elastic session — healing output layout (origin normalize + shell restart)"
+                                            );
+                                            let healed =
+                                                session.heal_output_layout().await;
+                                            tracing::info!(
+                                                healed,
+                                                "Output layout heal issued"
+                                            );
+                                        }
                                     }
                                 }
                             } else {

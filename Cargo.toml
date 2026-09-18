@@ -68,7 +68,14 @@ lamco-rdp-clipboard = "0.5.0"
 # physical output - placeholder, never re-latches on KWin 6.7-era
 # shells); engage adopts connected-but-disabled outputs so a headless
 # entry can no longer wedge the console forever.
-hyperv-rdp-extras = { git = "https://github.com/moerketh/hyperv-rdp-extras", rev = "09ac7d4", default-features = false, features = ["geometry", "transport", "cursor", "kwin-virtual"] }
+# 473a7a6: virtual output normalized to the ORIGIN after create (delayed
+# past the retiring output's settle-close) and after the guard's physical
+# disables - KWin >= 6.7 parks a new virtual output beside disabled
+# outputs' stale geometry and never normalizes (6.3 did); plasmashell
+# maps its desktop to the wrong screen and the capture is genuinely
+# blank on a healthy pipeline. Adds heal_output_layout (origin normalize
+# + plasmashell restart) for the fork's blank-capture recovery.
+hyperv-rdp-extras = { git = "https://github.com/moerketh/hyperv-rdp-extras", rev = "473a7a6", default-features = false, features = ["geometry", "transport", "cursor", "kwin-virtual"] }
 
 # -----------------------------------------------------------------------------
 # Async runtime

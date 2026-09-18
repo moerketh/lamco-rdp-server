@@ -332,7 +332,6 @@ async fn main() -> Result<()> {
     // clipboard/PipeWire tasks.
     let shutdown_broadcast = server.shutdown_broadcast();
     let disconnect_handle = server.error_info_disconnect_handle();
-    let display_handler = std::sync::Arc::clone(server.display_handler());
 
     tokio::spawn(async move {
         // Operator-initiated stop: "disconnection initiated by an

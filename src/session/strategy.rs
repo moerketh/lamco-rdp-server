@@ -86,6 +86,21 @@ pub trait SessionHandle: Send + Sync {
 
     fn session_type(&self) -> SessionType;
 
+    /// One-shot compositor-side layout heal: re-normalize the capture
+    /// output's screen layout (position at origin, restart the shell if
+    /// it wedged on its placeholder screen).
+    ///
+    /// Called by the display handler's blank-capture recovery: frames
+    /// flow and the client acks, but the capture is uniformly blank
+    /// because the desktop renders into the wrong screen (KWin >= 6.7
+    /// off-origin virtual output / plasmashell placeholder wedge).
+    ///
+    /// Returns `false` when this strategy has no layout to heal (all
+    /// non-kwin-virtual strategies; default impl).
+    async fn heal_output_layout(&self) -> bool {
+        false
+    }
+
     // === Input Injection Methods ===
 
     async fn notify_keyboard_keycode(&self, keycode: i32, pressed: bool) -> Result<()>;

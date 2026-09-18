@@ -133,6 +133,14 @@ impl SessionHandle for KwinVirtualSessionHandle {
         SessionType::KwinVirtual
     }
 
+    /// Layout heal for the kwin-virtual strategy: normalize the virtual
+    /// output to the origin and restart plasmashell if it wedged (crate
+    /// helper). Triggered by the display handler's blank-capture
+    /// recovery — see the detector's commentary for the full chain.
+    async fn heal_output_layout(&self) -> bool {
+        hyperv_rdp_extras::session::heal_output_layout(VIRTUAL_OUTPUT_KSCREEN_NAME).await
+    }
+
     async fn notify_keyboard_keycode(&self, keycode: i32, pressed: bool) -> Result<()> {
         self.libei.notify_keyboard_keycode(keycode, pressed).await
     }
