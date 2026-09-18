@@ -5096,29 +5096,13 @@ impl RdpServerDisplay for LamcoDisplayHandler {
         }
 
         // Elastic capture (kwin-virtual): recreate the compositor-side virtual
-        // output at a 16-ALIGNED size derived from the client's request. The
-        // H.264 surface is always 16-aligned; when the desktop is not, the
-        // surface overhangs the negotiated desktop and mstsc never sends
-        // FrameAcknowledge — the flow controller throttles to a trickle and
-        // the session renders black on a fully healthy pipeline (measured:
-        // 1366x768 / 1400x1050 / 1680x1050 requests black-screened with an
-        // ack-starvation throttle loop; aligned 1920x1200 never did).
-        // Aligning HERE makes desktop == capture == surface by construction;
-        // the client gets a desktop a few pixels larger than asked
-        // (client-side rescale, harmless).
-        let requested_size = client_size;
-        let aligned_w = crate::egfx::align_to_16(u32::from(requested_size.width));
-        let aligned_h = crate::egfx::align_to_16(u32::from(requested_size.height));
-        let client_size = DesktopSize {
-            width: aligned_w.min(u32::from(u16::MAX)) as u16,
-            height: aligned_h.min(u32::from(u16::MAX)) as u16,
-        };
-        if client_size != requested_size {
-            info!(
-                "request_initial_size: client requested {}x{} — aligning desktop to {}x{} so the H.264 surface cannot overhang the negotiated desktop (ack-starvation guard)",
-                requested_size.width, requested_size.height, client_size.width, client_size.height
-            );
-        }
+        // output at the client's EXACT requested size. The H.264 surface is
+        // 16-aligned with a zero-padded encode (pad_frame_to_aligned), and
+        // the metablock rects are CLAMPED to this desktop rect in the EGFX
+        // sender — rects overhanging the client's virtual desktop are what
+        // starved FrameAcknowledge (the earlier desktop-side alignment
+        // avoided the overhang but the client blits 1:1, clipping the
+        // taskbar: aligned-desktop-into-unaligned-window is not viable).
         {
             let hook = self.elastic_capture.read().clone();
             if let Some(session) = hook {
