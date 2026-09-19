@@ -1879,11 +1879,20 @@ impl LamcoDisplayHandler {
             let mut saw_real_content = false;
             let mut blank_capture_reported = false;
             let mut layout_heals_issued: u32 = 0;
+            // When the last layout heal was issued (grace-window anchor).
+            let mut last_layout_heal_at = std::time::Instant::now();
             // Layout-heal budget: each heal restarts plasmashell — an
             // unfixable fault must not restart-loop the user's desktop.
             // 2 covers the observed failure (first heal races the popup
             // path; the second lands after the shell has settled).
             const MAX_LAYOUT_HEALS: u32 = 2;
+            // Grace after a heal before another may fire: plasmashell's
+            // restart + desktop repaint takes tens of seconds (observed:
+            // popup-at-1680x1050 heal painted fully ~40s after the restart
+            // began). A fresh streak inside this window is the heal's own
+            // transient, not a new fault.
+            const LAYOUT_HEAL_GRACE: std::time::Duration =
+                std::time::Duration::from_secs(45);
             // 3, not 30: on a wedged capture the damage refresh delivers
             // ~one frame per MINUTE, so a 30-frame streak means a half
             // hour of black screen before the remedy fires. The false-
@@ -2461,9 +2470,28 @@ impl LamcoDisplayHandler {
                                     hook
                                 };
                                 if let Some(session) = elastic {
-                                    if layout_heals_issued < MAX_LAYOUT_HEALS {
+                                    // GRACE after a heal: the heal restarts
+                                    // plasmashell — the desktop goes dark,
+                                    // then repaints over several seconds
+                                    // (observed: popup of the restart itself
+                                    // can re-blank the capture while the
+                                    // shell settles). Re-triggering on the
+                                    // heal's OWN transient blank burns the
+                                    // budget on a second restart before the
+                                    // first has finished painting. Wait out
+                                    // a grace window (and require frames to
+                                    // be flowing again) before counting a
+                                    // fresh streak.
+                                    let in_heal_grace = layout_heals_issued > 0
+                                        && last_layout_heal_at.elapsed()
+                                            < LAYOUT_HEAL_GRACE;
+                                    if !in_heal_grace
+                                        && layout_heals_issued < MAX_LAYOUT_HEALS
+                                    {
                                         layout_heals_issued += 1;
                                         consecutive_blank_frames = 0;
+                                        last_layout_heal_at =
+                                            std::time::Instant::now();
                                         tracing::warn!(
                                             streak = blank_frame_streak_threshold,
                                             heals = layout_heals_issued,
@@ -2481,10 +2509,10 @@ impl LamcoDisplayHandler {
                                         // repopulates the cache.
                                         cached_frame = None;
                                     }
-                                    // At the heal budget: no further action.
-                                    // A restart loop would thrash the
-                                    // desktop; the heals count above says
-                                    // everything the journal needs.
+                                    // At the heal budget or in grace: no
+                                    // action. A restart loop would thrash
+                                    // the desktop; the heals count above
+                                    // says everything the journal needs.
                                 } else if !blank_capture_reported {
                                     // Non-elastic: classic one-shot DmaBuf
                                     // remedy (blank_capture_reported keeps
