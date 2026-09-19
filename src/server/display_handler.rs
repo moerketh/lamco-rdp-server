@@ -2936,7 +2936,23 @@ impl LamcoDisplayHandler {
                         let legacy_gate_settled =
                             !egfx_ready && session_start.elapsed() > egfx_timeout;
                         if client_waiting && needs_init && (egfx_ready || legacy_gate_settled) {
-                            if let Some(ref cached) = cached_frame {
+                            // SIZE GUARD: only replay a cached frame that matches
+                            // the CURRENT desktop. A stale frame from a previous
+                            // connection at another size (e.g. 1920x1200 cached
+                            // while the server idled, new client at 1680x1050)
+                            // carries region rects beyond the new surface — the
+                            // client rejects the frame (FreeRDP:
+                            // is_within_surface -> ERROR_INVALID_DATA 13), the
+                            // EGFX channel wedges with zero acks, and the session
+                            // never shows anything. The elastic resize creates
+                            // the new source BEFORE this gate runs, so comparing
+                            // against the live capture size is correct.
+                            let live = handler.size.read().await.clone();
+                            let size_matches = cached_frame.as_ref().is_some_and(|c| {
+                                c.width == u32::from(live.width)
+                                    && c.height == u32::from(live.height)
+                            });
+                            if let (Some(cached), true) = (cached_frame.as_ref(), size_matches) {
                                 if legacy_gate_settled {
                                     first_frame_received = true;
                                     info!(
@@ -2951,8 +2967,24 @@ impl LamcoDisplayHandler {
                                 }
                                 cached.clone()
                             } else {
-                                // No cached frame yet (server just started, PipeWire
-                                // hasn't delivered any frames). Wait for first frame.
+                                if let Some(ref cached) = cached_frame.as_ref().filter(|c| {
+                                    c.width != u32::from(live.width)
+                                        || c.height != u32::from(live.height)
+                                }) {
+                                    // One log per connection (needs_init clears on
+                                    // the next live frame): say WHY nothing is
+                                    // replayed, or the skip looks like a hang.
+                                    info!(
+                                        "📦 Cached frame ({}x{}, frame {}) predates the resize to {}x{} — skipping replay, waiting for the first live frame",
+                                        cached.width,
+                                        cached.height,
+                                        cached.frame_id,
+                                        live.width,
+                                        live.height
+                                    );
+                                }
+                                // No size-matching cached frame — wait for the
+                                // first live frame from the new source.
                                 tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
                                 continue;
                             }
