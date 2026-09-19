@@ -1996,16 +1996,15 @@ impl LamcoDisplayHandler {
             // plus the heal budget / was_dmabuf check — not the streak
             // length.
             let blank_frame_streak_threshold: u32 = 3;
-            // Missing-panel streak: the floating-windows fault persists
+            // Missing-panel tracking: the floating-windows fault persists
             // indefinitely, but a desktop mid-relayout can briefly have an
-            // unpainted bottom strip (fullscreen windows legitimately
-            // cover it — but then the strip is not BLACK, it is window
-            // content). Require ~2s of consecutively all-black strips on
-            // frames that HAVE content elsewhere before concluding the
-            // panel is missing. At damage-driven cadence that is far
-            // below any legit transient.
-            let mut panel_missing_streak: u32 = 0;
-            const PANEL_MISSING_STREAK_THRESHOLD: u32 = 120;
+            // unpainted bottom strip. TIME-based, not count-based: an idle
+            // wedged desktop is damage-driven — frames arrive only on
+            // cursor blinks (~2fps) — so a 120-FRAME bar would take ~60s
+            // to clear before the ~40s heal even starts. A sustained
+            // window measured on the wall clock (same 3s as blankness)
+            // fires regardless of frame cadence.
+            let mut panel_missing_since: Option<std::time::Instant> = None;
             // Frozen-capture detection (DmaBuf copy stuck at frame N): frames
             // DELIVER at full rate but the CPU copy never changes, so
             // pixel-diff finds zero damage forever and the encoder starves —
@@ -2560,6 +2559,7 @@ impl LamcoDisplayHandler {
                             // bottom strips on non-uniform frames with the
                             // SAME heal path/budget/grace as blankness.
                             let panel_missing = if uniform {
+                                panel_missing_since = None;
                                 false
                             } else {
                                 let strip_black = match f.data() {
@@ -2569,15 +2569,19 @@ impl LamcoDisplayHandler {
                                     None => false,
                                 };
                                 if strip_black {
-                                    panel_missing_streak += 1;
+                                    panel_missing_since.get_or_insert_with(std::time::Instant::now);
                                 } else {
-                                    panel_missing_streak = 0;
+                                    panel_missing_since = None;
                                 }
                                 strip_black
                             };
                             let panel_missing_sustained = panel_missing
-                                && panel_missing_streak
-                                    >= PANEL_MISSING_STREAK_THRESHOLD;
+                                && panel_missing_since.is_some_and(|t| {
+                                    t.elapsed()
+                                        >= std::time::Duration::from_millis(
+                                            LAYOUT_HEAL_BLANK_MS,
+                                        )
+                                });
                             // Sustained-blank clock for the layout heal:
                             // how long the CURRENT consecutive-blank streak
                             // has lasted (0 when not blanking).
@@ -2626,7 +2630,7 @@ impl LamcoDisplayHandler {
                                         layout_heals_issued += 1;
                                         consecutive_blank_frames = 0;
                                         blank_streak_started_at = None;
-                                        panel_missing_streak = 0;
+                                        panel_missing_since = None;
                                         last_layout_heal_at =
                                             std::time::Instant::now();
                                         tracing::warn!(
