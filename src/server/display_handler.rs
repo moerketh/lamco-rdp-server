@@ -1442,6 +1442,83 @@ impl LamcoDisplayHandler {
         }
     }
 
+    /// Blackness ratio over a BGRA buffer: fraction of sampled
+    /// pixels that are EXACTLY (0,0,0). A defective DmaBuf read on
+    /// this stack delivers an all-black image that often carries a
+    /// few stale non-black fragments — plain uniformity misses it
+    /// and latches saw_real_content. >=0.9 black is not a desktop.
+    fn buffer_black_ratio(data: &[u8]) -> f64 {
+        const BYTES_PER_PX: usize = 4;
+        if data.len() < BYTES_PER_PX {
+            return 1.0;
+        }
+        // Sample every ~1024th pixel, spread across the buffer.
+        let px_count = data.len() / BYTES_PER_PX;
+        let step_px = (px_count / 1024).max(1);
+        let stride = step_px * BYTES_PER_PX;
+        let mut black = 0u64;
+        let mut total = 0u64;
+        let mut off = 0;
+        while off + BYTES_PER_PX <= data.len() {
+            if data[off] == 0 && data[off + 1] == 0 && data[off + 2] == 0 {
+                black += 1;
+            }
+            total += 1;
+            off += stride;
+        }
+        if total == 0 {
+            1.0
+        } else {
+            black as f64 / total as f64
+        }
+    }
+
+    /// Bottom-strip panel check over a TIGHT-stride BGRA buffer
+    /// (run AFTER stride compaction): true when every sampled
+    /// pixel in the bottom ~4.5% of the frame is exactly black.
+    ///
+    /// A laid-out KDE desktop always paints its panel into that
+    /// strip — measured across healthy sessions at 1366x768,
+    /// 1680x1050 and 1920x1200 the strip carries 13-100%
+    /// non-black pixels (panel, taskmanager, clock). The
+    /// "floating windows on black" plasmashell fault leaves it
+    /// EXACTLY zero while windows elsewhere keep the frame
+    /// non-uniform — the blank detector cannot see that state,
+    /// this one can.
+    fn bottom_strip_all_black(data: &[u8], width: u32, height: u32) -> bool {
+        const BYTES_PER_PX: usize = 4;
+        if width == 0 || height == 0 {
+            return false;
+        }
+        let stride = width as usize * BYTES_PER_PX;
+        let strip_h = (height as usize / 22).max(1); // bottom ~4.5%
+        let y_start = height as usize - strip_h;
+        // Sample ~1000 pixels of the strip: every ~4th px of every
+        // other strip row — enough that ANY panel, taskmanager
+        // entry or clock breaks the all-black verdict.
+        let x_step = (width as usize / 250).max(1);
+        let mut black = 0u64;
+        let mut total = 0u64;
+        for row in 0..strip_h {
+            if row % 2 != 0 {
+                continue;
+            }
+            let base = (y_start + row) * stride;
+            if base + stride > data.len() {
+                break;
+            }
+            let mut off = base;
+            while off + BYTES_PER_PX <= base + stride {
+                if data[off] == 0 && data[off + 1] == 0 && data[off + 2] == 0 {
+                    black += 1;
+                }
+                total += 1;
+                off += x_step * BYTES_PER_PX;
+            }
+        }
+        total > 0 && black == total
+    }
+
     /// Periodically re-emit `PointerPosition` at the cursor strategy's
     /// predicted position, so Predictive mode keeps advancing between raw
     /// cursor samples rather than only moving when a fresh compositor frame
@@ -1919,6 +1996,16 @@ impl LamcoDisplayHandler {
             // plus the heal budget / was_dmabuf check — not the streak
             // length.
             let blank_frame_streak_threshold: u32 = 3;
+            // Missing-panel streak: the floating-windows fault persists
+            // indefinitely, but a desktop mid-relayout can briefly have an
+            // unpainted bottom strip (fullscreen windows legitimately
+            // cover it — but then the strip is not BLACK, it is window
+            // content). Require ~2s of consecutively all-black strips on
+            // frames that HAVE content elsewhere before concluding the
+            // panel is missing. At damage-driven cadence that is far
+            // below any legit transient.
+            let mut panel_missing_streak: u32 = 0;
+            const PANEL_MISSING_STREAK_THRESHOLD: u32 = 120;
             // Frozen-capture detection (DmaBuf copy stuck at frame N): frames
             // DELIVER at full rate but the CPU copy never changes, so
             // pixel-diff finds zero damage forever and the encoder starves —
@@ -1940,37 +2027,6 @@ impl LamcoDisplayHandler {
                 // from a zero-filled or single-value mapping.
                 let step = (data.len() / 4096).max(1);
                 data.iter().step_by(step).all(|&b| b == first)
-            }
-
-            /// Blackness ratio over a BGRA buffer: fraction of sampled
-            /// pixels that are EXACTLY (0,0,0). A defective DmaBuf read on
-            /// this stack delivers an all-black image that often carries a
-            /// few stale non-black fragments — plain uniformity misses it
-            /// and latches saw_real_content. >=0.9 black is not a desktop.
-            fn buffer_black_ratio(data: &[u8]) -> f64 {
-                const BYTES_PER_PX: usize = 4;
-                if data.len() < BYTES_PER_PX {
-                    return 1.0;
-                }
-                // Sample every ~1024th pixel, spread across the buffer.
-                let px_count = data.len() / BYTES_PER_PX;
-                let step_px = (px_count / 1024).max(1);
-                let stride = step_px * BYTES_PER_PX;
-                let mut black = 0u64;
-                let mut total = 0u64;
-                let mut off = 0;
-                while off + BYTES_PER_PX <= data.len() {
-                    if data[off] == 0 && data[off + 1] == 0 && data[off + 2] == 0 {
-                        black += 1;
-                    }
-                    total += 1;
-                    off += stride;
-                }
-                if total == 0 {
-                    1.0
-                } else {
-                    black as f64 / total as f64
-                }
             }
 
             // EGFX readiness timeout: if EGFX hasn't become ready within 5 seconds
@@ -2410,7 +2466,7 @@ impl LamcoDisplayHandler {
                         // consumer to poison until a client arrives; the
                         // arriving client's own frames repopulate).
                         let frame_is_blank = f.data().is_some_and(|d| {
-                            buffer_black_ratio(d) >= 0.9
+                            Self::buffer_black_ratio(d) >= 0.9
                         });
                         if !frame_is_blank
                             || !handler
@@ -2474,7 +2530,7 @@ impl LamcoDisplayHandler {
                             .load(std::sync::atomic::Ordering::Relaxed)
                         {
                             let uniform = match f.data() {
-                                Some(arc) => buffer_black_ratio(arc) >= 0.9,
+                                Some(arc) => Self::buffer_black_ratio(arc) >= 0.9,
                                 None => true,
                             };
                             if uniform {
@@ -2487,19 +2543,63 @@ impl LamcoDisplayHandler {
                                 blank_streak_started_at = None;
                                 saw_real_content = true;
                             }
+                            // Missing-panel ("floating windows") detection:
+                            // plasmashell can fail to re-latch its desktop
+                            // containment onto a resized virtual output —
+                            // WINDOWS still render (the frame is far from
+                            // uniformly black, so the blank detector never
+                            // fires) but wallpaper+panel never attach: the
+                            // client sees windows floating on black with no
+                            // taskbar. The discriminating signature is the
+                            // bottom strip (where the KDE panel lives by
+                            // default): a laid-out desktop ALWAYS paints it
+                            // (measured: healthy 1366x768/1680x1050/
+                            // 1920x1200 frames have 13-100% non-black
+                            // pixels in the bottom ~4.5%; the wedged state
+                            // has EXACTLY 0). Track sustained all-black
+                            // bottom strips on non-uniform frames with the
+                            // SAME heal path/budget/grace as blankness.
+                            let panel_missing = if uniform {
+                                false
+                            } else {
+                                let strip_black = match f.data() {
+                                    Some(arc) => {
+                                        Self::bottom_strip_all_black(arc, f.width, f.height)
+                                    }
+                                    None => false,
+                                };
+                                if strip_black {
+                                    panel_missing_streak += 1;
+                                } else {
+                                    panel_missing_streak = 0;
+                                }
+                                strip_black
+                            };
+                            let panel_missing_sustained = panel_missing
+                                && panel_missing_streak
+                                    >= PANEL_MISSING_STREAK_THRESHOLD;
                             // Sustained-blank clock for the layout heal:
                             // how long the CURRENT consecutive-blank streak
                             // has lasted (0 when not blanking).
                             let blank_streak_ms = blank_streak_started_at
                                 .map(|t| t.elapsed().as_millis() as u64)
                                 .unwrap_or(0);
+                            // Either detector's sustained verdict feeds the
+                            // heal gate below.
+                            let sustained_blank = (blank_streak_ms
+                                >= LAYOUT_HEAL_BLANK_MS)
+                                || panel_missing_sustained;
                             // First-paint grace: a connection that has
                             // never seen content may simply be a slow
                             // cold-start paint — only the FIRST_PAINT_GRACE
                             // window's sustained blank justifies a heal.
                             let first_paint_ok = saw_real_content
                                 || session_start.elapsed() > FIRST_PAINT_GRACE;
-                            if consecutive_blank_frames >= blank_frame_streak_threshold {
+                            let heal_due = consecutive_blank_frames
+                                >= blank_frame_streak_threshold
+                                && sustained_blank
+                                && first_paint_ok;
+                            if heal_due {
                                 let elastic = {
                                     let hook = self.elastic_capture.read().clone();
                                     hook
@@ -2520,22 +2620,19 @@ impl LamcoDisplayHandler {
                                     let in_heal_grace = layout_heals_issued > 0
                                         && last_layout_heal_at.elapsed()
                                             < LAYOUT_HEAL_GRACE;
-                                    let sustained_blank = blank_streak_ms
-                                        >= LAYOUT_HEAL_BLANK_MS
-                                        && first_paint_ok;
                                     if !in_heal_grace
-                                        && sustained_blank
                                         && layout_heals_issued < MAX_LAYOUT_HEALS
                                     {
                                         layout_heals_issued += 1;
                                         consecutive_blank_frames = 0;
                                         blank_streak_started_at = None;
+                                        panel_missing_streak = 0;
                                         last_layout_heal_at =
                                             std::time::Instant::now();
                                         tracing::warn!(
                                             streak = blank_frame_streak_threshold,
                                             heals = layout_heals_issued,
-                                            "Blank capture over a working pipeline with an elastic session — healing output layout (origin normalize + shell restart)"
+                                            "Blank or panel-less capture over a working pipeline with an elastic session — healing output layout (origin normalize + shell restart)"
                                         );
                                         let healed =
                                             session.heal_output_layout().await;
@@ -5878,6 +5975,62 @@ fn transpose(data: &[u8], width: u32, height: u32, stride: u32, bpp: u32) -> (Ve
 mod tests {
     use super::*;
     use crate::video::{BitmapData, Rectangle};
+
+    #[test]
+    fn bottom_strip_detects_missing_panel() {
+        // 200x100 BGRA: content in the top half, bottom strip black —
+        // the "floating windows on black" fault signature.
+        let w = 200u32;
+        let h = 100u32;
+        let mut data = vec![0u8; (w * h * 4) as usize];
+        for y in 0..h / 2 {
+            for x in 0..w {
+                let off = ((y * w + x) * 4) as usize;
+                data[off] = 200;
+                data[off + 1] = 150;
+                data[off + 2] = 100;
+            }
+        }
+        assert!(LamcoDisplayHandler::bottom_strip_all_black(&data, w, h));
+    }
+
+    #[test]
+    fn bottom_strip_passes_laid_out_desktop() {
+        // Same frame but with panel pixels in the bottom strip (a panel
+        // bar of non-black across the last rows).
+        let w = 200u32;
+        let h = 100u32;
+        let mut data = vec![0u8; (w * h * 4) as usize];
+        for y in 0..h / 2 {
+            for x in 0..w {
+                let off = ((y * w + x) * 4) as usize;
+                data[off] = 200;
+                data[off + 1] = 150;
+                data[off + 2] = 100;
+            }
+        }
+        // Panel: bottom 5 rows, dark-grey (not black).
+        for y in h - 5..h {
+            for x in 0..w {
+                let off = ((y * w + x) * 4) as usize;
+                data[off] = 40;
+                data[off + 1] = 42;
+                data[off + 2] = 48;
+            }
+        }
+        assert!(!LamcoDisplayHandler::bottom_strip_all_black(&data, w, h));
+    }
+
+    #[test]
+    fn bottom_strip_rejects_uniformly_black_frame() {
+        // Caller contract: the helper is only consulted on NON-uniform
+        // frames, but an all-black frame trivially has an all-black strip
+        // — it must report true (not panic) so a mis-wired call cannot
+        // crash the loop. Zero-size guards report false.
+        let data = vec![0u8; 200 * 100 * 4];
+        assert!(LamcoDisplayHandler::bottom_strip_all_black(&data, 200, 100));
+        assert!(!LamcoDisplayHandler::bottom_strip_all_black(&data, 0, 0));
+    }
 
     #[tokio::test]
     async fn test_pixel_format_conversion() {
