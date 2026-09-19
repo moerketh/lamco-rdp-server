@@ -1869,18 +1869,27 @@ impl LamcoDisplayHandler {
             let mut first_frame_received = false;
             let mut zero_frame_reported = false;
 
-            // Blank-capture detection state (DmaBuf read-as-zeros): frames
-            // DELIVER but their content is uniform — the zero-CONTENT sibling
-            // of the zero-frame condition. See the check next to
-            // `first_frame_received = true` below.
-            let mut blank_frame_streak: u32 = 0;
+            // Blank-capture detection state: frames DELIVER but their
+            // content is uniform — the zero-CONTENT sibling of the
+            // zero-frame condition. Two consumers (see the check next to
+            // `first_frame_received = true` below): the elastic layout
+            // heal (consecutive-blank streak, re-arming, heal-budgeted)
+            // and the classic one-shot DmaBuf MemFd flip.
+            let mut consecutive_blank_frames: u32 = 0;
             let mut saw_real_content = false;
             let mut blank_capture_reported = false;
-            // 3, not 30: on a wedged DmaBuf capture the damage refresh
-            // delivers ~one frame per MINUTE, so a 30-frame streak means a
-            // half hour of black screen before the remedy fires. The false-
-            // positive guards are the saw_real_content latch plus the
-            // was_dmabuf check below — not the streak length.
+            let mut layout_heals_issued: u32 = 0;
+            // Layout-heal budget: each heal restarts plasmashell — an
+            // unfixable fault must not restart-loop the user's desktop.
+            // 2 covers the observed failure (first heal races the popup
+            // path; the second lands after the shell has settled).
+            const MAX_LAYOUT_HEALS: u32 = 2;
+            // 3, not 30: on a wedged capture the damage refresh delivers
+            // ~one frame per MINUTE, so a 30-frame streak means a half
+            // hour of black screen before the remedy fires. The false-
+            // positive guards are the re-arming streak reset on content
+            // plus the heal budget / was_dmabuf check — not the streak
+            // length.
             let blank_frame_streak_threshold: u32 = 3;
             // Frozen-capture detection (DmaBuf copy stuck at frame N): frames
             // DELIVER at full rate but the CPU copy never changes, so
@@ -2403,65 +2412,65 @@ impl LamcoDisplayHandler {
                         // Mark that we've received at least one frame
                         first_frame_received = true;
 
-                        // Blank-capture detection: on some virtual-GPU +
-                        // compositor stacks (measured live 2026-09-16:
-                        // hyperv_drm + KWin 6.7.4 zkde-screencast) the
-                        // negotiated DmaBuf buffers DELIVER frames whose CPU
-                        // copy reads back all zeros (the PipeWire block lacks
-                        // SPA_DATA_FLAG_MAPPABLE — the copy is out of
-                        // contract) while the output itself renders real
-                        // content: pixel-diff then sees zero damage forever
-                        // and the client gets a black screen on a pipeline
-                        // that logs as healthy. One-shot remedy, mirroring
-                        // the zero-frame fallback: if a streak of frames at
-                        // the start of a connection is uniformly blank while
-                        // a client is connected, flip to MemFd and rebind.
-                        // Any non-uniform frame latches saw_real_content and
-                        // the check never runs again this connection.
-                        if !saw_real_content
-                            && !blank_capture_reported
-                            && handler
-                                .client_active
-                                .load(std::sync::atomic::Ordering::Relaxed)
+                        // Blank-capture detection. Two fault families share
+                        // one signature — frames DELIVER, content uniformly
+                        // black — with different remedies:
+                        //
+                        // 1. Compositor-side layout faults (elastic
+                        //    sessions): KWin >= 6.7 parks the virtual
+                        //    output off-origin (stale side-by-side
+                        //    position, never normalized; 6.3 normalized),
+                        //    or plasmashell wedges after virtual-output
+                        //    resize churn — placeholder screen, or the
+                        //    "a new display has been connected" popup path
+                        //    where ONLY the popup renders over an otherwise
+                        //    empty desktop (measured live, Plasma 6.7.4 at
+                        //    1680x1050: 0.982 black, frames acked, the
+                        //    popup the sole content). Remedy: heal the
+                        //    LAYOUT (origin normalize + plasmashell
+                        //    restart). The popup can appear SECONDS after
+                        //    the resize — real content may flow first — so
+                        //    this trigger tracks a CONSECUTIVE-blank streak
+                        //    that re-arms whenever content is seen, bounded
+                        //    to MAX_LAYOUT_HEALS per connection so a heal
+                        //    that cannot fix the fault cannot restart-loop
+                        //    the desktop.
+                        // 2. DmaBuf read-as-zeros (non-elastic): the
+                        //    negotiated DmaBuf CPU copy reads all-zero
+                        //    while the output renders (SPA_DATA_FLAG
+                        //    missing; measured 2026-09-16 on hyperv_drm +
+                        //    KWin 6.7.4 zkde). One-shot remedy: flip to
+                        //    MemFd and rebind.
+                        if handler
+                            .client_active
+                            .load(std::sync::atomic::Ordering::Relaxed)
                         {
                             let uniform = match f.data() {
                                 Some(arc) => buffer_black_ratio(arc) >= 0.9,
                                 None => true,
                             };
                             if uniform {
-                                blank_frame_streak += 1;
-                                if blank_frame_streak >= blank_frame_streak_threshold {
-                                    blank_capture_reported = true;
-                                    // LAYOUT HEAL FIRST (elastic sessions): a
-                                    // uniformly blank capture over a working
-                                    // pipeline is the signature of a
-                                    // compositor-side layout fault — KWin
-                                    // >= 6.7 parks the virtual output
-                                    // off-origin (stale side-by-side
-                                    // position, never normalized; 6.3
-                                    // normalized) or plasmashell wedges on
-                                    // its placeholder screen / "new
-                                    // display" notification path after
-                                    // resize churn (measured live on
-                                    // Plasma 6.7.4: virtual output at
-                                    // (1920,0) with 327/330 frames acked;
-                                    // and a 1680x1050 desktop showing only
-                                    // the display-detected popup at 0.982
-                                    // black ratio). Normalizing the origin
-                                    // + restarting plasmashell fixes the
-                                    // COMPOSITOR; a buffer flip cannot.
-                                    // One-shot per connection
-                                    // (blank_capture_reported), best-effort.
-                                    let elastic = {
-                                        let hook = self.elastic_capture.read().clone();
-                                        hook
-                                    };
-                                    if let Some(session) = elastic {
+                                consecutive_blank_frames += 1;
+                            } else {
+                                consecutive_blank_frames = 0;
+                                saw_real_content = true;
+                            }
+                            if consecutive_blank_frames >= blank_frame_streak_threshold {
+                                let elastic = {
+                                    let hook = self.elastic_capture.read().clone();
+                                    hook
+                                };
+                                if let Some(session) = elastic {
+                                    if layout_heals_issued < MAX_LAYOUT_HEALS {
+                                        layout_heals_issued += 1;
+                                        consecutive_blank_frames = 0;
                                         tracing::warn!(
-                                            streak = blank_frame_streak,
+                                            streak = blank_frame_streak_threshold,
+                                            heals = layout_heals_issued,
                                             "Blank capture over a working pipeline with an elastic session — healing output layout (origin normalize + shell restart)"
                                         );
-                                        let healed = session.heal_output_layout().await;
+                                        let healed =
+                                            session.heal_output_layout().await;
                                         tracing::info!(
                                             healed,
                                             "Output layout heal issued"
@@ -2471,58 +2480,50 @@ impl LamcoDisplayHandler {
                                         // post-heal first real frame
                                         // repopulates the cache.
                                         cached_frame = None;
-                                        // The heal restarts plasmashell;
-                                        // the desktop repaints within
-                                        // seconds. Do NOT also flip buffers
-                                        // here: the capture is not at
-                                        // fault, and a mid-heal rebind would
-                                        // tear down the stream the healed
-                                        // desktop is painting into.
-                                    } else {
-                                        // No elastic session: the classic
-                                        // DmaBuf read-as-zeros remedy. Log
-                                        // the FLIP only when DmaBuf was
-                                        // active — a uniformly-blank desktop
-                                        // over a working MemFd capture with
-                                        // no layout to heal is a genuinely
-                                        // empty desktop, not a fault.
-                                        let was_dmabuf = handler
-                                            .use_dmabuf
-                                            .swap(false, std::sync::atomic::Ordering::AcqRel);
-                                        if was_dmabuf {
-                                            tracing::warn!(
-                                                streak = blank_frame_streak,
-                                                "Capture delivers uniform (all-zero) frames while a client is connected — DmaBuf copy is reading zeros"
-                                            );
-                                            let node = handler
-                                                .capture_node
-                                                .load(std::sync::atomic::Ordering::Relaxed);
-                                            let size = handler.size.read().await.clone();
-                                            tracing::warn!(
+                                    }
+                                    // At the heal budget: no further action.
+                                    // A restart loop would thrash the
+                                    // desktop; the heals count above says
+                                    // everything the journal needs.
+                                } else if !blank_capture_reported {
+                                    // Non-elastic: classic one-shot DmaBuf
+                                    // remedy (blank_capture_reported keeps
+                                    // it to exactly one attempt).
+                                    blank_capture_reported = true;
+                                    let was_dmabuf = handler
+                                        .use_dmabuf
+                                        .swap(false, std::sync::atomic::Ordering::AcqRel);
+                                    if was_dmabuf {
+                                        tracing::warn!(
+                                            streak = consecutive_blank_frames,
+                                            "Capture delivers uniform (all-zero) frames while a client is connected — DmaBuf copy is reading zeros"
+                                        );
+                                        let node = handler
+                                            .capture_node
+                                            .load(std::sync::atomic::Ordering::Relaxed);
+                                        let size = handler.size.read().await.clone();
+                                        tracing::warn!(
+                                            node,
+                                            width = size.width,
+                                            height = size.height,
+                                            "Falling back to MemFd buffers and rebinding stream"
+                                        );
+                                        handler
+                                            .rebind_capture_node(
                                                 node,
-                                                width = size.width,
-                                                height = size.height,
-                                                "Falling back to MemFd buffers and rebinding stream"
-                                            );
-                                            handler
-                                                .rebind_capture_node(
-                                                    node,
-                                                    node,
-                                                    u32::from(size.width),
-                                                    u32::from(size.height),
-                                                )
-                                                .await;
-                                            cached_frame = None;
-                                        } else {
-                                            info!(
-                                                streak = blank_frame_streak,
-                                                "Capture delivers uniformly blank frames over MemFd with no elastic layout to heal — a genuinely empty desktop, not a fault"
-                                            );
-                                        }
+                                                node,
+                                                u32::from(size.width),
+                                                u32::from(size.height),
+                                            )
+                                            .await;
+                                        cached_frame = None;
+                                    } else {
+                                        info!(
+                                            streak = consecutive_blank_frames,
+                                            "Capture delivers uniformly blank frames over MemFd with no elastic layout to heal — a genuinely empty desktop, not a fault"
+                                        );
                                     }
                                 }
-                            } else {
-                                saw_real_content = true;
                             }
                         }
 
@@ -2611,9 +2612,10 @@ impl LamcoDisplayHandler {
                             egfx_gate_bypassed = false;
                             first_frame_received = false;
                             zero_frame_reported = false;
-                            blank_frame_streak = 0;
+                            consecutive_blank_frames = 0;
                             saw_real_content = false;
                             blank_capture_reported = false;
+                            layout_heals_issued = 0;
                             frozen_capture_streak = 0;
                             frozen_capture_streak_threshold = 150;
                             frames_sent = 0;
@@ -2669,9 +2671,10 @@ impl LamcoDisplayHandler {
                             egfx_gate_bypassed = false;
                             first_frame_received = false;
                             zero_frame_reported = false;
-                            blank_frame_streak = 0;
+                            consecutive_blank_frames = 0;
                             saw_real_content = false;
                             blank_capture_reported = false;
+                            layout_heals_issued = 0;
                             frozen_capture_streak = 0;
                             frozen_capture_streak_threshold = 150;
                             frames_sent = 0;
