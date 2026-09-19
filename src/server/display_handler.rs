@@ -1876,6 +1876,7 @@ impl LamcoDisplayHandler {
             // heal (consecutive-blank streak, re-arming, heal-budgeted)
             // and the classic one-shot DmaBuf MemFd flip.
             let mut consecutive_blank_frames: u32 = 0;
+            let mut blank_streak_started_at: Option<std::time::Instant> = None;
             let mut saw_real_content = false;
             let mut blank_capture_reported = false;
             let mut layout_heals_issued: u32 = 0;
@@ -1893,6 +1894,24 @@ impl LamcoDisplayHandler {
             // transient, not a new fault.
             const LAYOUT_HEAL_GRACE: std::time::Duration =
                 std::time::Duration::from_secs(45);
+            // Sustained-blank requirement for the LAYOUT heal. A fresh
+            // virtual output is LEGITIMATELY blank for the first moments
+            // (plasmashell paints it asynchronously, 1-2s), and a 3-frame
+            // streak (~100ms) fired a heal at nearly every session start
+            // (measured on both stacks: 3 heals / 4 sessions on Kali, heal
+            // at +3s on every Parrot session) — a 40s desktop restart per
+            // connect. A genuinely wedged desktop (off-origin output,
+            // placeholder shell) stays uniformly blank for tens of
+            // seconds; 3s separates the two with margin both ways. The
+            // DmaBuf MemFd flip below keeps the 3-frame bar — it is cheap
+            // and cannot thrash.
+            const LAYOUT_HEAL_BLANK_MS: u64 = 3_000;
+            // First-paint grace: if this connection has NEVER seen real
+            // content, allow an unusually long startup paint before
+            // concluding the layout is wedged (cold plasmashell start,
+            // first session after boot — observed painting past 5s).
+            const FIRST_PAINT_GRACE: std::time::Duration =
+                std::time::Duration::from_secs(8);
             // 3, not 30: on a wedged capture the damage refresh delivers
             // ~one frame per MINUTE, so a 30-frame streak means a half
             // hour of black screen before the remedy fires. The false-
@@ -2460,10 +2479,26 @@ impl LamcoDisplayHandler {
                             };
                             if uniform {
                                 consecutive_blank_frames += 1;
+                                blank_streak_started_at.get_or_insert_with(
+                                    std::time::Instant::now,
+                                );
                             } else {
                                 consecutive_blank_frames = 0;
+                                blank_streak_started_at = None;
                                 saw_real_content = true;
                             }
+                            // Sustained-blank clock for the layout heal:
+                            // how long the CURRENT consecutive-blank streak
+                            // has lasted (0 when not blanking).
+                            let blank_streak_ms = blank_streak_started_at
+                                .map(|t| t.elapsed().as_millis() as u64)
+                                .unwrap_or(0);
+                            // First-paint grace: a connection that has
+                            // never seen content may simply be a slow
+                            // cold-start paint — only the FIRST_PAINT_GRACE
+                            // window's sustained blank justifies a heal.
+                            let first_paint_ok = saw_real_content
+                                || session_start.elapsed() > FIRST_PAINT_GRACE;
                             if consecutive_blank_frames >= blank_frame_streak_threshold {
                                 let elastic = {
                                     let hook = self.elastic_capture.read().clone();
@@ -2485,11 +2520,16 @@ impl LamcoDisplayHandler {
                                     let in_heal_grace = layout_heals_issued > 0
                                         && last_layout_heal_at.elapsed()
                                             < LAYOUT_HEAL_GRACE;
+                                    let sustained_blank = blank_streak_ms
+                                        >= LAYOUT_HEAL_BLANK_MS
+                                        && first_paint_ok;
                                     if !in_heal_grace
+                                        && sustained_blank
                                         && layout_heals_issued < MAX_LAYOUT_HEALS
                                     {
                                         layout_heals_issued += 1;
                                         consecutive_blank_frames = 0;
+                                        blank_streak_started_at = None;
                                         last_layout_heal_at =
                                             std::time::Instant::now();
                                         tracing::warn!(
