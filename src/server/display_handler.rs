@@ -2588,21 +2588,23 @@ impl LamcoDisplayHandler {
                             let blank_streak_ms = blank_streak_started_at
                                 .map(|t| t.elapsed().as_millis() as u64)
                                 .unwrap_or(0);
-                            // Either detector's sustained verdict feeds the
-                            // heal gate below.
-                            let sustained_blank = (blank_streak_ms
-                                >= LAYOUT_HEAL_BLANK_MS)
-                                || panel_missing_sustained;
                             // First-paint grace: a connection that has
                             // never seen content may simply be a slow
                             // cold-start paint — only the FIRST_PAINT_GRACE
                             // window's sustained blank justifies a heal.
                             let first_paint_ok = saw_real_content
                                 || session_start.elapsed() > FIRST_PAINT_GRACE;
-                            let heal_due = consecutive_blank_frames
-                                >= blank_frame_streak_threshold
-                                && sustained_blank
-                                && first_paint_ok;
+                            // Each detector qualifies INDEPENDENTLY: the
+                            // blank path needs its frame streak AND wall
+                            // clock; the panel path is wall-clock only (its
+                            // frames are NON-uniform, so the blank streak
+                            // is zero there by construction — gating it on
+                            // the blank streak would make it dead code).
+                            let heal_due = first_paint_ok
+                                && ((consecutive_blank_frames
+                                    >= blank_frame_streak_threshold
+                                    && blank_streak_ms >= LAYOUT_HEAL_BLANK_MS)
+                                    || panel_missing_sustained);
                             if heal_due {
                                 let elastic = {
                                     let hook = self.elastic_capture.read().clone();
