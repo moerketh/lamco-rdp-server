@@ -2005,6 +2005,17 @@ impl LamcoDisplayHandler {
             // window measured on the wall clock (same 3s as blankness)
             // fires regardless of frame cadence.
             let mut panel_missing_since: Option<std::time::Instant> = None;
+            // When the last capture resize (elastic virtual-output recreate)
+            // happened — the heal gate holds off for a settle window after
+            // each resize: plasmashell legitimately takes seconds to re-latch
+            // its desktop containment onto the resized output, and healing
+            // inside that window is actively harmful on KWin 6.3 (the restart
+            // permanently detaches the containment — icons-on-black at every
+            // later size, only a reboot clears it).
+            let mut last_capture_resize_at: std::time::Instant =
+                std::time::Instant::now();
+            const CAPTURE_RESIZE_SETTLE: std::time::Duration =
+                std::time::Duration::from_secs(20);
             // Frozen-capture detection (DmaBuf copy stuck at frame N): frames
             // DELIVER at full rate but the CPU copy never changes, so
             // pixel-diff finds zero damage forever and the encoder starves —
@@ -2274,6 +2285,25 @@ impl LamcoDisplayHandler {
                                     // we requested. We use the frame's negotiated
                                     // width/height to tell the RDP client the truth.
                                     pending_resize = true;
+
+                                    // Reset the blank/panel detector clocks: the
+                                    // resized output legitimately paints blank
+                                    // for seconds while plasmashell re-latches
+                                    // its containment (observed on BOTH stacks:
+                                    // KWin 6.3 and 6.7). Without this reset a
+                                    // heal can fire INSIDE the relayout window
+                                    // — and on KWin 6.3 the plasmashell
+                                    // restart then PERMANENTLY detaches the
+                                    // containment (icons-on-black at every
+                                    // subsequent size). The heal gate below
+                                    // also enforces a settle window after
+                                    // each resize, but resetting here keeps
+                                    // the streaks from counting pre-settle
+                                    // frames at all.
+                                    consecutive_blank_frames = 0;
+                                    blank_streak_started_at = None;
+                                    panel_missing_since = None;
+                                    last_capture_resize_at = std::time::Instant::now();
 
                                     // Reset pipeline encoder state so the first frame
                                     // from the new stream triggers full re-init
@@ -2594,6 +2624,13 @@ impl LamcoDisplayHandler {
                             // window's sustained blank justifies a heal.
                             let first_paint_ok = saw_real_content
                                 || session_start.elapsed() > FIRST_PAINT_GRACE;
+                            // Post-resize settle: never heal inside the
+                            // window where plasmashell is legitimately
+                            // re-latching the resized output (see
+                            // last_capture_resize_at declaration for the
+                            // KWin 6.3 permanent-detachment hazard).
+                            let resize_settled = last_capture_resize_at.elapsed()
+                                >= CAPTURE_RESIZE_SETTLE;
                             // Each detector qualifies INDEPENDENTLY: the
                             // blank path needs its frame streak AND wall
                             // clock; the panel path is wall-clock only (its
@@ -2601,6 +2638,7 @@ impl LamcoDisplayHandler {
                             // is zero there by construction — gating it on
                             // the blank streak would make it dead code).
                             let heal_due = first_paint_ok
+                                && resize_settled
                                 && ((consecutive_blank_frames
                                     >= blank_frame_streak_threshold
                                     && blank_streak_ms >= LAYOUT_HEAL_BLANK_MS)
