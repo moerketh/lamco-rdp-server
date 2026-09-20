@@ -2969,11 +2969,15 @@ impl LamcoDisplayHandler {
                                         >= CAPTURE_RESIZE_SETTLE.as_millis() as u64;
                                 let first_paint_ok = saw_real_content
                                     || session_start.elapsed() > FIRST_PAINT_GRACE;
-                                // The last frame we saw was panel-less, and no
-                                // frame has arrived since (this is the None
-                                // branch): treat the panel-missing streak as
-                                // continuing through the silence.
-                                let last_frame_panel_less = panel_missing_since.is_some();
+                                // The last-seen frame was fault-marked ( EITHER
+                                // a live blank streak or a panel-less streak —
+                                // the popup-only wedge is ~0.98 black and
+                                // latches the BLANK clock, not the panel one),
+                                // and no frame has arrived since (None branch):
+                                // treat the fault as continuing through the
+                                // silence.
+                                let last_frame_faulted = panel_missing_since.is_some()
+                                    || blank_streak_started_at.is_some();
                                 let silent_long_enough = last_frame_time.elapsed()
                                     >= std::time::Duration::from_millis(
                                         LAYOUT_HEAL_BLANK_MS,
@@ -2981,7 +2985,7 @@ impl LamcoDisplayHandler {
                                 if !in_heal_grace
                                     && resize_settled
                                     && first_paint_ok
-                                    && last_frame_panel_less
+                                    && last_frame_faulted
                                     && silent_long_enough
                                 {
                                     layout_heals_issued += 1;
