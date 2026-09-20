@@ -2934,6 +2934,78 @@ impl LamcoDisplayHandler {
                             );
                         }
 
+                        // Frame-silent wedge heal: a panel-less capture goes
+                        // SILENT (zkde is damage-driven; the wedged desktop
+                        // never damages), so the detector in the Some(frame)
+                        // path never evaluates — measured on Kali: the "Display
+                        // Removed" popup leaves the capture stuck, frames stop,
+                        // and no heal ever fires though the client sits on the
+                        // broken image. Evaluate the same heal gate here, from
+                        // the LAST-SEEN frame's signature: if the most recent
+                        // frame was panel-less (or the blank streak was live)
+                        // and the settle/grace windows allow it, heal now.
+                        if handler
+                            .client_active
+                            .load(std::sync::atomic::Ordering::Relaxed)
+                            && layout_heals_issued < MAX_LAYOUT_HEALS
+                            && cached_frame.is_some()
+                        {
+                            let elastic = {
+                                let hook = handler.elastic_capture.read().clone();
+                                hook
+                            };
+                            if let Some(session) = elastic {
+                                let in_heal_grace = layout_heals_issued > 0
+                                    && last_layout_heal_at.elapsed() < LAYOUT_HEAL_GRACE;
+                                let resize_epoch_ms = handler
+                                    .last_capture_resize_epoch_ms
+                                    .load(std::sync::atomic::Ordering::Acquire);
+                                let resize_settled = resize_epoch_ms == 0
+                                    || std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .map(|d| d.as_millis() as u64)
+                                        .unwrap_or(u64::MAX)
+                                        .saturating_sub(resize_epoch_ms)
+                                        >= CAPTURE_RESIZE_SETTLE.as_millis() as u64;
+                                let first_paint_ok = saw_real_content
+                                    || session_start.elapsed() > FIRST_PAINT_GRACE;
+                                // The last frame we saw was panel-less, and no
+                                // frame has arrived since (this is the None
+                                // branch): treat the panel-missing streak as
+                                // continuing through the silence.
+                                let last_frame_panel_less = panel_missing_since.is_some();
+                                let silent_long_enough = last_frame_time.elapsed()
+                                    >= std::time::Duration::from_millis(
+                                        LAYOUT_HEAL_BLANK_MS,
+                                    );
+                                if !in_heal_grace
+                                    && resize_settled
+                                    && first_paint_ok
+                                    && last_frame_panel_less
+                                    && silent_long_enough
+                                {
+                                    layout_heals_issued += 1;
+                                    panel_missing_since = None;
+                                    consecutive_blank_frames = 0;
+                                    blank_streak_started_at = None;
+                                    last_layout_heal_at = std::time::Instant::now();
+                                    tracing::warn!(
+                                        heals = layout_heals_issued,
+                                        silent_ms = last_frame_time
+                                            .elapsed()
+                                            .as_millis() as u64,
+                                        "Panel-less capture went frame-silent — healing output layout from the no-frame path"
+                                    );
+                                    let healed = session.heal_output_layout().await;
+                                    tracing::info!(healed, "Output layout heal issued");
+                                    // The post-heal repaint must reach the
+                                    // client: drop the stale cache so nothing
+                                    // replays the wedged image.
+                                    cached_frame = None;
+                                }
+                            }
+                        }
+
                         // Stall detection: if we previously received frames (cached_frame
                         // exists) and haven't gotten one for 3+ seconds, the stream may be
                         // stuck. Static desktops normally produce no frames (damage-driven),
