@@ -75,7 +75,13 @@ lamco-rdp-clipboard = "0.5.0"
 # maps its desktop to the wrong screen and the capture is genuinely
 # blank on a healthy pipeline. Adds heal_output_layout (origin normalize
 # + plasmashell restart) for the fork's blank-capture recovery.
-hyperv-rdp-extras = { git = "https://github.com/moerketh/hyperv-rdp-extras", rev = "473a7a6", default-features = false, features = ["geometry", "transport", "cursor", "kwin-virtual"] }
+# e9a8da3: heal reattaches orphaned plasmashell containments (the
+# Plasma 6.3 elastic-resize wedge: containment stays glued to the dead
+# screen id after the virtual output is recreated; windows render but
+# wallpaper/panel never attach - a restart did NOT fix 6.3, the
+# evaluateScript reassignment does, instantly). heal_output_layout gains
+# escalate_restart: first heal surgical, restart only on repeat heals.
+hyperv-rdp-extras = { git = "https://github.com/moerketh/hyperv-rdp-extras", rev = "e9a8da3", default-features = false, features = ["geometry", "transport", "cursor", "kwin-virtual"] }
 
 # -----------------------------------------------------------------------------
 # Async runtime
