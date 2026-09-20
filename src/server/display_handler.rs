@@ -538,6 +538,18 @@ pub struct LamcoDisplayHandler {
     /// parking_lot RwLock so the hand-written (sync) Clone impl can copy it.
     pub(crate) elastic_capture:
         parking_lot::RwLock<Option<Arc<dyn crate::session::strategy::SessionHandle>>>,
+
+    /// When the last CAPTURE-SOURCE resize happened (epoch ms, 0 = never).
+    /// `rebind_capture_node` stamps it on every rebind — the elastic resize
+    /// path rebinding to a recreated virtual output included. The frame
+    /// loop's blank/panel detectors read it to hold their layout-heal
+    /// through the post-resize settle window (plasmashell legitimately
+    /// re-latches its containment for seconds after a resize; healing
+    /// inside that window permanently detaches the containment on
+    /// KWin 6.3). Atomic ms since UNIX_EPOCH — Instant cannot live in
+    /// a shared atomic.
+    pub(crate) last_capture_resize_epoch_ms:
+        std::sync::atomic::AtomicU64,
 }
 
 /// Result of pushing one frame's bitmap updates onto the DisplayUpdate
@@ -691,6 +703,7 @@ impl LamcoDisplayHandler {
             #[cfg(feature = "wayland")]
             wayland_observers: WaylandObservers::default(),
             elastic_capture: parking_lot::RwLock::new(None),
+            last_capture_resize_epoch_ms: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -792,6 +805,7 @@ impl LamcoDisplayHandler {
             #[cfg(feature = "wayland")]
             wayland_observers: WaylandObservers::default(),
             elastic_capture: parking_lot::RwLock::new(None),
+            last_capture_resize_epoch_ms: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -957,6 +971,16 @@ impl LamcoDisplayHandler {
         width: u32,
         height: u32,
     ) -> bool {
+        // Stamp the resize epoch: the frame loop's heal gate holds the
+        // layout heal through the post-resize settle window (see
+        // last_capture_resize_epoch_ms on the struct). Every rebind IS a
+        // capture-source change — elastic virtual-output recreation included.
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        self.last_capture_resize_epoch_ms
+            .store(now_ms, std::sync::atomic::Ordering::Release);
         if old_node == new_node {
             // Not a no-op: the re-established session's stream can land on the
             // same node id as the stopped one. The old PipeWire stream is dead,
@@ -2005,15 +2029,14 @@ impl LamcoDisplayHandler {
             // window measured on the wall clock (same 3s as blankness)
             // fires regardless of frame cadence.
             let mut panel_missing_since: Option<std::time::Instant> = None;
-            // When the last capture resize (elastic virtual-output recreate)
-            // happened — the heal gate holds off for a settle window after
-            // each resize: plasmashell legitimately takes seconds to re-latch
-            // its desktop containment onto the resized output, and healing
-            // inside that window is actively harmful on KWin 6.3 (the restart
-            // permanently detaches the containment — icons-on-black at every
-            // later size, only a reboot clears it).
-            let mut last_capture_resize_at: std::time::Instant =
-                std::time::Instant::now();
+            // Post-resize settle window (see
+            // last_capture_resize_epoch_ms on the struct for why the heal
+            // must not fire while plasmashell re-latches a resized
+            // output). The epoch is stamped by rebind_capture_node on
+            // EVERY capture-source change (the elastic resize path
+            // included — a frame-loop-local reset missed it, measured:
+            // heal fired 14s after an elastic resize that never touched
+            // the local clock).
             const CAPTURE_RESIZE_SETTLE: std::time::Duration =
                 std::time::Duration::from_secs(20);
             // Frozen-capture detection (DmaBuf copy stuck at frame N): frames
@@ -2303,7 +2326,6 @@ impl LamcoDisplayHandler {
                                     consecutive_blank_frames = 0;
                                     blank_streak_started_at = None;
                                     panel_missing_since = None;
-                                    last_capture_resize_at = std::time::Instant::now();
 
                                     // Reset pipeline encoder state so the first frame
                                     // from the new stream triggers full re-init
@@ -2627,10 +2649,18 @@ impl LamcoDisplayHandler {
                             // Post-resize settle: never heal inside the
                             // window where plasmashell is legitimately
                             // re-latching the resized output (see
-                            // last_capture_resize_at declaration for the
-                            // KWin 6.3 permanent-detachment hazard).
-                            let resize_settled = last_capture_resize_at.elapsed()
-                                >= CAPTURE_RESIZE_SETTLE;
+                            // last_capture_resize_epoch_ms for the KWin 6.3
+                            // permanent-detachment hazard).
+                            let resize_epoch_ms = handler
+                                .last_capture_resize_epoch_ms
+                                .load(std::sync::atomic::Ordering::Acquire);
+                            let resize_settled = resize_epoch_ms == 0
+                                || std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_millis() as u64)
+                                    .unwrap_or(u64::MAX)
+                                    .saturating_sub(resize_epoch_ms)
+                                    >= CAPTURE_RESIZE_SETTLE.as_millis() as u64;
                             // Each detector qualifies INDEPENDENTLY: the
                             // blank path needs its frame streak AND wall
                             // clock; the panel path is wall-clock only (its
@@ -5800,6 +5830,10 @@ impl Clone for LamcoDisplayHandler {
             wayland_observers: self.wayland_observers.clone(),
             capture_size: Arc::clone(&self.capture_size),
             elastic_capture: parking_lot::RwLock::new(self.elastic_capture.read().clone()),
+            last_capture_resize_epoch_ms: std::sync::atomic::AtomicU64::new(
+                self.last_capture_resize_epoch_ms
+                    .load(std::sync::atomic::Ordering::Acquire),
+            ),
         }
     }
 }
