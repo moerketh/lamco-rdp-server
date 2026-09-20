@@ -87,17 +87,23 @@ pub trait SessionHandle: Send + Sync {
     fn session_type(&self) -> SessionType;
 
     /// One-shot compositor-side layout heal: re-normalize the capture
-    /// output's screen layout (position at origin, restart the shell if
-    /// it wedged on its placeholder screen).
+    /// output's screen layout (position at origin, reattach orphaned
+    /// desktop containments, escalate to a shell restart on repeat
+    /// heals).
     ///
-    /// Called by the display handler's blank-capture recovery: frames
-    /// flow and the client acks, but the capture is uniformly blank
-    /// because the desktop renders into the wrong screen (KWin >= 6.7
-    /// off-origin virtual output / plasmashell placeholder wedge).
+    /// Called by the display handler's blank/panel-less capture
+    /// recovery: frames flow and the client acks, but the capture is
+    /// blank or panel-less because the desktop renders into the wrong
+    /// screen (KWin >= 6.7 off-origin virtual output, Plasma 6.3
+    /// orphaned containment, wedged plasmashell placeholder).
+    ///
+    /// `escalate_restart`: the kwin-virtual strategy restarts
+    /// plasmashell only when true — reserve it for faults the surgical
+    /// path (origin + containment reattach) could not fix.
     ///
     /// Returns `false` when this strategy has no layout to heal (all
     /// non-kwin-virtual strategies; default impl).
-    async fn heal_output_layout(&self) -> bool {
+    async fn heal_output_layout(&self, _escalate_restart: bool) -> bool {
         false
     }
 

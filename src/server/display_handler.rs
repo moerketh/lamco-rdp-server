@@ -2706,10 +2706,16 @@ impl LamcoDisplayHandler {
                                         tracing::warn!(
                                             streak = blank_frame_streak_threshold,
                                             heals = layout_heals_issued,
-                                            "Blank or panel-less capture over a working pipeline with an elastic session — healing output layout (origin normalize + shell restart)"
+                                            "Blank or panel-less capture over a working pipeline with an elastic session — healing output layout (origin normalize + containment reattach)"
                                         );
+                                        // First heal is surgical (origin +
+                                        // containment reattach, instant); a
+                                        // REPEAT heal means the surgical
+                                        // path could not fix it — escalate
+                                        // with the plasmashell restart.
+                                        let escalate = layout_heals_issued > 1;
                                         let healed =
-                                            session.heal_output_layout().await;
+                                            session.heal_output_layout(escalate).await;
                                         tracing::info!(
                                             healed,
                                             "Output layout heal issued"
@@ -3000,7 +3006,12 @@ impl LamcoDisplayHandler {
                                             .as_millis() as u64,
                                         "Panel-less capture went frame-silent — healing output layout from the no-frame path"
                                     );
-                                    let healed = session.heal_output_layout().await;
+                                    // Same escalation policy as the
+                                    // frame-driven path: surgical first,
+                                    // restart only on repeat heals.
+                                    let escalate = layout_heals_issued > 1;
+                                    let healed =
+                                        session.heal_output_layout(escalate).await;
                                     tracing::info!(healed, "Output layout heal issued");
                                     // The post-heal repaint must reach the
                                     // client: drop the stale cache so nothing
