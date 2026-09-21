@@ -1988,13 +1988,20 @@ impl LamcoDisplayHandler {
             // 2 covers the observed failure (first heal races the popup
             // path; the second lands after the shell has settled).
             const MAX_LAYOUT_HEALS: u32 = 2;
-            // Grace after a heal before another may fire: plasmashell's
-            // restart + desktop repaint takes tens of seconds (observed:
-            // popup-at-1680x1050 heal painted fully ~40s after the restart
-            // began). A fresh streak inside this window is the heal's own
-            // transient, not a new fault.
+            // Grace after a heal before the ESCALATED (restart) heal may
+            // fire. Historical 45s was sized for restart-transient
+            // re-blanking of the OLD restart-first heal. Since r30 heal
+            // #1 is surgical (no process kill — nothing goes transiently
+            // blank), the grace now only paces the escalation decision:
+            // if the desktop is STILL faulted 8s after a surgical heal,
+            // the surgical path could not fix it (measured Kali 6.7:
+            // containment never orphans there, reattach is a no-op, only
+            // the restart restores — at 45s the escalation never got a
+            // chance inside any realistic session). The restart's own
+            // post-restart repaint blanking is absorbed by the detector's
+            // 3s sustained window + this 8s grace on any FURTHER heal.
             const LAYOUT_HEAL_GRACE: std::time::Duration =
-                std::time::Duration::from_secs(45);
+                std::time::Duration::from_secs(8);
             // Sustained-blank requirement for the LAYOUT heal. A fresh
             // virtual output is LEGITIMATELY blank for the first moments
             // (plasmashell paints it asynchronously, 1-2s), and a 3-frame
