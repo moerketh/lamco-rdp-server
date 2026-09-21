@@ -2037,8 +2037,21 @@ impl LamcoDisplayHandler {
             // included — a frame-loop-local reset missed it, measured:
             // heal fired 14s after an elastic resize that never touched
             // the local clock).
+            //
+            // 6s, not the historical 20: the window existed to keep the
+            // OLD restart-based heal out of the relayout window (a
+            // restart inside it permanently detaches Plasma 6.3
+            // containment). Since r30 the FIRST heal is surgical
+            // (origin normalize + containment reattach — no process
+            // kill), and the restart escalation only becomes possible
+            // after a heal + its 45s grace, i.e. never inside this
+            // window. 6s covers the observed legit relayout (~2-3s,
+            // both stacks) with margin; a desktop still panel-less at
+            // +6s heals at ~+9s (6s settle + 3s sustained detector)
+            // instead of ~+23s (measured Kali 6.7: fault heal at +20s
+            // was the sole "slow to render" the user reported).
             const CAPTURE_RESIZE_SETTLE: std::time::Duration =
-                std::time::Duration::from_secs(20);
+                std::time::Duration::from_secs(6);
             // Frozen-capture detection (DmaBuf copy stuck at frame N): frames
             // DELIVER at full rate but the CPU copy never changes, so
             // pixel-diff finds zero damage forever and the encoder starves —
