@@ -2718,8 +2718,6 @@ impl LamcoDisplayHandler {
                                         && layout_heals_issued < MAX_LAYOUT_HEALS
                                     {
                                         layout_heals_issued += 1;
-                                        consecutive_blank_frames = 0;
-                                        blank_streak_started_at = None;
                                         // First heal is surgical (origin +
                                         // containment reattach, instant); a
                                         // REPEAT heal means the surgical
@@ -2727,24 +2725,33 @@ impl LamcoDisplayHandler {
                                         // with the plasmashell restart.
                                         let escalate = layout_heals_issued > 1;
                                         // ESCALATION CARRY: on the SURGICAL
-                                        // heal (heal #1) the panel clock is
-                                        // deliberately NOT reset. If the
-                                        // surgical path cannot fix the fault
-                                        // (Kali 6.7: containment never
-                                        // orphans, reattach is a no-op), the
-                                        // capture goes frame-silent with the
-                                        // fault still live — resetting the
-                                        // clock here meant no detector could
-                                        // ever requalify and the restart
-                                        // escalation was unreachable
-                                        // (measured k35: heal#1 at +9s, then
-                                        // nothing, client sat black).
+                                        // heal (heal #1) the fault clocks
+                                        // are deliberately NOT reset — BOTH
+                                        // of them. k36 measured the residual
+                                        // deadlock: on Kali 6.7 the fault
+                                        // signature is the BLANK streak
+                                        // (uniform black frames — the panel
+                                        // clock never latches there), the
+                                        // surgical heal reset it, and the
+                                        // post-heal frame-silence left NO
+                                        // live clock for the no-frame
+                                        // detector to see (k35's carry only
+                                        // preserved the panel clock).
+                                        // Carrying both lets a still-faulted
+                                        // silence qualify heal #2 (restart)
+                                        // after the 8s grace; real content
+                                        // re-arms everything (the streak
+                                        // resets on content in the Some(frame)
+                                        // path, the strip check clears the
+                                        // panel clock per-frame).
                                         // After a RESTART heal (escalated)
-                                        // the clock MUST clear: the restart
-                                        // itself transiently panel-lesses
-                                        // the desktop and re-detecting that
+                                        // the clocks MUST clear: the restart
+                                        // itself transiently blanks the
+                                        // desktop and re-detecting that
                                         // would burn the budget pointlessly.
                                         if escalate {
+                                            consecutive_blank_frames = 0;
+                                            blank_streak_started_at = None;
                                             panel_missing_since = None;
                                         }
                                         last_layout_heal_at =
@@ -2898,6 +2905,17 @@ impl LamcoDisplayHandler {
                             first_frame_received = false;
                             zero_frame_reported = false;
                             consecutive_blank_frames = 0;
+                            // Fault clocks: the escalation carry keeps
+                            // them alive through a surgical heal WITHIN a
+                            // connection, but a NEW connection must
+                            // re-observe the fault before healing (a
+                            // disconnect mid-relayout must not arm a heal
+                            // against a healthy idle desktop). A genuinely
+                            // wedged session re-latches within seconds —
+                            // its popup cursor-blink frames flow at ~2fps
+                            // and re-mark the blank streak.
+                            blank_streak_started_at = None;
+                            panel_missing_since = None;
                             saw_real_content = false;
                             blank_capture_reported = false;
                             layout_heals_issued = 0;
@@ -2957,6 +2975,17 @@ impl LamcoDisplayHandler {
                             first_frame_received = false;
                             zero_frame_reported = false;
                             consecutive_blank_frames = 0;
+                            // Blank-streak/panel clocks too: the
+                            // escalation carry keeps them alive through a
+                            // surgical heal WITHIN a connection, but a NEW
+                            // connection must re-observe the fault before
+                            // healing (a disconnect mid-relayout must not
+                            // arm a heal against a healthy idle desktop).
+                            // A genuinely wedged session re-latches within
+                            // seconds — its popup cursor-blink frames flow
+                            // at ~2fps and re-mark the blank streak.
+                            blank_streak_started_at = None;
+                            panel_missing_since = None;
                             saw_real_content = false;
                             blank_capture_reported = false;
                             layout_heals_issued = 0;
@@ -2994,7 +3023,22 @@ impl LamcoDisplayHandler {
                             .client_active
                             .load(std::sync::atomic::Ordering::Relaxed)
                             && layout_heals_issued < MAX_LAYOUT_HEALS
-                            && cached_frame.is_some()
+                            // NOT gated on cached_frame: the frame-driven
+                            // heal drops the cache (never replay a blank
+                            // frame to the client), so after a SURGICAL
+                            // heal that failed to fix the fault the cache
+                            // stays empty for exactly as long as the
+                            // post-heal silence lasts — a cache gate made
+                            // heal #2 unreachable in the one scenario it
+                            // exists for (measured k36: heal #1 at +6s,
+                            // then 40s of frame-silent black, no heal #2).
+                            // The fault clocks below are the precise
+                            // discriminator: they latch ONLY in the
+                            // Some(frame) path, so last_frame_faulted
+                            // proves frames WERE flowing and the last one
+                            // was fault-marked — strictly stronger than
+                            // the cache check, and it survives the heal's
+                            // own cache drop.
                         {
                             let elastic = {
                                 let hook = handler.elastic_capture.read().clone();
@@ -3037,13 +3081,16 @@ impl LamcoDisplayHandler {
                                     layout_heals_issued += 1;
                                     // Same escalation-carry rule as the
                                     // frame-driven path: a surgical heal
-                                    // keeps the fault clock so the restart
-                                    // escalation can qualify if the fault
-                                    // persists; a restart heal clears it.
-                                    consecutive_blank_frames = 0;
-                                    blank_streak_started_at = None;
+                                    // keeps EVERY fault clock (blank streak
+                                    // included — resetting it here would
+                                    // re-deadlock the escalation exactly
+                                    // like k36 if the silence persists after
+                                    // a surgical no-op); only a restart heal
+                                    // clears them.
                                     let escalate = layout_heals_issued > 1;
                                     if escalate {
+                                        consecutive_blank_frames = 0;
+                                        blank_streak_started_at = None;
                                         panel_missing_since = None;
                                     }
                                     last_layout_heal_at = std::time::Instant::now();
@@ -3057,7 +3104,6 @@ impl LamcoDisplayHandler {
                                     // Same escalation policy as the
                                     // frame-driven path: surgical first,
                                     // restart only on repeat heals.
-                                    let escalate = layout_heals_issued > 1;
                                     let healed =
                                         session.heal_output_layout(escalate).await;
                                     tracing::info!(healed, "Output layout heal issued");
