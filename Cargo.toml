@@ -81,7 +81,13 @@ lamco-rdp-clipboard = "0.5.0"
 # wallpaper/panel never attach - a restart did NOT fix 6.3, the
 # evaluateScript reassignment does, instantly). heal_output_layout gains
 # escalate_restart: first heal surgical, restart only on repeat heals.
-hyperv-rdp-extras = { git = "https://github.com/moerketh/hyperv-rdp-extras", rev = "e9a8da3", default-features = false, features = ["geometry", "transport", "cursor", "kwin-virtual"] }
+# 4affa6e: PROACTIVE containment reattach after every output create
+# (settle-close + 2.5s twin passes) - the desktop latches in ~2s after a
+# resolution change instead of ~22s via the fault heal, and Plasma never
+# spawns a duplicate containment with default wallpaper (the churned-VM
+# 'generic KDE background'). Adoption is conservative: only when screen 0
+# is unoccupied.
+hyperv-rdp-extras = { git = "https://github.com/moerketh/hyperv-rdp-extras", rev = "4affa6e", default-features = false, features = ["geometry", "transport", "cursor", "kwin-virtual"] }
 
 # -----------------------------------------------------------------------------
 # Async runtime
