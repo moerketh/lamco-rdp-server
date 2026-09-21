@@ -653,7 +653,14 @@ impl EgfxFrameSender {
             // a rect smaller than the bitstream leaves the tail unclaimed
             // and the client stalls — measured: 3 frames in 16s with egfx:0
             // against an AVC-capable client when this was clamped to the
-            // unaligned desktop width).
+            // unaligned desktop width). Note the two clamp targets are
+            // INTENTIONALLY different: the surface is created at the
+            // ALIGNED size (see create_surface in display_handler), so the
+            // aligned full-frame rect is within-surface, while the partial
+            // path clamps to the unaligned DESKTOP rect — also within the
+            // (larger) aligned surface. Do not "unify" these to the same
+            // dims: clamping the full frame down to the desktop rect
+            // re-introduces the stall above.
             vec![Avc420Region::full_frame(
                 encoded_width,
                 encoded_height,
