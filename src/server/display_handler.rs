@@ -2720,7 +2720,33 @@ impl LamcoDisplayHandler {
                                         layout_heals_issued += 1;
                                         consecutive_blank_frames = 0;
                                         blank_streak_started_at = None;
-                                        panel_missing_since = None;
+                                        // First heal is surgical (origin +
+                                        // containment reattach, instant); a
+                                        // REPEAT heal means the surgical
+                                        // path could not fix it — escalate
+                                        // with the plasmashell restart.
+                                        let escalate = layout_heals_issued > 1;
+                                        // ESCALATION CARRY: on the SURGICAL
+                                        // heal (heal #1) the panel clock is
+                                        // deliberately NOT reset. If the
+                                        // surgical path cannot fix the fault
+                                        // (Kali 6.7: containment never
+                                        // orphans, reattach is a no-op), the
+                                        // capture goes frame-silent with the
+                                        // fault still live — resetting the
+                                        // clock here meant no detector could
+                                        // ever requalify and the restart
+                                        // escalation was unreachable
+                                        // (measured k35: heal#1 at +9s, then
+                                        // nothing, client sat black).
+                                        // After a RESTART heal (escalated)
+                                        // the clock MUST clear: the restart
+                                        // itself transiently panel-lesses
+                                        // the desktop and re-detecting that
+                                        // would burn the budget pointlessly.
+                                        if escalate {
+                                            panel_missing_since = None;
+                                        }
                                         last_layout_heal_at =
                                             std::time::Instant::now();
                                         tracing::warn!(
@@ -2728,12 +2754,6 @@ impl LamcoDisplayHandler {
                                             heals = layout_heals_issued,
                                             "Blank or panel-less capture over a working pipeline with an elastic session — healing output layout (origin normalize + containment reattach)"
                                         );
-                                        // First heal is surgical (origin +
-                                        // containment reattach, instant); a
-                                        // REPEAT heal means the surgical
-                                        // path could not fix it — escalate
-                                        // with the plasmashell restart.
-                                        let escalate = layout_heals_issued > 1;
                                         let healed =
                                             session.heal_output_layout(escalate).await;
                                         tracing::info!(
@@ -3015,9 +3035,17 @@ impl LamcoDisplayHandler {
                                     && silent_long_enough
                                 {
                                     layout_heals_issued += 1;
-                                    panel_missing_since = None;
+                                    // Same escalation-carry rule as the
+                                    // frame-driven path: a surgical heal
+                                    // keeps the fault clock so the restart
+                                    // escalation can qualify if the fault
+                                    // persists; a restart heal clears it.
                                     consecutive_blank_frames = 0;
                                     blank_streak_started_at = None;
+                                    let escalate = layout_heals_issued > 1;
+                                    if escalate {
+                                        panel_missing_since = None;
+                                    }
                                     last_layout_heal_at = std::time::Instant::now();
                                     tracing::warn!(
                                         heals = layout_heals_issued,
