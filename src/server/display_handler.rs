@@ -2045,20 +2045,42 @@ impl LamcoDisplayHandler {
             // heal fired 14s after an elastic resize that never touched
             // the local clock).
             //
-            // 6s, not the historical 20: the window existed to keep the
-            // OLD restart-based heal out of the relayout window (a
-            // restart inside it permanently detaches Plasma 6.3
-            // containment). Since r30 the FIRST heal is surgical
-            // (origin normalize + containment reattach — no process
-            // kill), and the restart escalation only becomes possible
-            // after a heal + its 45s grace, i.e. never inside this
-            // window. 6s covers the observed legit relayout (~2-3s,
-            // both stacks) with margin; a desktop still panel-less at
-            // +6s heals at ~+9s (6s settle + 3s sustained detector)
-            // instead of ~+23s (measured Kali 6.7: fault heal at +20s
-            // was the sole "slow to render" the user reported).
+            // 15s, not the earlier 6: 6s was sized to keep the OLD
+            // restart-based heal out of the ~2-3s relayout window. KWin
+            // 6.7 measurably needs LONGER to latch a freshly recreated
+            // virtual output, and a heal racing the tail of a legitimate
+            // latch is strictly worse than a slow one — measured
+            // 2026-09-22 (13:01 connect, Kali Plasma 6.7.4): elastic
+            // rebind at +0s, the output still legitimately blank at
+            // +5.85s when the 6s window expired; heal #1 fired +150ms
+            // after expiry, dropped the frame cache before plasmashell
+            // finished painting, the capture went frame-silent, and the
+            // no-frame gate escalated to the plasmashell-restart heal at
+            // +13.85s — a ~15s black screen plus a desktop restart, all
+            // from ONE false-positive heal. The heal should only arm
+            // once the desktop has had its full settle budget: a
+            // genuinely wedged layout heals at ~+18s (15s settle + 3s
+            // sustained detector) instead of ~+9s; a slow-but-healthy
+            // latch at +7..+12s heals never.
             const CAPTURE_RESIZE_SETTLE: std::time::Duration =
-                std::time::Duration::from_secs(6);
+                std::time::Duration::from_secs(15);
+            // Last rebind epoch this loop has observed. rebind_capture_node
+            // stamps the epoch from OUTSIDE this task (connect-time
+            // elastic recreate, mid-session client resize) via an atomic,
+            // so the streak clocks below get no direct signal. Observing
+            // the stamp here and clearing the clocks extends the explicit
+            // resize path's invariant (below, where the non-elastic
+            // Destroy/Create resets them inline: "resetting here keeps
+            // the streaks from counting pre-settle frames at all") to
+            // every capture-source change — otherwise a blank streak
+            // started DURING the settle window is already past its 3s
+            // sustained bar when the window expires, and the heal fires
+            // +1 iteration after settle instead of re-measuring
+            // post-settle frames (the exact 13:01 cascade above: streak
+            // had 6s banked when the 6s window closed).
+            let mut last_seen_resize_epoch_ms: u64 = handler
+                .last_capture_resize_epoch_ms
+                .load(std::sync::atomic::Ordering::Acquire);
             // Frozen-capture detection (DmaBuf copy stuck at frame N): frames
             // DELIVER at full rate but the CPU copy never changes, so
             // pixel-diff finds zero damage forever and the encoder starves —
@@ -2164,6 +2186,27 @@ impl LamcoDisplayHandler {
                             frames_dropped,
                             frames_skipped_damage
                         );
+                    }
+                }
+
+                // === RESIZE-EPOCH OBSERVER ===
+                // rebind_capture_node stamps last_capture_resize_epoch_ms
+                // from outside this task (connect-time elastic recreate,
+                // mid-session client resize). When a new epoch lands,
+                // clear the fault streak clocks so they only ever measure
+                // POST-rebind frames — pre-settle streaks must not count
+                // (the settle gate below only delays the heal; without
+                // this reset a streak banked during settle fires the heal
+                // the moment the window expires).
+                {
+                    let epoch = handler
+                        .last_capture_resize_epoch_ms
+                        .load(std::sync::atomic::Ordering::Acquire);
+                    if epoch != last_seen_resize_epoch_ms {
+                        last_seen_resize_epoch_ms = epoch;
+                        consecutive_blank_frames = 0;
+                        blank_streak_started_at = None;
+                        panel_missing_since = None;
                     }
                 }
 

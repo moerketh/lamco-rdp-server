@@ -62,6 +62,10 @@ pub struct KwinVirtualSessionHandle {
     libei: Arc<crate::session::strategies::libei::LibeiSessionHandleImpl>,
     /// Current stream info (node id + geometry), updated on establish/release.
     streams: RwLock<Vec<StreamInfo>>,
+    /// Last size the virtual output was (re)created at — the connect-time
+    /// pre-warm prediction for the next client (see establish_for_client).
+    /// std Mutex: tiny payload, no await held across the guard.
+    last_output_size: std::sync::Mutex<Option<(u16, u16)>>,
 }
 
 impl KwinVirtualSessionHandle {
@@ -73,6 +77,7 @@ impl KwinVirtualSessionHandle {
             libei,
             streams: RwLock::new(Vec::new()),
             layout_guard: RwLock::new(None),
+            last_output_size: std::sync::Mutex::new(None),
         }
     }
 
@@ -82,6 +87,14 @@ impl KwinVirtualSessionHandle {
         // the create-before-close swap, the enable-after-every-create
         // black-screen guard, and the created-reply timeout.
         let node_id = self.wl.read().await.recreate_stream(width, height).await?;
+
+        // Remember the created size as the next connection's pre-warm
+        // prediction (create-before-close means the recreate only returned
+        // once the new output exists).
+        *self
+            .last_output_size
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some((width, height));
 
         let info = StreamInfo {
             node_id,
@@ -222,11 +235,27 @@ impl SessionHandle for KwinVirtualSessionHandle {
             }
         }
 
-        // Fresh establish (no live stream): sensible default size.
-        // `request_initial_size` follows immediately with the client's
-        // actual request and resizes via resize_capture_source, so this
-        // initial size only needs to be valid.
-        let (w, h) = (1920u16, 1200u16);
+        // Fresh establish (no live stream): pre-warm at the size the next
+        // client is PREDICTED to want — the previous connection's size —
+        // instead of a fixed default. The prediction pays off on the
+        // overwhelmingly common case (same client reconnecting at the same
+        // resolution): the virtual output is created at the client's size
+        // HERE at accept time, so plasmashell's multi-second latch
+        // overlaps the RDP handshake and — the bigger win —
+        // request_initial_size's resize_capture_source short-circuits on
+        // the size match, SKIPPING the destroy+recreate that used to add a
+        // second full KWin relayout after caps negotiation (measured: the
+        // create-at-default + recreate-at-request pair double-relayouts
+        // every fresh connect). A mispredicted size costs exactly what
+        // connect cost before this change (one recreate at caps) — never
+        // more; and recreate_stream below still records the truth for the
+        // next round.
+        let (w, h) = self
+            .last_output_size
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .unwrap_or((1920u16, 1200u16));
+        info!("[kwin-virtual] fresh establish — pre-warming virtual output at {}x{}", w, h);
 
         // CREATE the virtual output FIRST (the crate's recreate_stream
         // also ensures it is ENABLED), then disable the physical one. Order
@@ -325,6 +354,15 @@ impl SessionHandle for KwinVirtualSessionHandle {
                 && s.width == width as u32
                 && s.height == height as u32
             {
+                // The live stream is already at this size (typical: the
+                // establish_for_client pre-warm prediction hit). Record it
+                // so the prediction survives this confirmation too — this
+                // path returns before recreate_stream, which is otherwise
+                // the only writer.
+                *self
+                    .last_output_size
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner()) = Some((width, height));
                 return Some((width, height, None));
             }
         }
