@@ -87,7 +87,7 @@ lamco-rdp-clipboard = "0.5.0"
 # spawns a duplicate containment with default wallpaper (the churned-VM
 # 'generic KDE background'). Adoption is conservative: only when screen 0
 # is unoccupied.
-hyperv-rdp-extras = { git = "https://github.com/moerketh/hyperv-rdp-extras", rev = "ca9bb96", default-features = false, features = ["geometry", "transport", "cursor", "kwin-virtual"] }
+hyperv-rdp-extras = { git = "https://github.com/moerketh/hyperv-rdp-extras", rev = "bf8a901", default-features = false, features = ["geometry", "transport", "cursor", "kwin-virtual"] }
 
 # -----------------------------------------------------------------------------
 # Async runtime
