@@ -33,11 +33,12 @@ use hyperv_rdp_extras::session::{
 
 use crate::session::strategy::{CaptureResizeEffect, CaptureResizeOutcome};
 
-/// Experiment toggle: in-place virtual-output mode change (experiment D)
-/// instead of destroy/recreate on elastic resize. Read once per resize;
-/// default `recreate` (env absent). Toggle via systemd unit Environment=.
+/// In-place virtual-output mode change (experiment D) instead of
+/// destroy/recreate on elastic resize. On by default; set
+/// `LAMCO_KWIN_INPLACE_MODE=0` as an emergency off-switch if an untested
+/// compositor mishandles the in-place request. Read once per resize.
 fn in_place_mode_change_enabled() -> bool {
-    std::env::var("LAMCO_KWIN_INPLACE_MODE").is_ok()
+    !matches!(std::env::var("LAMCO_KWIN_INPLACE_MODE").as_deref(), Ok("0"))
 }
 
 // Re-exported for the parser tests below and external callers. The kscreen
@@ -385,9 +386,9 @@ impl SessionHandle for KwinVirtualSessionHandle {
         // Experiment D: switch the LIVE virtual output's mode in place via
         // kde-output-management-v2 custom modes — no destroy/recreate, so no
         // output add/remove, no PipeWire node rebind, no containment churn.
-        // Toggled by LAMCO_KWIN_INPLACE_MODE; needs an existing live stream
-        // (per-connection resize only; establish still creates). Every
-        // non-Applied outcome falls back to the recreate path below.
+        // Kill-switchable via LAMCO_KWIN_INPLACE_MODE=0; needs an existing
+        // live stream (per-connection resize only; establish still creates).
+        // Every non-Applied outcome falls back to the recreate path below.
         if in_place_mode_change_enabled() && !self.streams.read().await.is_empty() {
             match self
                 .wl
