@@ -5705,58 +5705,77 @@ impl RdpServerDisplay for LamcoDisplayHandler {
                     .resize_capture_source(client_size.width, client_size.height)
                     .await
                 {
-                    // new_node is Some ONLY when the resize actually recreated
-                    // the capture source. On the kwin-virtual path the live
-                    // PipeWire stream is bound to the zkde virtual output:
-                    // destroying it tears the output down, and with the
-                    // physical output disabled by the layout guard that
-                    // leaves ZERO enabled outputs — plasmashell falls back to
-                    // its placeholder screen and the session streams
-                    // all-zero buffers forever (black screen on a healthy
-                    // pipeline; observed 2026-09-16 as a same-node
-                    // destroy+recreate during the size-match short-circuit).
-                    // So: rebind ONLY when a genuinely new node exists.
-                    Some((_w, _h, Some(new_node))) => {
-                        let old_node =
-                            self.capture_node.load(std::sync::atomic::Ordering::Relaxed);
-                        let streams = session.streams();
-                        if let Some(s) = streams.first() {
-                            self.rebind_capture_node(old_node, new_node, s.width, s.height)
+                    // On the kwin-virtual path the live PipeWire stream is
+                    // bound to the zkde virtual output: destroying it tears
+                    // the output down, and with the physical output disabled
+                    // by the layout guard that leaves ZERO enabled outputs —
+                    // plasmashell falls back to its placeholder screen and
+                    // the session streams all-zero buffers forever (black
+                    // screen on a healthy pipeline; observed 2026-09-16 as a
+                    // same-node destroy+recreate during the size-match
+                    // short-circuit). So: rebind ONLY on a genuine recreate.
+                    Some(outcome) => match outcome.effect {
+                        crate::session::strategy::CaptureResizeEffect::Recreated { node_id } => {
+                            let old_node =
+                                self.capture_node.load(std::sync::atomic::Ordering::Relaxed);
+                            let streams = session.streams();
+                            if let Some(s) = streams.first() {
+                                self.rebind_capture_node(old_node, node_id, s.width, s.height)
+                                    .await;
+                            } else {
+                                // New node reported but no stream info: rebind
+                                // by the reported node with the requested size.
+                                self.rebind_capture_node(
+                                    old_node,
+                                    node_id,
+                                    u32::from(client_size.width),
+                                    u32::from(client_size.height),
+                                )
                                 .await;
-                        } else {
-                            // New node reported but no stream info: rebind by
-                            // the reported node with the requested size.
-                            self.rebind_capture_node(
-                                old_node,
-                                new_node,
-                                u32::from(client_size.width),
-                                u32::from(client_size.height),
-                            )
-                            .await;
+                            }
+                            // Adopt the client's size WITHOUT signaling a
+                            // resize: the activation is being negotiated at
+                            // exactly this size (see adopt_size_silently).
+                            self.adopt_size_silently(client_size.width, client_size.height)
+                                .await;
+                            info!(
+                                "request_initial_size: adopted client desktop {}x{} via elastic capture (source recreated at {}x{}, node {})",
+                                client_size.width, client_size.height, outcome.width, outcome.height, node_id
+                            );
+                            return client_size;
                         }
-                        // Adopt the client's size WITHOUT signaling a
-                        // resize: the activation is being negotiated at
-                        // exactly this size (see adopt_size_silently).
-                        self.adopt_size_silently(client_size.width, client_size.height)
-                            .await;
-                        info!(
-                            "request_initial_size: adopted client desktop {}x{} via elastic capture (source recreated at {}x{}, node {})",
-                            client_size.width, client_size.height, _w, _h, new_node
-                        );
-                        return client_size;
-                    }
-                    // Size-match short-circuit (or resize failure): the
-                    // existing stream is live and healthy — DO NOT destroy
-                    // it. Adopt the size and let frames flow.
-                    Some((_w, _h, None)) => {
-                        self.adopt_size_silently(client_size.width, client_size.height)
-                            .await;
-                        info!(
-                            "request_initial_size: adopted client desktop {}x{} — capture source already at size ({}x{}), stream untouched",
-                            client_size.width, client_size.height, _w, _h
-                        );
-                        return client_size;
-                    }
+                        // Experiment D: in-place mode change — the same
+                        // stream now delivers the new size. No rebind, but
+                        // stamp the settle epoch (plasma still re-latches
+                        // its containment; heal detectors must hold off).
+                        crate::session::strategy::CaptureResizeEffect::RelaidOutInPlace => {
+                            let now_ms = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_millis() as u64)
+                                .unwrap_or(0);
+                            self.last_capture_resize_epoch_ms
+                                .store(now_ms, std::sync::atomic::Ordering::Release);
+                            self.adopt_size_silently(client_size.width, client_size.height)
+                                .await;
+                            info!(
+                                "request_initial_size: adopted client desktop {}x{} via IN-PLACE mode change (node kept, stream untouched)",
+                                client_size.width, client_size.height
+                            );
+                            return client_size;
+                        }
+                        // Size-match short-circuit (or resize failure): the
+                        // existing stream is live and healthy — DO NOT destroy
+                        // it. Adopt the size and let frames flow.
+                        crate::session::strategy::CaptureResizeEffect::Unchanged => {
+                            self.adopt_size_silently(client_size.width, client_size.height)
+                                .await;
+                            info!(
+                                "request_initial_size: adopted client desktop {}x{} — capture source already at size ({}x{}), stream untouched",
+                                client_size.width, client_size.height, outcome.width, outcome.height
+                            );
+                            return client_size;
+                        }
+                    },
                     None => {
                         warn!(
                             "Elastic capture failed at {}x{} — keeping current desktop size",

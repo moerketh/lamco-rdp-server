@@ -118,45 +118,64 @@ impl LamcoDisplayHandler {
             req_width, req_height
         );
         match session.resize_capture_source(req_width, req_height).await {
-            // new_node is Some ONLY when the source was actually recreated.
-            // On the size-match short-circuit (None) the live stream MUST
-            // NOT be destroyed: it is bound to the zkde virtual output and
-            // tearing it down removes the only enabled output (the physical
-            // one is disabled by the layout guard) — plasmashell falls to
-            // its placeholder screen and the session streams all-zero
-            // buffers forever (black screen on a healthy pipeline).
-            Some((_w, _h, Some(new_node))) => {
-                // Rebind the PipeWire stream to the new node.
-                let old_node = self.capture_node.load(std::sync::atomic::Ordering::Relaxed);
-                let streams = session.streams();
-                if let Some(s) = streams.first() {
-                    self.rebind_capture_node(old_node, new_node, s.width, s.height)
+            // A recreate MUST rebind; Unchanged/RelaidOutInPlace MUST NOT
+            // destroy the live stream: it is bound to the zkde virtual
+            // output and tearing it down removes the only enabled output
+            // (the physical one is disabled by the layout guard) —
+            // plasmashell falls to its placeholder screen and the session
+            // streams all-zero buffers forever (black screen on a healthy
+            // pipeline).
+            Some(outcome) => match outcome.effect {
+                crate::session::strategy::CaptureResizeEffect::Recreated { node_id } => {
+                    // Rebind the PipeWire stream to the new node.
+                    let old_node = self.capture_node.load(std::sync::atomic::Ordering::Relaxed);
+                    let streams = session.streams();
+                    if let Some(s) = streams.first() {
+                        self.rebind_capture_node(old_node, node_id, s.width, s.height)
+                            .await;
+                    } else {
+                        self.rebind_capture_node(
+                            old_node,
+                            node_id,
+                            u32::from(req_width),
+                            u32::from(req_height),
+                        )
                         .await;
-                } else {
-                    self.rebind_capture_node(
-                        old_node,
-                        new_node,
-                        u32::from(req_width),
-                        u32::from(req_height),
-                    )
-                    .await;
+                    }
+                    // Record capture truth; desktop stays at the client's
+                    // request (the stored size is updated by
+                    // request_initial_size on the next activation).
+                    info!(
+                        "Elastic capture resized: source now delivers {}x{} (node {})",
+                        outcome.width, outcome.height, node_id
+                    );
                 }
-                // Record capture truth; desktop stays at the client's
-                // request (the stored size is updated by
-                // request_initial_size on the next activation).
-                info!(
-                    "Elastic capture resized: source now delivers {}x{} (node {})",
-                    _w, _h, new_node
-                );
-            }
-            Some((_w, _h, None)) => {
-                // Size-match short-circuit or resize failure with a live
-                // stream: nothing was recreated, keep the stream untouched.
-                info!(
-                    "Elastic capture: source already delivers {}x{} — stream untouched",
-                    _w, _h
-                );
-            }
+                crate::session::strategy::CaptureResizeEffect::RelaidOutInPlace => {
+                    // Experiment D: the output mode changed in place — the
+                    // SAME PipeWire node now delivers the new size (Format
+                    // param renegotiation). No rebind, but plasma still
+                    // re-latches its containment: stamp the settle epoch so
+                    // the heal gate holds exactly as after a recreate.
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    self.last_capture_resize_epoch_ms
+                        .store(now_ms, std::sync::atomic::Ordering::Release);
+                    info!(
+                        "Elastic capture resized in place: source now delivers {}x{} on the same node",
+                        outcome.width, outcome.height
+                    );
+                }
+                crate::session::strategy::CaptureResizeEffect::Unchanged => {
+                    // Size-match short-circuit or resize failure with a live
+                    // stream: nothing was recreated, keep the stream untouched.
+                    info!(
+                        "Elastic capture: source already delivers {}x{} — stream untouched",
+                        outcome.width, outcome.height
+                    );
+                }
+            },
             None => {
                 warn!(
                     "Elastic capture resize to {}x{} failed — keeping current stream",

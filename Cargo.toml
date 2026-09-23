@@ -42,7 +42,7 @@ cc = "1"
 # trait-diamond conflict.
 lamco-rdp = "0.8.0"
 lamco-portal = { version = "0.4.5", features = ["dbus-clipboard"] }
-lamco-pipewire = { version = "0.6.13", features = ["audio", "damage"] }
+lamco-pipewire = { version = "0.7.1", features = ["audio", "damage"] }
 lamco-video = "0.3.0"
 lamco-rdp-input = { version = "0.2.0" }
 lamco-clipboard-core = { version = "0.6.1", features = ["image"] }
@@ -87,7 +87,10 @@ lamco-rdp-clipboard = "0.5.0"
 # spawns a duplicate containment with default wallpaper (the churned-VM
 # 'generic KDE background'). Adoption is conservative: only when screen 0
 # is unoccupied.
-hyperv-rdp-extras = { git = "https://github.com/moerketh/hyperv-rdp-extras", rev = "bf8a901", default-features = false, features = ["geometry", "transport", "cursor", "kwin-virtual"] }
+# experiment/kwin-inplace-mode: adds KdeOutputManager::try_change_mode_in_place
+# (in-place virtual-output mode change via kde-output-management-v2 custom
+# modes; experiment D). Gated at runtime by LAMCO_KWIN_INPLACE_MODE=1.
+hyperv-rdp-extras = { git = "https://github.com/moerketh/hyperv-rdp-extras", rev = "8dcaf6aea928d2123ac7ba0ece45082b62eeaa4e", default-features = false, features = ["geometry", "transport", "cursor", "kwin-virtual"] }
 
 # -----------------------------------------------------------------------------
 # Async runtime
@@ -601,3 +604,10 @@ ironrdp-core = { git = "https://github.com/lamco-admin/IronRDP", rev = "b6be611c
 ironrdp-displaycontrol = { git = "https://github.com/lamco-admin/IronRDP", rev = "b6be611ccb8776f1133679ab3193cd578a17e58a" }
 ironrdp-egfx = { git = "https://github.com/lamco-admin/IronRDP", rev = "b6be611ccb8776f1133679ab3193cd578a17e58a" }
 ironrdp-rdpsnd = { git = "https://github.com/lamco-admin/IronRDP", rev = "b6be611ccb8776f1133679ab3193cd578a17e58a" }
+# lamco-pipewire stride-mismatch warn-once fix (moerketh/lamco-wayland branch
+# fix/pipewire-stride-warn-once, crate version 0.7.1): the per-frame ~240
+# warn/s flood in pw_thread's process callback is now logged once per
+# distinct signature. Route through the fork until the fix lands upstream in
+# lamco-admin/lamco-wayland and publishes to crates.io; then drop this entry
+# and keep version = "0.7.1" above.
+lamco-pipewire = { git = "https://github.com/moerketh/lamco-wayland", rev = "0f7b72903a41b2885887d491fb97ad1d46b77bbe" }

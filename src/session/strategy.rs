@@ -306,16 +306,9 @@ pub trait SessionHandle: Send + Sync {
     async fn release_after_client(&self) {}
 
     /// Resize the strategy's capture source to the client's requested desktop
-    /// size, returning `(width, height, new_node)` where `new_node` is
-    /// `Some(node_id)` ONLY when the resize actually recreated the capture
-    /// source (a new PipeWire node to rebind to). `None` for the node means
-    /// the source was kept as-is — the caller MUST NOT touch the existing
-    /// stream in that case: destroying a live stream on the kwin-virtual
-    /// path tears down the zkde virtual output, and with the physical
-    /// output disabled by the layout guard that leaves ZERO enabled
-    /// outputs — plasmashell falls back to its placeholder screen and
-    /// streams untouched all-zero buffers forever (field-observed
-    /// 2026-09-04, regression observed 2026-09-16).
+    /// size. See [`CaptureResizeOutcome`] for the effect contract. `None`
+    /// means the resize failed outright and the caller keeps the current
+    /// stream.
     ///
     /// Only strategies whose capture size is elastic implement this — today
     /// that is the KWin virtual-output strategy (zkde-screencast can recreate
@@ -325,7 +318,7 @@ pub trait SessionHandle: Send + Sync {
     /// fixed by the compositor; the display handler silently adopts the
     /// client's requested desktop size and frames pass through at capture
     /// geometry).
-    async fn resize_capture_source(&self, _width: u16, _height: u16) -> Option<(u16, u16, Option<u32>)> {
+    async fn resize_capture_source(&self, _width: u16, _height: u16) -> Option<CaptureResizeOutcome> {
         None
     }
 
@@ -425,6 +418,39 @@ pub struct StreamInfo {
     pub height: u32,
     pub position_x: i32,
     pub position_y: i32,
+}
+
+/// What `resize_capture_source` did to the capture source this call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureResizeEffect {
+    /// The live stream already delivered the requested size (size-match
+    /// short-circuit). The caller MUST NOT touch the existing stream:
+    /// destroying a live stream on the kwin-virtual path tears down the zkde
+    /// virtual output, and with the physical output disabled by the layout
+    /// guard that leaves ZERO enabled outputs — plasmashell falls back to
+    /// its placeholder screen and streams untouched all-zero buffers forever
+    /// (field-observed 2026-09-04, regression observed 2026-09-16).
+    Unchanged,
+    /// The capture source was recreated on a NEW PipeWire node; the caller
+    /// must rebind the capture pipeline to `node_id`.
+    Recreated { node_id: u32 },
+    /// The compositor resized the output in place (experiment D: KWin
+    /// kde-output-management-v2 custom modes): the SAME output and PipeWire
+    /// node keep streaming — mid-stream size changes propagate via the
+    /// PipeWire Format param renegotiation. No rebind is wanted OR needed,
+    /// but the caller must stamp the capture-resize settle epoch: plasma
+    /// still re-latches its containment for the new mode and the layout-heal
+    /// detectors must hold off exactly as after a recreate.
+    RelaidOutInPlace,
+}
+
+/// Result of `resize_capture_source` on an elastic-capture strategy.
+#[derive(Debug, Clone, Copy)]
+pub struct CaptureResizeOutcome {
+    /// Size the source now delivers.
+    pub width: u16,
+    pub height: u16,
+    pub effect: CaptureResizeEffect,
 }
 
 /// How a backend's compositor session behaves across successive RDP client

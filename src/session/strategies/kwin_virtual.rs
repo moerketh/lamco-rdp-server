@@ -27,7 +27,18 @@ use tracing::info;
 use crate::session::strategy::{
     ClipboardSource, PipeWireAccess, SessionHandle, SessionLifecyclePolicy, SessionType, StreamInfo,
 };
-use hyperv_rdp_extras::session::{OutputLayoutGuard, VirtualOutputConfig, VirtualOutputManager};
+use hyperv_rdp_extras::session::{
+    ModeChangeOutcome, OutputLayoutGuard, VirtualOutputConfig, VirtualOutputManager,
+};
+
+use crate::session::strategy::{CaptureResizeEffect, CaptureResizeOutcome};
+
+/// Experiment toggle: in-place virtual-output mode change (experiment D)
+/// instead of destroy/recreate on elastic resize. Read once per resize;
+/// default `recreate` (env absent). Toggle via systemd unit Environment=.
+fn in_place_mode_change_enabled() -> bool {
+    std::env::var("LAMCO_KWIN_INPLACE_MODE").is_ok()
+}
 
 // Re-exported for the parser tests below and external callers. The kscreen
 // parser is parameterized by the excluded kscreen name (exact match; see
@@ -332,7 +343,7 @@ impl SessionHandle for KwinVirtualSessionHandle {
         info!("[kwin-virtual] stream closed — virtual output removed, physical outputs restored");
     }
 
-    async fn resize_capture_source(&self, width: u16, height: u16) -> Option<(u16, u16, Option<u32>)> {
+    async fn resize_capture_source(&self, width: u16, height: u16) -> Option<CaptureResizeOutcome> {
         // The virtual output is elastic: recreate it at the requested size
         // and the stream follows. zkde-screencast accepts ANY resolution —
         // this is the whole point of the strategy (no DRM mode list).
@@ -341,10 +352,10 @@ impl SessionHandle for KwinVirtualSessionHandle {
         // creates (or reuses) the stream and request_initial_size follows
         // immediately with the client's request — recreating at the SAME
         // size would swap the output (close+create+rebind) for nothing.
-        // The short-circuit returns node=None: the caller must NOT rebind,
-        // because rebinding destroys the live PipeWire stream — which is
-        // bound to the zkde virtual output and tears it down with it.
-        // With the physical output disabled by the layout guard, that
+        // The short-circuit's Unchanged effect means the caller must NOT
+        // rebind, because rebinding destroys the live PipeWire stream —
+        // which is bound to the zkde virtual output and tears it down with
+        // it. With the physical output disabled by the layout guard, that
         // leaves ZERO enabled outputs and plasmashell falls back to its
         // placeholder screen: the session then streams all-zero buffers
         // forever (black screen on a healthy pipeline).
@@ -363,21 +374,86 @@ impl SessionHandle for KwinVirtualSessionHandle {
                     .last_output_size
                     .lock()
                     .unwrap_or_else(|p| p.into_inner()) = Some((width, height));
-                return Some((width, height, None));
+                return Some(CaptureResizeOutcome {
+                    width,
+                    height,
+                    effect: CaptureResizeEffect::Unchanged,
+                });
             }
         }
+
+        // Experiment D: switch the LIVE virtual output's mode in place via
+        // kde-output-management-v2 custom modes — no destroy/recreate, so no
+        // output add/remove, no PipeWire node rebind, no containment churn.
+        // Toggled by LAMCO_KWIN_INPLACE_MODE; needs an existing live stream
+        // (per-connection resize only; establish still creates). Every
+        // non-Applied outcome falls back to the recreate path below.
+        if in_place_mode_change_enabled() && !self.streams.read().await.is_empty() {
+            match self
+                .wl
+                .read()
+                .await
+                .try_change_mode_in_place(width, height)
+                .await
+            {
+                ModeChangeOutcome::Applied => {
+                    let node_id = self
+                        .streams
+                        .read()
+                        .await
+                        .first()
+                        .map(|s| s.node_id)
+                        .unwrap_or(0);
+                    *self
+                        .last_output_size
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner()) = Some((width, height));
+                    *self.streams.write().await = vec![StreamInfo {
+                        node_id,
+                        width: width as u32,
+                        height: height as u32,
+                        position_x: 0,
+                        position_y: 0,
+                    }];
+                    info!(
+                        "[kwin-virtual] in-place mode change applied: {}x{} on existing stream (node {})",
+                        width, height, node_id
+                    );
+                    return Some(CaptureResizeOutcome {
+                        width,
+                        height,
+                        effect: CaptureResizeEffect::RelaidOutInPlace,
+                    });
+                }
+                outcome => {
+                    info!(
+                        "[kwin-virtual] in-place mode change to {}x{} not applied ({outcome:?}) — falling back to recreate",
+                        width, height
+                    );
+                }
+            }
+        }
+
         match self.recreate_stream(width, height).await {
             Ok(node) => {
                 // The source was actually recreated: report the new node so
                 // the caller rebinds the capture pipeline to it.
-                Some((width, height, Some(node)))
+                Some(CaptureResizeOutcome {
+                    width,
+                    height,
+                    effect: CaptureResizeEffect::Recreated { node_id: node },
+                })
             }
             Err(_e) => {
                 tracing::warn!(
                     "[kwin-virtual] resize to {width}x{height} failed: {_e} — keeping current stream"
                 );
                 let cur = self.streams.read().await;
-                cur.first().map(|s| (s.width as u16, s.height as u16, None))
+                cur.first().map(|s| CaptureResizeOutcome {
+                    width: s.width as u16,
+                    height: s.height as u16,
+                    effect: CaptureResizeEffect::Unchanged,
+                })
             }
         }
     }
