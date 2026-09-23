@@ -42,7 +42,7 @@ cc = "1"
 # trait-diamond conflict.
 lamco-rdp = "0.8.0"
 lamco-portal = { version = "0.4.5", features = ["dbus-clipboard"] }
-lamco-pipewire = { version = "0.7.1", features = ["audio", "damage"] }
+lamco-pipewire = { version = "0.6.13", features = ["audio", "damage"] }
 lamco-video = "0.3.0"
 lamco-rdp-input = { version = "0.2.0" }
 lamco-clipboard-core = { version = "0.6.1", features = ["image"] }
@@ -605,9 +605,9 @@ ironrdp-displaycontrol = { git = "https://github.com/lamco-admin/IronRDP", rev =
 ironrdp-egfx = { git = "https://github.com/lamco-admin/IronRDP", rev = "b6be611ccb8776f1133679ab3193cd578a17e58a" }
 ironrdp-rdpsnd = { git = "https://github.com/lamco-admin/IronRDP", rev = "b6be611ccb8776f1133679ab3193cd578a17e58a" }
 # lamco-pipewire stride-mismatch warn-once fix (moerketh/lamco-wayland branch
-# fix/pipewire-stride-warn-once, crate version 0.7.1): the per-frame ~240
-# warn/s flood in pw_thread's process callback is now logged once per
-# distinct signature. Route through the fork until the fix lands upstream in
-# lamco-admin/lamco-wayland and publishes to crates.io; then drop this entry
-# and keep version = "0.7.1" above.
-lamco-pipewire = { git = "https://github.com/moerketh/lamco-wayland", rev = "0f7b72903a41b2885887d491fb97ad1d46b77bbe" }
+# fix/pipewire-stride-warn-once-0.6, crate version 0.6.15, backported onto the
+# crates.io 0.6.14 tree): the per-frame ~240 warn/s flood in pw_thread's
+# process callback is now logged once per distinct signature. Route through
+# the fork until the fix lands upstream in lamco-admin/lamco-wayland and
+# publishes to crates.io; then drop this entry.
+lamco-pipewire = { git = "https://github.com/moerketh/lamco-wayland", rev = "b70e86d" }
