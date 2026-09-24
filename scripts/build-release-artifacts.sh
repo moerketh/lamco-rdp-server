@@ -4,6 +4,7 @@
 # Produces (under dist/release/):
 #   lamco-rdp-server_<ver>_amd64.deb          — Debian/Ubuntu/Parrot package
 #   lamco-rdp-server-<ver>-linux-x86_64.tar.gz — portable binary tarball with install.sh
+#   lamco-rdp-server-<ver>-1-x86_64.pkg.tar.zst — pacman package (Arch/Manjaro etc.)
 #   SHA256SUMS.txt                            — checksums for all artifacts
 #
 # <ver> comes from --version (default: Cargo.toml version + -hyperv1 suffix,
@@ -27,6 +28,9 @@ FEATURES="${LAMCO_RELEASE_FEATURES:-default,vaapi,gui,vsock,websocket,kwin-virtu
 LAMCO_RELEASE_VERSION="${LAMCO_RELEASE_VERSION:-}"
 ARCH="$(uname -m)"
 DIST_DIR="${REPO_ROOT}/dist/release"
+# pacman package release index: bump only to re-publish the same upstream
+# release (rare). .PKGINFO stores the combined "<LAMCO_RELEASE_VERSION>-<pkgrel>".
+PACMAN_PKGREL=1
 
 # Staging happens on a NATIVE-filesystem temp dir, never the repo path: on WSL
 # /mnt/c (drvfs) every file reads as mode 777, which dpkg-deb rejects for the
@@ -65,13 +69,14 @@ fi
 
 usage() {
   cat <<EOF
-Usage: $0 [--version <ver>] [--features <csv>] [--skip-build] [--skip-deb] [--skip-tarball] [--audit-secrets]
+Usage: $0 [--version <ver>] [--features <csv>] [--skip-build] [--skip-deb] [--skip-tarball] [--skip-pacman] [--audit-secrets]
 Options:
   --version <ver>    Package version (default: Cargo.toml version + '-hyperv1')
   --features <csv>    Cargo features to build (default: $FEATURES)
   --skip-build       Reuse an existing target/release build
   --skip-deb         Do not produce the .deb
   --skip-tarball     Do not produce the tarball
+  --skip-pacman      Do not produce the .pkg.tar.zst
   --audit-secrets    Spot-check binaries + staged packages for secret-shaped
                      strings (credential assignments, GitHub/AWS/Slack/Stripe
                      token formats, embedded PEM bodies). Off by default; run
@@ -89,6 +94,7 @@ EOF
 SKIP_BUILD=0
 SKIP_DEB=0
 SKIP_TARBALL=0
+SKIP_PACMAN=0
 AUDIT_SECRETS=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -101,6 +107,7 @@ while [[ $# -gt 0 ]]; do
     --skip-build) SKIP_BUILD=1; shift ;;
     --skip-deb) SKIP_DEB=1; shift ;;
     --skip-tarball) SKIP_TARBALL=1; shift ;;
+    --skip-pacman) SKIP_PACMAN=1; shift ;;
     --audit-secrets) AUDIT_SECRETS=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "error: unknown option: $1" >&2; usage >&2; exit 1 ;;
@@ -187,7 +194,7 @@ verify_deps() {
   log "verifying build dependencies"
   require_cmd cargo
   require_cmd cc || true   # gcc/clang
-  for c in curl sha256sum dpkg-deb; do require_cmd "$c"; done
+  for c in curl sha256sum dpkg-deb zstd; do require_cmd "$c"; done
 
   if command -v dpkg >/dev/null 2>&1 && command -v pkg-config >/dev/null 2>&1; then
     local missing=()
@@ -292,7 +299,7 @@ audit_secrets() {
 
   log "secrets audit: scanning staged package trees"
   local tree
-  for tree in "$STAGE_ROOT/deb-stage" "$STAGE_ROOT/tarball-stage"; do
+  for tree in "$STAGE_ROOT/deb-stage" "$STAGE_ROOT/tarball-stage" "$STAGE_ROOT/pacman-stage"; do
     if [[ -d "$tree" ]]; then
       while IFS= read -r -d '' f; do
         scan_file_for_secrets "$f" "${tree##*/}/${f#"$tree"/}" || failed=1
@@ -312,7 +319,7 @@ audit_secrets() {
 resolve_version() {
   if [[ -z "$LAMCO_RELEASE_VERSION" ]]; then
     local cargo_ver
-    cargo_ver="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)"
+    cargo_ver="$(tr -d '\r' < Cargo.toml | sed -n 's/^version = "\(.*\)"$/\1/p' | head -1)"
     [[ -n "$cargo_ver" ]] || die 1 "could not read version from Cargo.toml"
     LAMCO_RELEASE_VERSION="${cargo_ver}-hyperv1"
     log "version defaulting to Cargo.toml + suffix: ${LAMCO_RELEASE_VERSION}"
@@ -411,7 +418,7 @@ echo "Next steps:"
 echo "  1. Generate certificates:  sudo lamco-rdp-server-setup-certs"
 echo "     (or: lamco-rdp-server --generate-certs)"
 echo "  2. Grant permissions:      lamco-rdp-server --grant-permission"
-echo "  3. Enable the service:     systemctl --user enable --now lamco-rdp-server.service"
+echo "  3. Enable the service:     systemctl --user enable --now app-io.lamco.rdp-server.service"
 exit 0
 EOF
   cat > "$stage/DEBIAN/postrm" <<'EOF'
@@ -501,8 +508,13 @@ f="$SRC/share/icons/hicolor/scalable/apps/io.lamco.rdp-server.svg"
   install -Dm644 "$SRC/share/doc/LICENSE" "$PREFIX/share/doc/lamco-rdp-server/LICENSE"
 
 # systemd user unit — respects SYSTEMD_UNIT_DIR for /usr systems
-unit_src="$SRC/lib/systemd/user/lamco-rdp-server.service"
-[[ -f "$unit_src" ]] && install -Dm644 "$unit_src" "$SYSTEMD_UNIT_DIR/lamco-rdp-server.service"
+if [[ -f "$SRC/lib/systemd/user/app-io.lamco.rdp-server.service" ]]; then
+  install -Dm644 "$SRC/lib/systemd/user/app-io.lamco.rdp-server.service" "$SYSTEMD_UNIT_DIR/app-io.lamco.rdp-server.service"
+  unit_name="app-io.lamco.rdp-server.service"
+else
+  install -Dm644 "$SRC/lib/systemd/user/lamco-rdp-server.service" "$SYSTEMD_UNIT_DIR/lamco-rdp-server.service"
+  unit_name="lamco-rdp-server.service"
+fi
 
 echo
 echo "Install complete. Next steps:"
@@ -512,7 +524,7 @@ echo "     or create your own under /etc/lamco-rdp-server/"
 echo "  2. Grant portal permissions (one-time, per user):"
 echo "       $PREFIX/bin/lamco-rdp-server --grant-permission"
 echo "  3. Enable the user service:"
-echo "       systemctl --user enable --now lamco-rdp-server.service"
+echo "       systemctl --user enable --now $unit_name"
 echo
 echo "NOTE: x264 fast AVC420 encoding needs libx264 installed (libx264-164 /"
 echo "libx264). Without it, OpenH264 is used (install libopenh264-7)."
@@ -526,10 +538,148 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
-# 8. Checksums
+# 8. pacman package assembly (Arch/Manjaro; packaging/aur/ stays the source
+#    reference for scripts, but this output is built directly — no makepkg,
+#    no AUR dependency)
+# ---------------------------------------------------------------------------
+build_pacman() {
+  local stage="${STAGE_ROOT}/pacman-stage"
+  local pkgver="${LAMCO_RELEASE_VERSION}-${PACMAN_PKGREL}"
+  local out="${DIST_DIR}/lamco-rdp-server-${pkgver}-${ARCH}.pkg.tar.zst"
+  rm -rf "$stage"
+  mkdir -p "$stage"
+  stage_install_set "$stage"
+
+  local builddate size
+  builddate="$(date +%s)"
+  size="$( (cd "$stage" && du -sb usr etc | awk '{s+=$1} END {print s}') )"
+
+  # .PKGINFO: pacman's metadata. pkgver is the COMBINED "epoch-version-pkgrel"
+  # string (pacman splits it on the last hyphen at install time): a separate
+  # pkgrel field, as in the AUR PKGBUILD, is a makepkg input, not a .PKGINFO
+  # field. No backup= entry: /etc/lamco-rdp-server ships empty (user-owned
+  # config) and no other /etc file ships in the payload.
+  cat > "$stage/.PKGINFO" <<EOF
+pkgname = lamco-rdp-server
+pkgbase = lamco-rdp-server
+xdata = pkgtype=pkg
+pkgver = ${pkgver}
+pkgdesc = Remote desktop server (Hyper-V Enhanced Session fork: AF_VSOCK, WebSocket, x264)
+url = https://github.com/moerketh/lamco-rdp-server
+builddate = ${builddate}
+packager = Automated Release Pipeline <noreply@github.com>
+size = ${size}
+arch = ${ARCH}
+license = BUSL-1.1
+depend = glibc
+depend = gcc-libs
+depend = dbus
+depend = pipewire
+depend = libpipewire
+depend = xdg-desktop-portal
+depend = wayland
+depend = libxkbcommon
+depend = pam
+depend = fuse3
+depend = libva
+depend = openssl
+optdepend = x264: system x264 encoder (dlopen'd)
+optdepend = openh264: Cisco OpenH264 encoder (dlopen'd; license text in /usr/share/doc/lamco-rdp-server)
+optdepend = vulkan-icd-loader: Vulkan renderer for the GUI
+optdepend = xdg-desktop-portal-gnome: GNOME portal backend
+optdepend = xdg-desktop-portal-kde: KDE portal backend
+optdepend = xdg-desktop-portal-wlr: wlroots portal backend
+optdepend = xdg-desktop-portal-hyprland: Hyprland portal backend
+EOF
+
+  # .INSTALL: install/upgrade hooks. post_upgrade carries user enable-state
+  # across the lamco-rdp-server.service -> app-io.lamco.rdp-server.service
+  # unit rename (mirrors packaging/aur/lamco-rdp-server.install).
+  cat > "$stage/.INSTALL" <<'EOF'
+post_install() {
+    printf '%s\n' \
+        ':: lamco-rdp-server (Hyper-V Enhanced Session fork) installed.' \
+        '   Enable the systemd user service:' \
+        '     systemctl --user enable --now app-io.lamco.rdp-server.service' \
+        '   Certificates: sudo lamco-rdp-server-setup-certs' \
+        '   Portal permissions (one-time, per user):' \
+        '     lamco-rdp-server --grant-permission'
+}
+
+post_upgrade() {
+    # The systemd user unit was renamed from lamco-rdp-server.service to
+    # app-io.lamco.rdp-server.service so xdg-desktop-portal can derive a real
+    # app id from it. Anyone who enabled the old unit needs that enabled state
+    # carried over, or the service silently stops autostarting at login. This
+    # can only reach users with an active systemd --user manager right now;
+    # anyone not logged in during the upgrade needs to re-enable manually.
+    local old_unit="lamco-rdp-server.service"
+    local new_unit="app-io.lamco.rdp-server.service"
+    local socket uid user
+
+    for socket in /run/user/*/systemd/private; do
+        [ -S "$socket" ] || continue
+        uid="${socket#/run/user/}"
+        uid="${uid%%/*}"
+        user="$(getent passwd "$uid" | cut -d: -f1)"
+        [ -n "$user" ] || continue
+        if systemctl --user --machine="${user}@" is-enabled "$old_unit" >/dev/null 2>&1; then
+            systemctl --user --machine="${user}@" disable "$old_unit" >/dev/null 2>&1 || true
+            systemctl --user --machine="${user}@" enable "$new_unit" >/dev/null 2>&1 || true
+        fi
+    done
+}
+EOF
+
+  # .MTREE: file manifest with digests (repo-add / makepkg parity; pacman -U
+  # itself does not require it). gzip'd, matching makepkg output. Entries:
+  # metadata members + payload files + directories (the .MTREE never lists
+  # itself). Everything mtime-normalized to builddate.
+  local f digest bytes
+  {
+    printf '#mtree\n'
+    printf '/set type=file uid=0 gid=0 mode=644\n'
+    for f in .PKGINFO .INSTALL; do
+      digest="$(sha256sum "$stage/$f" | cut -d' ' -f1)"
+      bytes="$(stat -c '%s' "$stage/$f")"
+      printf './%s time=%s.0 size=%s sha256digest=%s\n' "$f" "$builddate" "$bytes" "$digest"
+    done
+    (cd "$stage" && find usr etc -type f | LC_ALL=C sort) | while IFS= read -r f; do
+      digest="$(sha256sum "$stage/$f" | cut -d' ' -f1)"
+      bytes="$(stat -c '%s' "$stage/$f")"
+      if [[ -x "$stage/$f" ]]; then
+        printf './%s time=%s.0 mode=755 size=%s sha256digest=%s\n' "$f" "$builddate" "$bytes" "$digest"
+      else
+        printf './%s time=%s.0 size=%s sha256digest=%s\n' "$f" "$builddate" "$bytes" "$digest"
+      fi
+    done
+    (cd "$stage" && find usr etc -type d | LC_ALL=C sort) | while IFS= read -r d; do
+      printf './%s time=%s.0 mode=755 type=dir\n' "${d}" "$builddate"
+    done
+  } | gzip -cn > "$stage/.MTREE"
+
+  # Pack. Metadata members must sit at the ARCHIVE ROOT (depth 0) — never
+  # inside usr/ — or pacman cannot find them. Payload = usr + etc trees.
+  # --owner=0 --group=0: package files must be root-owned regardless of the
+  # uid running the build (no fakeroot needed).
+  mkdir -p "$DIST_DIR"
+  tar -C "$stage" --format=gnu --owner=0 --group=0 --numeric-owner \
+    --zstd -cf "$out" .PKGINFO .MTREE .INSTALL usr etc \
+    || die 4 "pacman package creation failed"
+
+  # Guard: pacman requires .PKGINFO as the FIRST archive entry.
+  [[ "$(tar --zstd -tf "$out" | head -1)" == ".PKGINFO" ]] \
+    || die 4 "packed archive does not start with .PKGINFO"
+
+  rm -rf "$stage"
+  log "built $(basename "$out")"
+}
+
+# ---------------------------------------------------------------------------
+# 9. Checksums
 # ---------------------------------------------------------------------------
 write_checksums() {
-  ( cd "$DIST_DIR" && sha256sum ./*.deb ./*.tar.gz > SHA256SUMS.txt 2>/dev/null ) || true
+  ( cd "$DIST_DIR" && sha256sum ./*.deb ./*.tar.gz ./*.pkg.tar.zst > SHA256SUMS.txt 2>/dev/null ) || true
   log "wrote SHA256SUMS.txt"
 }
 
@@ -544,6 +694,7 @@ main() {
   [[ "$SKIP_BUILD" -eq 0 ]] && do_build
   [[ "$SKIP_DEB" -eq 0 ]] && build_deb
   [[ "$SKIP_TARBALL" -eq 0 ]] && build_tarball
+  [[ "$SKIP_PACMAN" -eq 0 ]] && build_pacman
   # Opt-in spot check (--audit-secrets); off by default.
   [[ "$AUDIT_SECRETS" -eq 1 ]] && audit_secrets
   write_checksums

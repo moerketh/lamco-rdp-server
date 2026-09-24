@@ -31,7 +31,9 @@ jobs:
         run: |
           set -euo pipefail
           TAG="${GITHUB_REF_NAME}"
-          CARGO_VER="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)"
+          # tr -d '\r': tolerate CRLF checkouts (Windows working trees) so
+          # the same guard passes from a local WSL run.
+          CARGO_VER="$(tr -d '\r' < Cargo.toml | sed -n 's/^version = "\(.*\)"$/\1/p' | head -1)"
           # Accept v<base> or v<base>-hyperv.<n>
           BASE="${TAG#v}"
           BASE="${BASE%-hyperv.*}"
@@ -57,7 +59,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             clang cmake libdbus-1-dev libfuse3-dev libpam0g-dev \
             libpipewire-0.3-dev libspa-0.2-dev libssl-dev libva-dev \
-            libwayland-dev libxkbcommon-dev nasm pkgconf libx264-dev
+            libwayland-dev libxkbcommon-dev nasm pkgconf libx264-dev zstd
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -180,4 +182,5 @@ jobs:
           files: |
             dist/release/*.deb
             dist/release/*.tar.gz
+            dist/release/*.pkg.tar.zst
             dist/release/SHA256SUMS.txt

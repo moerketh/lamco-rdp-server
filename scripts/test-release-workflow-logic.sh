@@ -2,6 +2,9 @@
 # Local dry-run of the workflow's tag-guard + notes-extraction logic.
 # Simulates: TAG from GITHUB_REF_NAME, the PKG_VERSION computation, and
 # the CHANGELOG section extraction, exactly as release.yml does.
+# Also statically verifies the pacman artifact wiring end-to-end: build
+# script flag handling, naming composition, SHA256SUMS coverage, and the
+# CI dependency + release upload globs.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -11,7 +14,7 @@ GITHUB_ENV="$(mktemp)"
 
 # --- tag guard (verbatim from release.yml) ---
 TAG="${GITHUB_REF_NAME}"
-CARGO_VER="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)"
+CARGO_VER="$(tr -d '\r' < Cargo.toml | sed -n 's/^version = "\(.*\)"$/\1/p' | head -1)"
 BASE="${TAG#v}"
 BASE="${BASE%-hyperv.*}"
 if [[ "$BASE" != "$CARGO_VER" ]]; then
@@ -55,3 +58,51 @@ else
   echo "$BODY" | head -8
   echo "  ... ($(echo "$BODY" | wc -l) lines total)"
 fi
+
+# --- pacman artifact wiring (static checks against the release machinery) ---
+# The tag guard only proves PKG_VERSION derivation; these assertions keep the
+# .pkg.tar.zst artifact threaded end-to-end through build → checksums →
+# upload. They fail loudly when a rename or refactor drops one of the wires.
+BRAS="scripts/build-release-artifacts.sh"
+WORKFLOW=".github/workflows/release.yml"
+
+fail=0
+assert_contains() {  # $1 = file, $2 = needle, $3 = description
+  if grep -qF -- "$2" "$1"; then
+    echo "OK: $3"
+  else
+    echo "WIRING FAIL: $3"
+    echo "  missing in $1: $2"
+    fail=1
+  fi
+}
+
+# 1. build script honors --skip-pacman and wires build_pacman into main()
+assert_contains "$BRAS" '--skip-pacman) SKIP_PACMAN=1; shift ;;' \
+  "--skip-pacman flag parsed"
+assert_contains "$BRAS" '[[ "$SKIP_PACMAN" -eq 0 ]] && build_pacman' \
+  "main() calls build_pacman"
+assert_contains "$BRAS" 'local pkgver="${LAMCO_RELEASE_VERSION}-${PACMAN_PKGREL}"' \
+  "pkgver combines LAMCO_RELEASE_VERSION with PACMAN_PKGREL"
+assert_contains "$BRAS" 'lamco-rdp-server-${pkgver}-${ARCH}.pkg.tar.zst' \
+  "artifact name uses <name>-<pkgver>-<arch>.pkg.tar.zst"
+assert_contains "$BRAS" '"$(tar --zstd -tf "$out" | head -1)" == ".PKGINFO"' \
+  ".PKGINFO-first archive guard"
+
+# 2. SHA256SUMS covers the pacman artifact
+assert_contains "$BRAS" 'sha256sum ./*.deb ./*.tar.gz ./*.pkg.tar.zst' \
+  "SHA256SUMS glob includes *.pkg.tar.zst"
+
+# 3. workflow installs the zstd compressor the build script requires
+assert_contains "$WORKFLOW" ' libx264-dev zstd' \
+  "workflow apt installs zstd"
+
+# 4. workflow uploads the pacman artifact
+assert_contains "$WORKFLOW" 'dist/release/*.pkg.tar.zst' \
+  "workflow release upload includes *.pkg.tar.zst"
+
+if [[ $fail -ne 0 ]]; then
+  echo "PACMAN WIRING CHECKS FAILED"
+  exit 1
+fi
+echo "pacman artifact wiring OK"
