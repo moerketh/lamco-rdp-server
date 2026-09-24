@@ -39,7 +39,8 @@ Community Edition runs fully sandboxed via XDG Desktop Portals. Clipboard is sup
 
 | Format | Distro | Install |
 |--------|--------|---------|
-| **AUR** | Arch Linux | `yay -S lamco-rdp-server` |
+| **AUR** (upstream, source-built) | Arch Linux | `yay -S lamco-rdp-server` — no fork features |
+| **pacman** | Arch / Manjaro | `sudo pacman -U lamco-rdp-server-*-x86_64.pkg.tar.zst` |
 | **RPM** | Fedora 42+ | `sudo dnf install ./lamco-rdp-server-*.fc42.x86_64.rpm` |
 | **RPM** | openSUSE Tumbleweed | `sudo zypper install ./lamco-rdp-server-*.suse-tw.x86_64.rpm` |
 | **RPM** | RHEL 9 / AlmaLinux 9 | `sudo dnf install ./lamco-rdp-server-*.el9.x86_64.rpm` |
@@ -49,6 +50,15 @@ Community Edition runs fully sandboxed via XDG Desktop Portals. Clipboard is sup
 Native installs provide full bidirectional clipboard, hardware GPU encoding, and all compositor integration strategies. Free for single-server use and non-profits; commercial license required for multi-server deployments.
 
 The source tarball on the Releases page includes vendored dependencies for offline builds.
+
+### Arch Linux (fork binary)
+
+Download the `.pkg.tar.zst` from the [latest release](https://github.com/moerketh/lamco-rdp-server/releases) and run:
+
+    sudo pacman -U lamco-rdp-server-1.4.5-hyperv3-1-x86_64.pkg.tar.zst
+    systemctl --user enable --now app-io.lamco.rdp-server.service
+
+The fork package and the upstream AUR `lamco-rdp-server` share the same package name: if the AUR package is installed, remove it first (`sudo pacman -R lamco-rdp-server`) — pacman refuses to replace a same-name foreign package implicitly. The AUR package builds this fork's upstream target and does not include the Hyper-V Enhanced Session features (Vsock/WebSocket/x264).
 
 ## Platform Support
 

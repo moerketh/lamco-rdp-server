@@ -12,6 +12,7 @@ Artifacts per release (x86_64):
 |---|---|
 | `lamco-rdp-server_<ver>_amd64.deb` | Debian / Ubuntu / Parrot package |
 | `lamco-rdp-server-<ver>-linux-x86_64.tar.gz` | Portable tarball with `install.sh` (`/usr/local` prefix) |
+| `lamco-rdp-server-<ver>-1-x86_64.pkg.tar.zst` | Arch / Manjaro pacman package (`<ver>-1` = version-pkgrel) |
 | `SHA256SUMS.txt` | Checksums for the above |
 
 ---
@@ -36,7 +37,9 @@ Artifacts per release (x86_64):
    `--version` and the `--licenses` output, and creates the **draft** release
    with all artifacts.
 6. **Review the draft release**: asset names, SHA256SUMS, notes. Fix notes in
-   the GitHub UI if needed.
+   the GitHub UI if needed. Check that the pacman asset is present
+   (`lamco-rdp-server-<ver>-1-x86_64.pkg.tar.zst`, `<ver>-1` = version-pkgrel)
+   and that SHA256SUMS.txt lists the deb, tarball, and pacman package.
 7. **Validate on the test VM before publishing** (see below).
 8. **Publish** the release in the GitHub UI.
 
@@ -95,6 +98,11 @@ lamco-rdp-server --version          # /usr/local/bin
   predates the v2 rewrite.
 - **Local dry-run** without tagging: `bash scripts/build-release-artifacts.sh`
   from a WSL checkout (see README "Building from Source" for system deps).
+  Flags: `--skip-build` (reuse an existing `target/release/`), `--skip-deb`,
+  `--skip-tarball`, `--skip-pacman`, `--audit-secrets` (opt-in secrets
+  spot-check). The pacman package requires `zstd` (the zstd crate only
+  provides the decompressor; `pacman -U` archives are themselves
+  zstd-compressed tarballs, compressed at build time by the CLI `zstd` tool).
 - **Deleting the old pre-v2 branch**: once this lineage is verified across a
   release or two, `git push origin --delete feature/hyperv-enhanced-session`
   (the pre-rewrite backup) is safe.

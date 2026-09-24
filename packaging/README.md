@@ -7,7 +7,10 @@ This directory contains packaging resources for various distribution methods.
 ```
 packaging/
 ├── aur/                           # Arch User Repository
-│   └── PKGBUILD                           # AUR package build script
+│   ├── PKGBUILD                           # AUR package build script (upstream source build)
+│   ├── lamco-rdp-server.install           # AUR install/upgrade shell hooks (source build)
+│   └── cros-libva-vp9-compat.patch        # VA-API VP9 compat patch applied by the PKGBUILD
+```
 ├── obs/                           # openSUSE Build Service (OBS)
 │   ├── lamco-rdp-server.spec              # OBS-specific RPM spec
 │   └── obs-initial-setup.sh               # Initial home project setup script
@@ -38,6 +41,13 @@ packaging/
 ```
 
 ## Installation Methods
+
+The fork's release pipeline also builds a ready-to-install **pacman
+package** (`lamco-rdp-server-<ver>-1-x86_64.pkg.tar.zst`, one `pkgrel`)
+directly from `scripts/build-release-artifacts.sh` — no makepkg or AUR
+account needed. `packaging/aur/lamco-rdp-server.install` remains the source
+of truth for its install/upgrade hooks, which the script embeds; the AUR
+`PKGBUILD` is only used for the (feature-reduced) upstream source build.
 
 ### 1. Flatpak (Recommended for Desktop Users)
 
