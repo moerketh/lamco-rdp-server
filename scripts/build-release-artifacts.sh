@@ -151,9 +151,16 @@ ensure_openh264_license() {
 
     if [[ -z "$cargo_src" ]] && command -v cargo >/dev/null 2>&1; then
       # Fresh checkout: fetch dependencies so the pinned crate is available
-      # locally before the compile step needs this file.
+      # locally before the compile step needs this file. Capture fetch output
+      # so a --locked / network / manifest failure is visible in the log
+      # instead of collapsing into the "no source for licenses" error below.
       log "populating cargo registry (cargo fetch --locked)"
-      cargo fetch --locked >/dev/null 2>&1 || log "cargo fetch reported issues; continuing"
+      local fetch_out fetch_rc
+      fetch_out="$(cargo fetch --locked 2>&1)" && fetch_rc=0 || fetch_rc=$?
+      if [[ "$fetch_rc" -ne 0 ]]; then
+        log "cargo fetch --locked FAILED (rc=$fetch_rc):"
+        printf '%s\n' "$fetch_out" >&2
+      fi
       cargo_src="$(find "$HOME/.cargo/registry/src" -path '*openh264-sys2*/tests/reference/BINARY_LICENSE.txt' 2>/dev/null | sort -V | tail -1 || true)"
     fi
 
