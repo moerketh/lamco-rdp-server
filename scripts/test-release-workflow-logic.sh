@@ -55,7 +55,10 @@ if [[ -z "$BODY" ]]; then
   echo "NOTES FALLBACK (no CHANGELOG section) — would use git log"
 else
   echo "NOTES FOUND for $head:"
-  echo "$BODY" | head -8
+  # The preview must not mask late SIGPIPE: the section body can exceed the
+  # 64KB pipe buffer, echo dies on head's exit, and with pipefail the whole
+  # script aborts before the pacman-wiring assertions below ever run.
+  echo "$BODY" | head -8 || true
   echo "  ... ($(echo "$BODY" | wc -l) lines total)"
 fi
 
