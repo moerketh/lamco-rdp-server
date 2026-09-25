@@ -1976,7 +1976,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2885,14 +2885,17 @@ dependencies = [
 [[package]]
 name = "hyperv-rdp-extras"
 version = "0.1.0"
-source = "git+https://github.com/moerketh/hyperv-rdp-extras?rev=bf8a901#bf8a90184365fd53132be80b5aed37fa3fee0ba6"
+source = "git+https://github.com/moerketh/hyperv-rdp-extras?rev=8dcaf6aea928d2123ac7ba0ece45082b62eeaa4e#8dcaf6aea928d2123ac7ba0ece45082b62eeaa4e"
 dependencies = [
  "anyhow",
+ "bitflags 2.11.0",
  "nix 0.31.3",
  "tokio",
  "tracing",
+ "wayland-backend",
  "wayland-client",
  "wayland-protocols-plasma",
+ "wayland-scanner",
 ]
 
 [[package]]
@@ -3769,16 +3772,15 @@ dependencies = [
 
 [[package]]
 name = "lamco-pipewire"
-version = "0.6.13"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f184ada837636b715661cb97aaf646e18f758a544f2bd5b2554c1cadf7cac8e9"
+version = "0.6.15"
+source = "git+https://github.com/moerketh/lamco-wayland?rev=b70e86d#b70e86d1ac614a45f06acc5917c17a631f047025"
 dependencies = [
  "anyhow",
  "futures",
  "libc",
  "libspa",
  "libspa-sys",
- "nix 0.31.3",
+ "nix 0.30.1",
  "parking_lot",
  "pipewire",
  "thiserror 2.0.20",
@@ -6472,7 +6474,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7326,7 +7328,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -8639,7 +8641,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
