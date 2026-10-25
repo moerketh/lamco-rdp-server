@@ -58,6 +58,40 @@ pub struct TransferFileDescriptor {
     pub file_index: u32,
     /// Clipboard data ID for RDP locking
     pub clip_data_id: u32,
+    /// Sanitized path within the copied collection (directories kept), for
+    /// backends that rebuild the tree; `filename` stays the flat leaf name.
+    pub relative_path: PathBuf,
+    /// The entry is a directory: nothing to fetch, create it.
+    pub is_directory: bool,
+    /// The entry is one of the copied items themselves (announce it); the
+    /// rest live inside a copied directory.
+    pub top_level: bool,
+}
+
+impl TransferFileDescriptor {
+    /// Descriptors for a remote file list, in list order, each with its
+    /// planned place in the staging tree.
+    pub fn from_remote_entries(
+        entries: &[(hyperv_rdp_extras::clipboard::RemoteEntry<'_>, Option<u64>)],
+        clip_data_id: u32,
+    ) -> Vec<Self> {
+        let remote: Vec<_> = entries.iter().map(|(e, _)| *e).collect();
+        let plan = hyperv_rdp_extras::clipboard::plan_staged_tree(&remote);
+        entries
+            .iter()
+            .zip(plan)
+            .enumerate()
+            .map(|(idx, ((entry, size), staged))| Self {
+                filename: lamco_clipboard_core::sanitize::sanitize_filename_for_linux(entry.name),
+                size: size.unwrap_or(0),
+                file_index: idx as u32,
+                clip_data_id,
+                relative_path: staged.path,
+                is_directory: staged.is_directory,
+                top_level: staged.top_level,
+            })
+            .collect()
+    }
 }
 
 /// Result of preparing files for clipboard announcement.
@@ -254,6 +288,9 @@ mod tests {
             size: 1024,
             file_index: 0,
             clip_data_id: 1,
+            relative_path: PathBuf::from("test.txt"),
+            is_directory: false,
+            top_level: true,
         };
         assert_eq!(desc.filename, "test.txt");
         assert_eq!(desc.size, 1024);

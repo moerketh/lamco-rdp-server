@@ -308,6 +308,10 @@ impl ClipboardOrchestrator {
         Ok(())
     }
 
+    /// Most entries a Linux → Windows file copy offers (a copied directory
+    /// is expanded into everything beneath it).
+    const MAX_OUTGOING_ENTRIES: usize = 10_000;
+
     /// Read the Linux clipboard's file list and prepare a Linux → Windows file copy:
     /// register the on-disk paths with the transfer backend (so content requests can be
     /// served) and return IronRDP file descriptors for the offer.
@@ -344,23 +348,29 @@ impl ClipboardOrchestrator {
             return None;
         }
 
-        let mut descriptors = Vec::with_capacity(paths.len());
-        let mut outgoing = Vec::with_capacity(paths.len());
-        for path in &paths {
-            let Some(filename) = path.file_name().map(|n| n.to_string_lossy().into_owned()) else {
-                continue;
-            };
-            if filename.is_empty() {
-                continue;
+        // A copied directory is offered with everything beneath it: listing
+        // only the directory makes Windows create it empty.
+        let (entries, skipped) = tokio::task::spawn_blocking(move || {
+            hyperv_rdp_extras::clipboard::expand_outgoing(&paths, Self::MAX_OUTGOING_ENTRIES)
+        })
+        .await
+        .ok()?;
+        if skipped > 0 {
+            warn!(
+                "File copy: skipped {} entries (unreadable, name too long for RDP, or past {} entries)",
+                skipped, Self::MAX_OUTGOING_ENTRIES
+            );
+        }
+
+        let mut descriptors = Vec::with_capacity(entries.len());
+        let mut outgoing = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let mut descriptor = FileDescriptor::new(entry.name.clone());
+            if let Some(dir) = entry.relative_dir {
+                descriptor = descriptor.with_relative_path(dir);
             }
-
-            let meta = tokio::fs::metadata(path).await.ok();
-            let size = meta.as_ref().map_or(0, std::fs::Metadata::len);
-            let is_dir = meta.as_ref().is_some_and(std::fs::Metadata::is_dir);
-
-            let mut descriptor = FileDescriptor::new(filename.clone());
-            descriptor.file_size = Some(size);
-            descriptor.attributes = Some(if is_dir {
+            descriptor.file_size = Some(entry.size);
+            descriptor.attributes = Some(if entry.is_directory {
                 ClipboardFileAttributes::DIRECTORY
             } else {
                 ClipboardFileAttributes::ARCHIVE
@@ -372,9 +382,9 @@ impl ClipboardOrchestrator {
             descriptors.push(descriptor);
             outgoing.push(OutgoingFileInfo {
                 list_index,
-                path: path.clone(),
-                size,
-                filename,
+                path: entry.path,
+                size: entry.size,
+                filename: entry.name,
             });
         }
 

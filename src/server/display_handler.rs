@@ -1375,6 +1375,19 @@ impl LamcoDisplayHandler {
         );
     }
 
+    /// Desktop size for a connection whose capture source cannot be resized
+    /// to the client (no elastic capture, or the elastic recreate failed).
+    ///
+    /// The live capture size wins whenever it is known; the client's request
+    /// is only a fallback for a capture that has not reported a size yet.
+    fn plain_path_desktop_size(client_size: DesktopSize, live: DesktopSize) -> DesktopSize {
+        if live.width > 0 && live.height > 0 {
+            live
+        } else {
+            client_size
+        }
+    }
+
     /// Record a new CAPTURE (compositor/PipeWire) size.
     ///
     /// Called when the compositor's actual output changes (per-frame capture
@@ -5680,7 +5693,7 @@ impl RdpServerDisplay for LamcoDisplayHandler {
         }
         if client_size == current && live != current {
             warn!(
-                "request_initial_size: size state {}x{} disagrees with live capture {}x{} — forcing resize to {}x{}",
+                "request_initial_size: size state {}x{} disagrees with live capture {}x{} — re-resolving for client {}x{}",
                 current.width, current.height, live.width, live.height,
                 client_size.width, client_size.height
             );
@@ -5781,26 +5794,42 @@ impl RdpServerDisplay for LamcoDisplayHandler {
                             "Elastic capture failed at {}x{} — keeping current desktop size",
                             client_size.width, client_size.height
                         );
-                        // Fall through: adopt the client's size as the RDP
-                        // desktop anyway. The per-frame capture-size tracking
-                        // records what the source actually delivers.
+                        // Fall through to the plain path: the source did not
+                        // follow the client, so the live capture size is the
+                        // only size the encoder can honour.
                     }
                 }
             }
         }
 
-        // Same silent adoption on the plain path — a queued resize during
-        // capability processing tears the fresh activation down (see
-        // adopt_size_silently).
-        self.adopt_size_silently(client_size.width, client_size.height)
+        // Plain path (MutterDirect, portal-generic, ScreenCastOnly, wlr-direct,
+        // or a failed elastic recreate): the capture source does NOT follow the
+        // client, so the desktop must be the LIVE capture size. Adopting the
+        // client's size here desynchronised the EGFX surface (built from the
+        // desktop, e.g. 1376x768) from the encoder (built from the frames,
+        // 1920x1088): the client re-advertised its caps and dropped with a
+        // protocol error (field-observed on GNOME and Hyprland at any
+        // non-native client size). The server's Demand Active size is
+        // authoritative; RDP clients accept a desktop that differs from their
+        // request (scrollbars / smart sizing). Silent adoption for the same
+        // reason as the elastic branch (see adopt_size_silently).
+        let adopted = Self::plain_path_desktop_size(client_size, live);
+        self.adopt_size_silently(adopted.width, adopted.height)
             .await;
 
-        info!(
-            "request_initial_size: adopted client desktop {}x{} (capture truth deferred to first frame)",
-            client_size.width, client_size.height
-        );
+        if adopted == client_size {
+            info!(
+                "request_initial_size: adopted client desktop {}x{} (capture size unknown or equal)",
+                client_size.width, client_size.height
+            );
+        } else {
+            info!(
+                "request_initial_size: client requested {}x{} but the capture source is fixed at {}x{} — desktop is the capture size",
+                client_size.width, client_size.height, adopted.width, adopted.height
+            );
+        }
 
-        client_size
+        adopted
     }
 
     /// Called once per connection to establish the update stream.
@@ -6553,6 +6582,96 @@ mod tests {
         assert!(
             new_sender.try_send(DisplayUpdate::HidePointer).is_ok(),
             "fresh channel must accept sends"
+        );
+    }
+
+    // === Non-resizable capture: connect-time desktop size ===
+    //
+    // Without elastic capture the source stays at its own size; a desktop
+    // adopted from the client (1366x768 against a 1920x1080 GNOME/Hyprland
+    // capture) desynchronised the EGFX surface from the encoder and the
+    // client dropped with a protocol error.
+
+    async fn plain_handler(width: u16, height: u16) -> LamcoDisplayHandler {
+        let (_raw_tx, raw_rx) = std::sync::mpsc::channel();
+        let config = Arc::new(crate::config::Config::default());
+        let registry = Arc::new(crate::services::ServiceRegistry::from_compositor(
+            crate::compositor::CompositorCapabilities::new(
+                crate::compositor::CompositorType::Gnome { version: None },
+                crate::compositor::PortalCapabilities::default(),
+                Vec::new(),
+            ),
+        ));
+        LamcoDisplayHandler::new_direct(
+            width,
+            height,
+            raw_rx,
+            Vec::new(),
+            None,
+            None,
+            None,
+            config,
+            registry,
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        )
+        .await
+        .expect("handler construction")
+    }
+
+    #[tokio::test]
+    async fn test_initial_size_without_elastic_capture_keeps_capture_size() {
+        let mut handler = plain_handler(1920, 1080).await;
+
+        let granted = handler
+            .request_initial_size(DesktopSize {
+                width: 1366,
+                height: 768,
+            })
+            .await;
+
+        let capture = DesktopSize {
+            width: 1920,
+            height: 1080,
+        };
+        assert_eq!(granted, capture, "desktop must be the fixed capture size");
+        assert_eq!(handler.size().await, capture, "stored desktop must agree");
+    }
+
+    #[tokio::test]
+    async fn test_initial_size_without_elastic_capture_follows_renegotiated_capture() {
+        let mut handler = plain_handler(1920, 1080).await;
+        // The compositor output changed since startup (per-frame tracking).
+        handler.update_capture_size(2560, 1440).await;
+
+        let granted = handler
+            .request_initial_size(DesktopSize {
+                width: 1920,
+                height: 1080,
+            })
+            .await;
+
+        assert_eq!(
+            granted,
+            DesktopSize {
+                width: 2560,
+                height: 1440
+            }
+        );
+    }
+
+    #[test]
+    fn test_plain_path_size_falls_back_to_client_when_capture_unknown() {
+        let client = DesktopSize {
+            width: 1366,
+            height: 768,
+        };
+        let unknown = DesktopSize {
+            width: 0,
+            height: 0,
+        };
+        assert_eq!(
+            LamcoDisplayHandler::plain_path_desktop_size(client, unknown),
+            client
         );
     }
 

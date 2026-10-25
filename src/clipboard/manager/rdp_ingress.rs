@@ -26,6 +26,24 @@ use crate::clipboard::{
     sync::SyncManager,
 };
 
+/// Planner input for a remote file list (leaf names + relative directories;
+/// the directory attribute is not carried by this event).
+fn remote_entries(
+    files: &[lamco_rdp_clipboard::RemoteFileMetadata],
+) -> Vec<(hyperv_rdp_extras::clipboard::RemoteEntry<'_>, Option<u64>)> {
+    files
+        .iter()
+        .map(|f| (
+            hyperv_rdp_extras::clipboard::RemoteEntry {
+                relative_dir: f.relative_path.as_deref(),
+                name: &f.name,
+                is_directory: None,
+            },
+            f.size,
+        ))
+        .collect()
+}
+
 /// Last provider read failure, its first occurrence, and how many identical
 /// failures have followed it.
 ///
@@ -629,32 +647,65 @@ impl ClipboardOrchestrator {
         >,
         server_event_sender: &ServerEventSender,
         transfer_data_cache: &Arc<RwLock<HashMap<String, Vec<u8>>>>,
+        pending_portal_requests: &PendingPortalRequests,
     ) -> Result<()> {
         let provider_opt = clipboard_provider.read().await;
         let Some(provider) = provider_opt.as_ref() else {
             return Ok(());
         };
-        if !provider.requires_upfront_data() || files.is_empty() {
+        if files.is_empty() {
             return Ok(());
         }
 
-        use lamco_clipboard_core::sanitize::sanitize_filename_for_linux;
+        if !provider.requires_upfront_data() {
+            // On-demand providers (GNOME/KDE): the paste that asked for the
+            // file list is still queued. IronRDP intercepts the
+            // FileGroupDescriptorW FormatDataResponse and reports it only
+            // here, so handle_rdp_data_response never ran for it: answer it
+            // now, and take its FIFO slot so the next text response is not
+            // matched to this stale file serial.
+            let request = hyperv_rdp_extras::clipboard::take_pending_file_paste(
+                &mut *pending_portal_requests.write().await,
+                EAGER_FETCH_SERIAL,
+            );
+            let Some((serial, requested_mime, _)) = request else {
+                debug!("RemoteFileList with no pending file paste; nothing to answer");
+                return Ok(());
+            };
+            let provider = Arc::clone(provider);
+            drop(provider_opt);
+            let transfer_descriptors =
+                crate::clipboard::file_transfer::TransferFileDescriptor::from_remote_entries(
+                    &remote_entries(&files),
+                    clip_data_id.unwrap_or(1),
+                );
+            info!(
+                "RemoteFileList: answering pending file paste (serial {}, {} file(s))",
+                serial,
+                files.len()
+            );
+            return Self::deliver_file_list(
+                transfer_descriptors,
+                serial,
+                requested_mime,
+                Some(&provider),
+                pending_portal_requests,
+                file_transfer_backend,
+                server_event_sender,
+                transfer_data_cache,
+            )
+            .await;
+        }
 
         use crate::clipboard::file_transfer::{
             PrepareResult, TransferFileDescriptor, generate_gnome_copied_files_content,
             generate_uri_list_content,
         };
 
-        let transfer_descriptors: Vec<TransferFileDescriptor> = files
-            .iter()
-            .enumerate()
-            .map(|(idx, f)| TransferFileDescriptor {
-                filename: sanitize_filename_for_linux(&f.name),
-                size: f.size.unwrap_or(0),
-                file_index: idx as u32,
-                clip_data_id: clip_data_id.unwrap_or(1),
-            })
-            .collect();
+        let transfer_descriptors = TransferFileDescriptor::from_remote_entries(
+            &remote_entries(&files),
+            clip_data_id.unwrap_or(1),
+        );
 
         let sender = match first_live_sender(server_event_sender).await {
             Some(s) => s,
@@ -697,6 +748,136 @@ impl ClipboardOrchestrator {
             }
             PrepareResult::Failed(reason) => {
                 error!("RemoteFileList: prepare_files failed: {reason}");
+            }
+        }
+        Ok(())
+    }
+
+    /// Deliver a remote (Windows) file list to the pending portal paste
+    /// `serial`: stage or map the files through the file-transfer backend and
+    /// answer every pending file-MIME serial with the resulting URIs.
+    ///
+    /// Shared by the two routes a FileGroupDescriptorW reaches us on: a plain
+    /// FormatDataResponse, and IronRDP's `on_remote_file_list`, which
+    /// intercepts the file-list response and never forwards it as format data.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "orchestrator handler with shared state refs"
+    )]
+    async fn deliver_file_list(
+        transfer_descriptors: Vec<crate::clipboard::file_transfer::TransferFileDescriptor>,
+        serial: u32,
+        requested_mime: String,
+        provider_opt: Option<&Arc<dyn crate::clipboard::provider::ClipboardProvider>>,
+        pending_portal_requests: &PendingPortalRequests,
+        file_transfer_backend: &Arc<
+            tokio::sync::RwLock<Box<dyn crate::clipboard::file_transfer::FileTransferBackend>>,
+        >,
+        server_event_sender: &ServerEventSender,
+        transfer_data_cache: &Arc<RwLock<HashMap<String, Vec<u8>>>>,
+    ) -> Result<()> {
+        use crate::clipboard::file_transfer::PrepareResult;
+
+        let sender = match first_live_sender(server_event_sender).await {
+            Some(s) => s,
+            None => {
+                error!("ServerEvent sender not available");
+                if let Some(provider) = provider_opt {
+                    let _ = provider
+                        .complete_transfer(serial, &requested_mime, vec![], false)
+                        .await;
+                }
+                return Ok(());
+            }
+        };
+
+        let backend = file_transfer_backend.read().await;
+        match backend
+            .prepare_files(&transfer_descriptors, serial, &sender)
+            .await?
+        {
+            PrepareResult::Ready(paths) => {
+                // GNOME announces both text/uri-list and x-special/gnome-copied-files
+                // and its clipboard-manager poll loop fires SelectionTransfers that
+                // race the user's actual paste. Unlike the generic-data path below,
+                // this branch used to answer only the serial that triggered the RDP
+                // fetch and return — leaving the paste's serial unanswered, so Files
+                // pasted nothing. Answer every pending file-MIME serial from the same
+                // data and cache both variants for GNOME's subsequent requests.
+                use crate::clipboard::file_transfer::{
+                    generate_gnome_copied_files_content, generate_uri_list_content,
+                };
+                let gnome_bytes =
+                    generate_gnome_copied_files_content(&paths).into_bytes();
+                let urilist_bytes = generate_uri_list_content(&paths).into_bytes();
+                let content_for = |mime: &str| match mime {
+                    "text/uri-list" => Some(urilist_bytes.clone()),
+                    "x-special/gnome-copied-files" => Some(gnome_bytes.clone()),
+                    _ => None,
+                };
+
+                if let Some(provider) = provider_opt {
+                    let first = content_for(&requested_mime)
+                        .unwrap_or_else(|| gnome_bytes.clone());
+                    provider
+                        .complete_transfer(serial, &requested_mime, first, true)
+                        .await?;
+
+                    let others: Vec<(u32, String)> = {
+                        let mut pending = pending_portal_requests.write().await;
+                        let drained = pending
+                            .iter()
+                            .filter(|(s, _, _)| *s != serial)
+                            .map(|(s, m, _)| (*s, m.clone()))
+                            .collect();
+                        pending.clear();
+                        drained
+                    };
+                    for (other_serial, other_mime) in others {
+                        let result = match content_for(&other_mime) {
+                            Some(bytes) => {
+                                provider
+                                    .complete_transfer(
+                                        other_serial,
+                                        &other_mime,
+                                        bytes,
+                                        true,
+                                    )
+                                    .await
+                            }
+                            None => {
+                                provider
+                                    .complete_transfer(
+                                        other_serial,
+                                        &other_mime,
+                                        vec![],
+                                        false,
+                                    )
+                                    .await
+                            }
+                        };
+                        if let Err(e) = result {
+                            warn!(
+                                "Failed to answer pending serial {other_serial}: {e}"
+                            );
+                        }
+                    }
+                }
+
+                let mut cache = transfer_data_cache.write().await;
+                cache.insert("x-special/gnome-copied-files".to_string(), gnome_bytes);
+                cache.insert("text/uri-list".to_string(), urilist_bytes);
+            }
+            PrepareResult::Pending => {
+                // Staging backend will notify via event channel
+            }
+            PrepareResult::Failed(reason) => {
+                error!("File transfer backend failed: {}", reason);
+                if let Some(provider) = provider_opt {
+                    let _ = provider
+                        .complete_transfer(serial, &requested_mime, vec![], false)
+                        .await;
+                }
             }
         }
         Ok(())
@@ -1026,124 +1207,37 @@ impl ClipboardOrchestrator {
                         );
                     }
 
-                    use lamco_clipboard_core::sanitize::sanitize_filename_for_linux;
+                    use crate::clipboard::file_transfer::TransferFileDescriptor;
 
-                    use crate::clipboard::file_transfer::{PrepareResult, TransferFileDescriptor};
-
-                    let transfer_descriptors: Vec<TransferFileDescriptor> = descriptors
+                    // FILE_ATTRIBUTE_DIRECTORY when the attributes were sent;
+                    // otherwise the planner infers directories from the tree.
+                    let entries: Vec<_> = descriptors
                         .iter()
-                        .enumerate()
-                        .map(|(idx, d)| TransferFileDescriptor {
-                            filename: sanitize_filename_for_linux(&d.name),
-                            size: d.size.unwrap_or(0),
-                            file_index: idx as u32,
-                            clip_data_id: 1,
+                        .map(|d| {
+                            (
+                                hyperv_rdp_extras::clipboard::RemoteEntry {
+                                    relative_dir: None,
+                                    name: &d.name,
+                                    is_directory: (d.attributes & 0x10 != 0).then_some(true),
+                                },
+                                d.size,
+                            )
                         })
                         .collect();
+                    let transfer_descriptors =
+                        TransferFileDescriptor::from_remote_entries(&entries, 1);
 
-                    let sender = match first_live_sender(server_event_sender).await {
-                        Some(s) => s,
-                        None => {
-                            error!("ServerEvent sender not available");
-                            if let Some(ref provider) = provider_opt {
-                                let _ = provider
-                                    .complete_transfer(serial, &requested_mime, vec![], false)
-                                    .await;
-                            }
-                            return Ok(());
-                        }
-                    };
-
-                    let backend = file_transfer_backend.read().await;
-                    match backend
-                        .prepare_files(&transfer_descriptors, serial, &sender)
-                        .await?
-                    {
-                        PrepareResult::Ready(paths) => {
-                            // GNOME announces both text/uri-list and x-special/gnome-copied-files
-                            // and its clipboard-manager poll loop fires SelectionTransfers that
-                            // race the user's actual paste. Unlike the generic-data path below,
-                            // this branch used to answer only the serial that triggered the RDP
-                            // fetch and return — leaving the paste's serial unanswered, so Files
-                            // pasted nothing. Answer every pending file-MIME serial from the same
-                            // data and cache both variants for GNOME's subsequent requests.
-                            use crate::clipboard::file_transfer::{
-                                generate_gnome_copied_files_content, generate_uri_list_content,
-                            };
-                            let gnome_bytes =
-                                generate_gnome_copied_files_content(&paths).into_bytes();
-                            let urilist_bytes = generate_uri_list_content(&paths).into_bytes();
-                            let content_for = |mime: &str| match mime {
-                                "text/uri-list" => Some(urilist_bytes.clone()),
-                                "x-special/gnome-copied-files" => Some(gnome_bytes.clone()),
-                                _ => None,
-                            };
-
-                            if let Some(ref provider) = provider_opt {
-                                let first = content_for(&requested_mime)
-                                    .unwrap_or_else(|| gnome_bytes.clone());
-                                provider
-                                    .complete_transfer(serial, &requested_mime, first, true)
-                                    .await?;
-
-                                let others: Vec<(u32, String)> = {
-                                    let mut pending = pending_portal_requests.write().await;
-                                    let drained = pending
-                                        .iter()
-                                        .filter(|(s, _, _)| *s != serial)
-                                        .map(|(s, m, _)| (*s, m.clone()))
-                                        .collect();
-                                    pending.clear();
-                                    drained
-                                };
-                                for (other_serial, other_mime) in others {
-                                    let result = match content_for(&other_mime) {
-                                        Some(bytes) => {
-                                            provider
-                                                .complete_transfer(
-                                                    other_serial,
-                                                    &other_mime,
-                                                    bytes,
-                                                    true,
-                                                )
-                                                .await
-                                        }
-                                        None => {
-                                            provider
-                                                .complete_transfer(
-                                                    other_serial,
-                                                    &other_mime,
-                                                    vec![],
-                                                    false,
-                                                )
-                                                .await
-                                        }
-                                    };
-                                    if let Err(e) = result {
-                                        warn!(
-                                            "Failed to answer pending serial {other_serial}: {e}"
-                                        );
-                                    }
-                                }
-                            }
-
-                            let mut cache = transfer_data_cache.write().await;
-                            cache.insert("x-special/gnome-copied-files".to_string(), gnome_bytes);
-                            cache.insert("text/uri-list".to_string(), urilist_bytes);
-                        }
-                        PrepareResult::Pending => {
-                            // Staging backend will notify via event channel
-                        }
-                        PrepareResult::Failed(reason) => {
-                            error!("File transfer backend failed: {}", reason);
-                            if let Some(ref provider) = provider_opt {
-                                let _ = provider
-                                    .complete_transfer(serial, &requested_mime, vec![], false)
-                                    .await;
-                            }
-                        }
-                    }
-                    return Ok(());
+                    return Self::deliver_file_list(
+                        transfer_descriptors,
+                        serial,
+                        requested_mime,
+                        provider_opt.as_ref(),
+                        pending_portal_requests,
+                        file_transfer_backend,
+                        server_event_sender,
+                        transfer_data_cache,
+                    )
+                    .await;
                 }
                 Err(e) => {
                     error!("Failed to parse FileGroupDescriptorW: {:?}", e);
@@ -1497,3 +1591,4 @@ mod eager_fetch_tests {
         assert_eq!(decoded, EagerImageDecode::Unsupported);
     }
 }
+

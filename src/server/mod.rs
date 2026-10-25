@@ -1047,6 +1047,8 @@ impl LamcoRdpServer {
                     enable_rtf: has_type(&["rtf"]),
                     rate_limit_ms: config.clipboard.rate_limit_ms,
                     kde_syncselection_hint: config.clipboard.kde_syncselection_hint,
+                    file_transfer_mode: config.clipboard.file_transfer_mode.clone(),
+                    file_transfer_download_dir: config.clipboard.file_transfer_download_dir.clone(),
                     ..ClipboardOrchestratorConfig::default()
                 };
 
@@ -1202,15 +1204,7 @@ impl LamcoRdpServer {
                     addr_builder.with_tls(tls_acceptor)
                 };
 
-                // Per-transport security (C1): when vsock is resolved and the
-                // primary is NOT already plain (security_mode = "rdp" makes
-                // the primary itself plain — nothing secondary to build),
-                // build a second server speaking Standard RDP Security for
-                // host-relayed vsock connections. vmms terminates TLS/CredSSP
-                // on the host and relays plaintext RDP over the
-                // hypervisor-isolated vsock; a TLS-configured server fails
-                // that with "received corrupt message ... InvalidContentType"
-                // (upstream #52).
+                // Per-transport security (C1, see needs_vsock_plain_server).
                 //
                 // Build order: the PLAIN server consumes the single-use
                 // factory objects first; the primary then rebuilds its own
@@ -1218,48 +1212,9 @@ impl LamcoRdpServer {
                 // orchestrator, keyboard handler state, codec table, sound
                 // config). `LamcoGfxFactory::share_state_with` gives the
                 // plain server the same EGFX state/server handles.
-                let vsock_active = {
-                    #[cfg(feature = "vsock")]
-                    {
-                        config
-                            .server
-                            .transports
-                            .resolve(&config.server.listen_addr)
-                            .map(|t| t.vsock.is_some())
-                            .unwrap_or(false)
-                    }
-                    #[cfg(not(feature = "vsock"))]
-                    {
-                        false
-                    }
-                };
                 let plain_server =
-                    if vsock_active && !is_standard_rdp_security(&config.security.security_mode) {
-                        info!(
-                            "Security: vsock transport active — building a second server with \
-                         Standard RDP Security for Hyper-V Enhanced Session (vmconnect) \
-                         connections; TCP/Unix/WebSocket keep their configured security"
-                        );
-                        // The plain server never runs CredSSP, so the PAM
-                        // credential validator installed on the primary does
-                        // not apply to vsock-originated connections — they are
-                        // accepted on the host-relay's say-so alone. That is
-                        // the intended Hyper-V Enhanced Session design (vmms
-                        // authenticates the user before forwarding), but it
-                        // must be visible, not silent: with auth_method set to
-                        // anything but "none", say it loudly so an operator
-                        // hardening TCP auth knows vsock is the open flank.
-                        // (Mitigated by the CID allowlist; on the auto-detect
-                        // path it defaults to [VMADDR_CID_HOST].)
-                        if config.security.auth_method != "none" {
-                            warn!(
-                                auth_method = %config.security.auth_method,
-                                "Security: the vsock plain-RDP server does NOT authenticate \
-                                 (no CredSSP/PAM) — access control is the host relay's job. \
-                                 Restrict [server.transports.vsock] allowed_cids if this is \
-                                 unintended."
-                            );
-                        }
+                    if needs_vsock_plain_server(&config) {
+                        log_vsock_plain_server(&config);
                         Some(
                             RdpServer::builder()
                                 .with_addr(listen_addr)
@@ -1320,8 +1275,9 @@ impl LamcoRdpServer {
                     ))))
                     // Resolution support: honor the client's requested desktop
                     // size (dialog choice), clamped to 3840x2160. The display
-                    // handler adopts the requested desktop size (elastic
-                    // capture recreates the compositor source to match).
+                    // handler decides the granted size (request_initial_size:
+                    // elastic capture follows the client, a fixed capture
+                    // keeps its own size).
                     .with_honor_client_desktop_size(Some(ironrdp_server::DesktopSize {
                         width: 3840,
                         height: 2160,
@@ -1766,6 +1722,8 @@ impl LamcoRdpServer {
                 enable_rtf: has_type(&["rtf"]),
                 rate_limit_ms: config.clipboard.rate_limit_ms,
                 kde_syncselection_hint: config.clipboard.kde_syncselection_hint,
+                file_transfer_mode: config.clipboard.file_transfer_mode.clone(),
+                file_transfer_download_dir: config.clipboard.file_transfer_download_dir.clone(),
                 ..ClipboardOrchestratorConfig::default()
             };
 
@@ -1941,34 +1899,84 @@ impl LamcoRdpServer {
             addr_builder.with_tls(tls_acceptor)
         };
 
-        // This path (Portal Token strategy) builds a single server: per-transport
-        // dual-server routing is implemented on the self-sufficient-strategies
-        // path above; the portal path keeps upstream v1.4.5 single-server shape.
-        let mut rdp_server = crate::transport::ServerPair::single(
-            handler_builder
-                .with_input_handler(input_handler)
-                .with_display_handler((*display_handler).clone())
-                .with_bitmap_codecs(codecs)
-                .with_cliprdr_factory(Some(Box::new(clipboard_factory)))
-                .with_gfx_factory(if egfx_enabled {
-                    Some(Box::new(gfx_factory))
-                } else {
-                    None
-                })
-                .with_sound_factory(Some(Box::new(sound_factory)))
-                .with_rdpei_factory(rdpei_factory)
-                .with_autodetect_rtt_handle(Arc::clone(&autodetect_rtt))
-                .with_connection_handler(Some(Box::new(keyboard_layout_handler)))
-                // Resolution support: honor the client's requested desktop size
-                // (dialog choice), clamped to 3840x2160. The display handler
-                // adopts the requested desktop size (elastic capture recreates
-                // the compositor source to match).
-                .with_honor_client_desktop_size(Some(ironrdp_server::DesktopSize {
-                    width: 3840,
-                    height: 2160,
-                }))
-                .build(),
-        );
+        // Per-transport security (C1, see needs_vsock_plain_server) on the
+        // Portal / Mutter Direct path too: without it a Hybrid-configured
+        // GNOME session refuses every vmconnect connection ("server requires
+        // HYBRID|HYBRID_EX"). Same build order as the self-sufficient path:
+        // the plain server consumes the single-use factories, the primary
+        // rebuilds its own over the same shared state.
+        let plain_server = if needs_vsock_plain_server(&config) {
+            log_vsock_plain_server(&config);
+            Some(
+                RdpServer::builder()
+                    .with_addr(listen_addr)
+                    .with_no_security()
+                    .with_input_handler(input_handler.clone())
+                    .with_display_handler((*display_handler).clone())
+                    .with_bitmap_codecs(codecs)
+                    .with_cliprdr_factory(Some(Box::new(clipboard_factory)))
+                    .with_gfx_factory(if egfx_enabled {
+                        Some(Box::new(gfx_factory.share_state_with()))
+                    } else {
+                        None
+                    })
+                    .with_sound_factory(Some(Box::new(sound_factory)))
+                    .with_rdpei_factory(rdpei_factory)
+                    .with_autodetect_rtt_handle(Arc::clone(&autodetect_rtt))
+                    .with_connection_handler(Some(Box::new(keyboard_layout_handler)))
+                    .with_honor_client_desktop_size(Some(ironrdp_server::DesktopSize {
+                        width: 3840,
+                        height: 2160,
+                    }))
+                    .build(),
+            )
+        } else {
+            None
+        };
+
+        // Primary server. When the plain server was built it consumed the
+        // originals, so every single-use factory is rebuilt from its Arc'd
+        // source; otherwise these are the first (and only) instances.
+        let primary_keyboard_handler = Arc::clone(&input_handler.keyboard_handler);
+        let primary_rdpei_factory: Option<RdpeiFactory> = config
+            .input
+            .enable_touch
+            .then(|| Box::new(create_rdpei_factory(input_handler.input_sender())) as RdpeiFactory);
+        let primary = handler_builder
+            .with_input_handler(input_handler)
+            .with_display_handler((*display_handler).clone())
+            .with_bitmap_codecs(
+                server_codecs_capabilities(&["remotefx"])
+                    .map_err(|e| anyhow::anyhow!("Failed to create codec capabilities: {e}"))?,
+            )
+            .with_cliprdr_factory(Some(Box::new(LamcoCliprdrFactory::new(Arc::clone(
+                &clipboard_manager,
+            )))))
+            .with_gfx_factory(if egfx_enabled {
+                Some(Box::new(gfx_factory))
+            } else {
+                None
+            })
+            .with_sound_factory(Some(Box::new(create_sound_factory(&config.audio, None))))
+            .with_rdpei_factory(primary_rdpei_factory)
+            .with_autodetect_rtt_handle(Arc::clone(&autodetect_rtt))
+            .with_connection_handler(Some(Box::new(KeyboardLayoutConnectionHandler::new(
+                primary_keyboard_handler,
+            ))))
+            // Resolution support: honor the client's requested desktop size
+            // (dialog choice), clamped to 3840x2160. The display handler
+            // decides the granted size (request_initial_size: elastic capture
+            // follows the client, a fixed capture keeps its own size).
+            .with_honor_client_desktop_size(Some(ironrdp_server::DesktopSize {
+                width: 3840,
+                height: 2160,
+            }))
+            .build();
+
+        let mut rdp_server = match plain_server {
+            Some(plain) => crate::transport::ServerPair::dual(primary, plain),
+            None => crate::transport::ServerPair::single(primary),
+        };
 
         display_handler
             .set_server_event_sender(rdp_server.primary_event_sender().clone())
@@ -2478,6 +2486,60 @@ impl Drop for LamcoRdpServer {
 /// TLS ClientHello. Only safe on isolated transports (vsock) or loopback.
 pub(crate) fn is_standard_rdp_security(security_mode: &str) -> bool {
     matches!(security_mode, "rdp" | "none")
+}
+
+/// Per-transport security (C1): a second, Standard-RDP-Security server is
+/// built for host-relayed vsock connections when the vsock transport is
+/// resolved and the primary is NOT already plain (`security_mode = "rdp"`
+/// makes the primary itself plain — nothing secondary to build). vmms
+/// terminates TLS/CredSSP on the host and relays plaintext RDP over the
+/// hypervisor-isolated vsock; a TLS/Hybrid-configured server fails that with
+/// "received corrupt message ... InvalidContentType" (upstream #52) or
+/// "server requires HYBRID|HYBRID_EX".
+fn needs_vsock_plain_server(config: &crate::config::Config) -> bool {
+    let vsock_active = {
+        #[cfg(feature = "vsock")]
+        {
+            config
+                .server
+                .transports
+                .resolve(&config.server.listen_addr)
+                .is_ok_and(|t| t.vsock.is_some())
+        }
+        #[cfg(not(feature = "vsock"))]
+        {
+            false
+        }
+    };
+    vsock_active && !is_standard_rdp_security(&config.security.security_mode)
+}
+
+/// Log the vsock plain-server decision, loudly when it bypasses configured
+/// authentication.
+///
+/// The plain server never runs CredSSP, so the PAM credential validator
+/// installed on the primary does not apply to vsock-originated connections —
+/// they are accepted on the host-relay's say-so alone. That is the intended
+/// Hyper-V Enhanced Session design (vmms authenticates the user before
+/// forwarding), but it must be visible, not silent: with auth_method set to
+/// anything but "none", say it loudly so an operator hardening TCP auth knows
+/// vsock is the open flank. (Mitigated by the CID allowlist; on the
+/// auto-detect path it defaults to [VMADDR_CID_HOST].)
+fn log_vsock_plain_server(config: &crate::config::Config) {
+    info!(
+        "Security: vsock transport active — building a second server with \
+         Standard RDP Security for Hyper-V Enhanced Session (vmconnect) \
+         connections; TCP/Unix/WebSocket keep their configured security"
+    );
+    if config.security.auth_method != "none" {
+        warn!(
+            auth_method = %config.security.auth_method,
+            "Security: the vsock plain-RDP server does NOT authenticate \
+             (no CredSSP/PAM) — access control is the host relay's job. \
+             Restrict [server.transports.vsock] allowed_cids if this is \
+             unintended."
+        );
+    }
 }
 
 /// Resolve the effective security mode from config.
