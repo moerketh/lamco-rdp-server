@@ -83,6 +83,10 @@ impl LamcoCliprdrFactory {
         tokio::spawn(async move {
             info!("🔗 RDP clipboard event bridge task started");
 
+            // One host copy can arrive as two identical Format Lists; handling
+            // both double-fetches the file list and vmconnect fails one fetch.
+            let mut format_list_dedup = hyperv_rdp_extras::clipboard::FormatListDedup::default();
+
             loop {
                 // Poll for events (ClipboardEventReceiver uses try_recv, not async recv)
                 if let Some(rdp_event) = receiver.try_recv() {
@@ -92,6 +96,16 @@ impl LamcoCliprdrFactory {
 
                     match rdp_event {
                         ClipboardEvent::RemoteCopy { formats } => {
+                            if !format_list_dedup.admit(
+                                formats.iter().map(|f| (f.id().value(), f.name().map(|n| n.value()))),
+                                std::time::Instant::now(),
+                            ) {
+                                info!(
+                                    "🔗 Bridge: RDP RemoteCopy ({} formats) repeats the previous list — echo of the same copy, skipped",
+                                    formats.len()
+                                );
+                                continue;
+                            }
                             info!(
                                 "🔗 Bridge: RDP RemoteCopy ({} formats) → ClipboardManager",
                                 formats.len()
