@@ -39,6 +39,15 @@ use crate::clipboard::error::{ClipboardError, Result};
 /// Maximum bytes per FileContentsRequest chunk (64 MB)
 const MAX_CHUNK_SIZE: u64 = 64 * 1024 * 1024;
 
+/// Create the directory a staged entry lands in (it may sit inside a copied
+/// directory whose own descriptor has not been processed).
+fn create_parent_dir(path: &std::path::Path) -> std::io::Result<()> {
+    match path.parent() {
+        Some(parent) => std::fs::create_dir_all(parent),
+        None => Ok(()),
+    }
+}
+
 /// A file being received from Windows (download in progress).
 #[derive(Debug)]
 struct IncomingFile {
@@ -48,6 +57,10 @@ struct IncomingFile {
     total_size: u64,
     received_size: u64,
     temp_path: PathBuf,
+    /// Where the finished file goes: its place in the copied tree.
+    final_path: PathBuf,
+    /// Announce `final_path` once done (a copied item, not a nested entry).
+    top_level: bool,
     file_handle: File,
     /// Index in the FileGroupDescriptorW list (for continuation requests)
     file_index: u32,
@@ -200,6 +213,34 @@ impl FileTransferBackend for StagingFileTransfer {
         }
 
         for desc in descriptors {
+            let final_path = state.download_dir.join(&desc.relative_path);
+
+            if desc.is_directory || desc.size == 0 {
+                // Nothing to fetch for a directory or a zero-byte file. A RANGE
+                // request past the end of the stream is rejected by IronRDP's
+                // request_file_contents() as a PDU error that drops the whole
+                // connection, so materialise the entry locally instead.
+                let made = if desc.is_directory {
+                    std::fs::create_dir_all(&final_path)
+                } else {
+                    create_parent_dir(&final_path).and_then(|()| File::create(&final_path).map(drop))
+                };
+                match made {
+                    Ok(()) => {
+                        info!("Staged empty entry: {}", final_path.display());
+                        if desc.top_level {
+                            state.completed_files.push(final_path);
+                        }
+                    }
+                    Err(e) => error!(
+                        "Failed to create '{}': {}",
+                        final_path.display(),
+                        e
+                    ),
+                }
+                continue;
+            }
+
             let stream_id = self.next_stream_id.fetch_add(1, Ordering::Relaxed);
 
             info!(
@@ -229,17 +270,15 @@ impl FileTransferBackend for StagingFileTransfer {
                 total_size: desc.size,
                 received_size: 0,
                 temp_path,
+                final_path,
+                top_level: desc.top_level,
                 file_handle,
                 file_index: desc.file_index,
                 clip_data_id: desc.clip_data_id,
             };
             state.incoming_files.insert(stream_id, incoming);
 
-            let request_size = if desc.size > 0 {
-                desc.size.min(MAX_CHUNK_SIZE) as u32
-            } else {
-                MAX_CHUNK_SIZE as u32
-            };
+            let request_size = desc.size.min(MAX_CHUNK_SIZE) as u32;
 
             match server_event_sender.send(ServerEvent::Clipboard(
                 ClipboardMessage::SendFileContentsRequest(CliprdrFileContentsRequest {
@@ -277,6 +316,18 @@ impl FileTransferBackend for StagingFileTransfer {
             }
         }
 
+        if state.incoming_files.is_empty() {
+            // Every entry was zero-byte: nothing is in flight, so no
+            // FileContentsResponse will ever complete the paste.
+            let paths = std::mem::take(&mut state.completed_files);
+            state.portal_serial = None;
+            return Ok(if paths.is_empty() {
+                PrepareResult::Failed("No files could be staged".to_string())
+            } else {
+                PrepareResult::Ready(paths)
+            });
+        }
+
         info!(
             "Initiated staging transfer for {} file(s), waiting for responses...",
             state.incoming_files.len()
@@ -310,7 +361,6 @@ impl FileTransferBackend for StagingFileTransfer {
         );
 
         let mut state = self.state.write();
-        let download_dir = state.download_dir.clone();
 
         let file = match state.incoming_files.get_mut(&stream_id) {
             Some(f) => f,
@@ -362,9 +412,10 @@ impl FileTransferBackend for StagingFileTransfer {
                 .map_err(|e| ClipboardError::FileIoError(format!("Failed to flush file: {e}")))?;
 
             let temp_path = file.temp_path.clone();
-            let filename = file.filename.clone();
-            let final_path = download_dir.join(&filename);
-            state.completed_files.push(final_path.clone());
+            let final_path = file.final_path.clone();
+            if file.top_level {
+                state.completed_files.push(final_path.clone());
+            }
             state.incoming_files.remove(&stream_id);
 
             let all_complete = state.incoming_files.is_empty();
@@ -374,7 +425,9 @@ impl FileTransferBackend for StagingFileTransfer {
             // Release lock before file rename
             drop(state);
 
-            std::fs::rename(&temp_path, &final_path).map_err(|e| {
+            create_parent_dir(&final_path)
+                .and_then(|()| std::fs::rename(&temp_path, &final_path))
+                .map_err(|e| {
                 error!(
                     "Failed to move '{}' to '{}': {}",
                     temp_path.display(),
@@ -590,5 +643,106 @@ mod tests {
         let id1 = backend.allocate_stream_id();
         let id2 = backend.allocate_stream_id();
         assert_eq!(id2, id1 + 1);
+    }
+
+    fn descriptor(filename: &str, size: u64, file_index: u32) -> TransferFileDescriptor {
+        TransferFileDescriptor {
+            filename: filename.to_string(),
+            size,
+            file_index,
+            clip_data_id: 1,
+            relative_path: PathBuf::from(filename),
+            is_directory: false,
+            top_level: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_zero_byte_entries_are_staged_without_a_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = StagingFileTransfer::new(dir.path().to_path_buf());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        let result = backend
+            .prepare_files(&[descriptor("empty.dat", 0, 0)], 7, &tx)
+            .await
+            .unwrap();
+
+        match result {
+            PrepareResult::Ready(paths) => assert_eq!(paths, vec![dir.path().join("empty.dat")]),
+            other => panic!("expected Ready, got {other:?}"),
+        }
+        assert_eq!(std::fs::metadata(dir.path().join("empty.dat")).unwrap().len(), 0);
+        assert!(rx.try_recv().is_err(), "no FileContentsRequest for a zero-byte entry");
+    }
+
+    #[tokio::test]
+    async fn test_mixed_paste_requests_only_sized_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = StagingFileTransfer::new(dir.path().to_path_buf());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        let result = backend
+            .prepare_files(&[descriptor("dir", 0, 0), descriptor("a.txt", 5, 1)], 7, &tx)
+            .await
+            .unwrap();
+
+        assert!(matches!(result, PrepareResult::Pending));
+        match rx.try_recv().unwrap() {
+            ServerEvent::Clipboard(ClipboardMessage::SendFileContentsRequest(req)) => {
+                assert_eq!(req.index, 1);
+                assert_eq!(req.requested_size, 5);
+            }
+            _ => panic!("expected a FileContentsRequest"),
+        }
+        assert!(rx.try_recv().is_err(), "exactly one request");
+
+        backend.deliver_file_data(1, b"hello".to_vec(), false).await.unwrap();
+        assert_eq!(std::fs::read(dir.path().join("a.txt")).unwrap(), b"hello");
+        assert!(dir.path().join("dir").exists());
+    }
+
+    #[tokio::test]
+    async fn test_copied_directory_is_rebuilt_and_announced_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = StagingFileTransfer::new(dir.path().to_path_buf());
+        let mut events = backend.subscribe();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let nested = |name: &str, path: &str, size: u64, idx: u32, is_dir: bool| {
+            TransferFileDescriptor {
+                relative_path: PathBuf::from(path),
+                is_directory: is_dir,
+                top_level: !path.contains('/'),
+                ..descriptor(name, size, idx)
+            }
+        };
+
+        let result = backend
+            .prepare_files(
+                &[
+                    nested("dir one", "dir one", 0, 0, true),
+                    nested("sub", "dir one/sub", 0, 1, true),
+                    nested("nested.txt", "dir one/sub/nested.txt", 5, 2, false),
+                ],
+                7,
+                &tx,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(result, PrepareResult::Pending));
+
+        backend.deliver_file_data(1, b"hello".to_vec(), false).await.unwrap();
+
+        assert_eq!(
+            std::fs::read(dir.path().join("dir one/sub/nested.txt")).unwrap(),
+            b"hello"
+        );
+        match events.try_recv().unwrap() {
+            FileTransferEvent::FilesReady { paths, portal_serial } => {
+                assert_eq!(portal_serial, 7);
+                assert_eq!(paths, vec![dir.path().join("dir one")], "only the copied item");
+            }
+            other => panic!("expected FilesReady, got {other:?}"),
+        }
     }
 }

@@ -87,10 +87,12 @@ lamco-rdp-clipboard = "0.5.0"
 # spawns a duplicate containment with default wallpaper (the churned-VM
 # 'generic KDE background'). Adoption is conservative: only when screen 0
 # is unoccupied.
-# experiment/kwin-inplace-mode: adds KdeOutputManager::try_change_mode_in_place
-# (in-place virtual-output mode change via kde-output-management-v2 custom
-# modes; experiment D). Gated at runtime by LAMCO_KWIN_INPLACE_MODE=1.
-hyperv-rdp-extras = { git = "https://github.com/moerketh/hyperv-rdp-extras", rev = "8dcaf6aea928d2123ac7ba0ece45082b62eeaa4e", default-features = false, features = ["geometry", "transport", "cursor", "kwin-virtual"] }
+# 51c0b0a: clipboard review fixes (Windows-safe guest names, special files
+# skipped, dedup/retry contracts) on top of EarlyRequestRetry +
+# FormatListDedup + file-paste tree planning; see that repo's PROVENANCE.md.
+# The in-place KWin mode change (try_change_mode_in_place) is now
+# default-on: LAMCO_KWIN_INPLACE_MODE=0 is the emergency off-switch.
+hyperv-rdp-extras = { git = "https://github.com/moerketh/hyperv-rdp-extras", rev = "51c0b0a78ce4372fd1b7a8c9680ec610c0fe7cbf", default-features = false, features = ["geometry", "transport", "cursor", "kwin-virtual", "clipboard"] }
 
 # -----------------------------------------------------------------------------
 # Async runtime

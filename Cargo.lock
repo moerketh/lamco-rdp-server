@@ -2885,7 +2885,7 @@ dependencies = [
 [[package]]
 name = "hyperv-rdp-extras"
 version = "0.1.0"
-source = "git+https://github.com/moerketh/hyperv-rdp-extras?rev=8dcaf6aea928d2123ac7ba0ece45082b62eeaa4e#8dcaf6aea928d2123ac7ba0ece45082b62eeaa4e"
+source = "git+https://github.com/moerketh/hyperv-rdp-extras?rev=51c0b0a78ce4372fd1b7a8c9680ec610c0fe7cbf#51c0b0a78ce4372fd1b7a8c9680ec610c0fe7cbf"
 dependencies = [
  "anyhow",
  "bitflags 2.11.0",

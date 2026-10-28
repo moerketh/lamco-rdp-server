@@ -148,6 +148,14 @@ pub struct ClipboardOrchestratorConfig {
     /// See `crate::config::types::ClipboardConfig::kde_syncselection_hint` for details.
     /// Default: false (disabled)
     pub kde_syncselection_hint: bool,
+
+    /// File-transfer backend override (`[clipboard] file_transfer_mode`):
+    /// "fuse", "staging" or "portal"; None = automatic selection.
+    pub file_transfer_mode: Option<String>,
+
+    /// Staging download directory (`[clipboard] file_transfer_download_dir`);
+    /// None = `$HOME/Downloads`.
+    pub file_transfer_download_dir: Option<PathBuf>,
 }
 
 impl Default for ClipboardOrchestratorConfig {
@@ -163,6 +171,8 @@ impl Default for ClipboardOrchestratorConfig {
             loop_detection_window_ms: 500,
             rate_limit_ms: 200,            // Max 5 events/second
             kde_syncselection_hint: false, // Disabled by default
+            file_transfer_mode: None,
+            file_transfer_download_dir: None,
         }
     }
 }
@@ -565,10 +575,12 @@ impl ClipboardOrchestrator {
         let (event_tx, event_rx) = mpsc::channel(100);
 
         // File transfer backend: select based on deployment mode and config
-        let download_dir = std::env::var("HOME").ok().map_or_else(
-            || PathBuf::from("/tmp"),
-            |h| PathBuf::from(h).join("Downloads"),
-        );
+        let download_dir = config.file_transfer_download_dir.clone().unwrap_or_else(|| {
+            std::env::var("HOME").ok().map_or_else(
+                || PathBuf::from("/tmp"),
+                |h| PathBuf::from(h).join("Downloads"),
+            )
+        });
 
         let file_transfer_backend = {
             use crate::clipboard::file_transfer::{
@@ -577,7 +589,7 @@ impl ClipboardOrchestrator {
             };
 
             let in_flatpak = crate::config::is_flatpak();
-            let mode = FileTransferMode::select(in_flatpak, None);
+            let mode = FileTransferMode::select(in_flatpak, config.file_transfer_mode.as_deref());
 
             let backend: Box<dyn FileTransferBackend> = match mode {
                 FileTransferMode::Fuse => {
@@ -1288,7 +1300,13 @@ impl ClipboardOrchestrator {
             }
 
             ClipboardEvent::RdpDataError => {
-                Self::handle_rdp_data_error(clipboard_provider, pending_portal_requests).await
+                Self::handle_rdp_data_error(
+                    clipboard_provider,
+                    pending_portal_requests,
+                    current_rdp_formats,
+                    server_event_sender,
+                )
+                .await
             }
 
             ClipboardEvent::RdpFileContentsRequest {
@@ -1339,6 +1357,7 @@ impl ClipboardOrchestrator {
                     file_transfer_backend,
                     server_event_sender,
                     transfer_data_cache,
+                    pending_portal_requests,
                 )
                 .await
             }
@@ -1614,6 +1633,21 @@ mod tests {
         let manager = ClipboardOrchestrator::new(config).await.unwrap();
 
         assert!(manager.event_tx.capacity() > 0);
+    }
+
+    #[tokio::test]
+    async fn test_configured_staging_mode_is_honoured() {
+        // `[clipboard] file_transfer_mode` used to be parsed and then ignored
+        // (select() got None): a sandboxed unit could not opt out of FUSE.
+        let dir = std::env::temp_dir().join("lamco-staging-mode-test");
+        let config = ClipboardOrchestratorConfig {
+            file_transfer_mode: Some("staging".to_string()),
+            file_transfer_download_dir: Some(dir),
+            ..ClipboardOrchestratorConfig::default()
+        };
+        let manager = ClipboardOrchestrator::new(config).await.unwrap();
+
+        assert_eq!(manager.file_transfer_backend.read().await.name(), "Staging Download");
     }
 
     #[tokio::test]

@@ -9,6 +9,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Add entries here as work lands; retitle to the release version and date when the release is cut.
 
+## [1.4.5-hyperv.7] - 2026-10-28
+
+Clipboard reliability and the in-place KWin mode change. Campaign-3
+follow-ups, each reproduced live before the change.
+
+### Added
+
+- **In-place KWin virtual-output mode change** (experiment D): a resize
+  of the live virtual output goes through
+  `KdeOutputManager::try_change_mode_in_place` (kde-output-management-v2
+  custom modes, `hyperv-rdp-extras` `kwin-virtual`) instead of
+  destroy/recreate — no Plasma relayout, no containment churn, no heal
+  cascade. Measured 32–40 ms apply on connect into a parked/idle pipe.
+  Default-on; `LAMCO_KWIN_INPLACE_MODE=0` is the emergency off-switch,
+  falling back to the recreate stream path.
+
+### Fixed
+
+- **Connect-time heal cascade** no longer races Plasma's elastic
+  relayout (display).
+- **Clipboard file paste, both directions** (via the
+  `hyperv-rdp-extras` clipboard planning helpers): a pasted Windows
+  directory is staged as its tree (directories created, empty entries
+  materialised locally instead of a rejected RANGE request that killed
+  the session), only copied items are announced, and a copied local
+  directory is offered with its contents parents-first. The
+  FileGroupDescriptorW answer path is deduplicated into
+  `deliver_file_list`, which answers every pending file-MIME serial
+  (GNOME races the paste with clipboard-manager polls) and drains the
+  stale paste so the next text paste is not mispaired.
+- **Clipboard settings are actually read**: `[clipboard]`
+  `file_transfer_mode` and `file_transfer_download_dir` were parsed and
+  dropped; the pending paste that IronRDP intercepts as a
+  RemoteFileList is answered instead of hanging.
+- **A1/A3 resize**: a non-resizable capture (Mutter Direct,
+  portal-generic, ScreenCastOnly, wlr-direct) no longer adopts the
+  client desktop size — the EGFX surface is built from the live
+  capture size, so the client no longer re-advertises caps and drops
+  with a protocol error.
+- **GNOME over vsock**: the Portal Token path builds a second plain-RDP
+  server for vsock exactly like the self-sufficient path
+  (`needs_vsock_plain_server` extracted and shared) — GNOME connections
+  over vsock previously failed the TLS handshake.
+- **Format List echo**: one Windows copy can arrive as two identical
+  Format Lists (Explorer updates twice, vmconnect forwards each);
+  the duplicate is dropped (`FormatListDedup`) so the copy is handled
+  once and the concurrent double-fetch that broke the paste is gone.
+- **Early request failures retried**: vmconnect can fail a Format Data
+  Request sent within a millisecond of its own Format List (Explorer's
+  clipboard is still being filled) and answer the same request a moment
+  later; such failures are re-requested on a 100/250/500 ms backoff
+  (`EarlyRequestRetry`), retired when a new copy arrives. Genuine
+  failures still reach the paste immediately.
+
+### Changed
+
+- `hyperv-rdp-extras` re-pinned to `51c0b0a` (clipboard helpers +
+  review fixes: Windows-safe guest names, special files skipped,
+  dedup/retry contracts).
+- `lamco-pipewire` routes through the 0.6-line stride-fix backport
+  (`moerketh/lamco-wayland` `fix/pipewire-stride-warn-once-0.6`,
+  crate 0.6.15, `[patch.crates-io]`): the per-frame stride-mismatch
+  warn flood is logged once per distinct signature. Drop the patch
+  entry once the fix publishes to crates.io.
+
 ## [1.4.5-hyperv.3] - 2026-09-14
 
 The fork-authored, upstream-absent modules move into the standalone
