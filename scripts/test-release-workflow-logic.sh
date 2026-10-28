@@ -85,8 +85,8 @@ assert_contains "$BRAS" '--skip-pacman) SKIP_PACMAN=1; shift ;;' \
   "--skip-pacman flag parsed"
 assert_contains "$BRAS" '[[ "$SKIP_PACMAN" -eq 0 ]] && build_pacman' \
   "main() calls build_pacman"
-assert_contains "$BRAS" 'local pkgver="${LAMCO_RELEASE_VERSION}-${PACMAN_PKGREL}"' \
-  "pkgver combines LAMCO_RELEASE_VERSION with PACMAN_PKGREL"
+assert_contains "$BRAS" 'local pkgver="$(printf '"'"'%s'"'"' "$LAMCO_RELEASE_VERSION" | tr '"'"'-'"'"' '"'"'.'"'"')-${PACMAN_PKGREL}"' \
+  "pkgver combines LAMCO_RELEASE_VERSION (hyphens -> dots: Arch pkgver grammar) with PACMAN_PKGREL"
 assert_contains "$BRAS" 'lamco-rdp-server-${pkgver}-${ARCH}.pkg.tar.zst' \
   "artifact name uses <name>-<pkgver>-<arch>.pkg.tar.zst"
 assert_contains "$BRAS" '"$(tar --zstd -tf "$out" | head -1)" == ".PKGINFO"' \

@@ -4,7 +4,7 @@
 # Produces (under dist/release/):
 #   lamco-rdp-server_<ver>_amd64.deb          — Debian/Ubuntu/Parrot package
 #   lamco-rdp-server-<ver>-linux-x86_64.tar.gz — portable binary tarball with install.sh
-#   lamco-rdp-server-<ver>-1-x86_64.pkg.tar.zst — pacman package (Arch/Manjaro etc.)
+#   lamco-rdp-server-<ver-with-dots>-1-x86_64.pkg.tar.zst — pacman package (Arch/Manjaro etc.)
 #   SHA256SUMS.txt                            — checksums for all artifacts
 #
 # <ver> comes from --version (default: Cargo.toml version + -hyperv1 suffix,
@@ -551,7 +551,10 @@ EOF
 # ---------------------------------------------------------------------------
 build_pacman() {
   local stage="${STAGE_ROOT}/pacman-stage"
-  local pkgver="${LAMCO_RELEASE_VERSION}-${PACMAN_PKGREL}"
+  # Arch pkgver grammar forbids hyphens (the pkgver-pkgrel split): the
+  # lineage marker's hyphen becomes a dot (1.4.5-hyperv7 -> 1.4.5.hyperv7)
+  # and the pkgrel is appended with the one legal hyphen.
+  local pkgver="$(printf '%s' "$LAMCO_RELEASE_VERSION" | tr '-' '.')-${PACMAN_PKGREL}"
   local out="${DIST_DIR}/lamco-rdp-server-${pkgver}-${ARCH}.pkg.tar.zst"
   rm -rf "$stage"
   mkdir -p "$stage"
