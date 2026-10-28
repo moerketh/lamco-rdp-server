@@ -1300,7 +1300,13 @@ impl ClipboardOrchestrator {
             }
 
             ClipboardEvent::RdpDataError => {
-                Self::handle_rdp_data_error(clipboard_provider, pending_portal_requests).await
+                Self::handle_rdp_data_error(
+                    clipboard_provider,
+                    pending_portal_requests,
+                    current_rdp_formats,
+                    server_event_sender,
+                )
+                .await
             }
 
             ClipboardEvent::RdpFileContentsRequest {

@@ -90,7 +90,7 @@ lamco-rdp-clipboard = "0.5.0"
 # experiment/kwin-inplace-mode: adds KdeOutputManager::try_change_mode_in_place
 # (in-place virtual-output mode change via kde-output-management-v2 custom
 # modes; experiment D). Gated at runtime by LAMCO_KWIN_INPLACE_MODE=1.
-hyperv-rdp-extras = { git = "https://github.com/moerketh/hyperv-rdp-extras", rev = "1a997bb7f2eec90fd77dc12032f11427fe6373b0", default-features = false, features = ["geometry", "transport", "cursor", "kwin-virtual", "clipboard"] }
+hyperv-rdp-extras = { path = "/mnt/c/repos/moerketh/hyperv-rdp-extras", default-features = false, features = ["geometry", "transport", "cursor", "kwin-virtual", "clipboard"] }
 
 # -----------------------------------------------------------------------------
 # Async runtime

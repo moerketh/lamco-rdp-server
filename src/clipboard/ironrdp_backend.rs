@@ -9,6 +9,7 @@
 //! Integrates with the server's ClipboardOrchestrator for event routing.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use ironrdp_cliprdr::backend::CliprdrBackendFactory;
 use ironrdp_server::ServerEventSender;
@@ -21,6 +22,87 @@ use tokio::sync::{Mutex, mpsc};
 use tracing::{debug, info};
 
 use crate::clipboard::manager::ClipboardOrchestrator;
+
+/// Re-request budget for clipboard data the client failed right after
+/// announcing it (vmconnect refuses requests racing its own Format List).
+/// Shared with the orchestrator's error handler, which issues the retries.
+static EARLY_REQUEST_RETRY: std::sync::Mutex<hyperv_rdp_extras::clipboard::EarlyRequestRetry> =
+    std::sync::Mutex::new(hyperv_rdp_extras::clipboard::EarlyRequestRetry::new());
+
+/// Timestamp of the Format List the clipboard last *handled* (an admitted
+/// list, not an echo): failures within [`EarlyRequestRetry::WINDOW`] of it
+/// count as early.
+static LAST_HANDLED_FORMAT_LIST: std::sync::Mutex<Option<Instant>> =
+    std::sync::Mutex::new(None);
+
+/// Record a failed request and, when it is early (racing the announcing
+/// Format List), take a retry delay from the budget. `None` means the
+/// failure is genuine (or the budget is spent) and should reach the paste.
+pub(super) fn take_retry_delay(format_id: u32, now: Instant) -> Option<std::time::Duration> {
+    let mut retry = EARLY_REQUEST_RETRY.lock().ok()?;
+    let early = LAST_HANDLED_FORMAT_LIST
+        .lock()
+        .ok()
+        .and_then(|t| t.map(|t0| now.saturating_duration_since(t0) <= hyperv_rdp_extras::clipboard::EarlyRequestRetry::WINDOW));
+    if early != Some(true) {
+        debug!(
+            "Format {} request failure is not early (last handled list {:?}) — no retry",
+            format_id,
+            LAST_HANDLED_FORMAT_LIST.lock().ok().and_then(|t| t.map(|t0| now.saturating_duration_since(t0)))
+        );
+        return None;
+    }
+    retry.next_delay()
+}
+
+/// A Format List was admitted and is being handled: its timestamp opens the
+/// early-failure window and restarts the retry budget.
+pub(super) fn on_handled_format_list(now: Instant) {
+    if let Ok(mut t) = LAST_HANDLED_FORMAT_LIST.lock() {
+        *t = Some(now);
+    }
+    if let Ok(mut retry) = EARLY_REQUEST_RETRY.lock() {
+        retry.reset();
+    }
+}
+
+/// Dedup for remote Format Lists: one Windows copy can arrive as two
+/// identical lists (Explorer + vmconnect echo); the bridge consults this on
+/// every `RemoteCopy`.
+static FORMAT_LIST_DEDUP: std::sync::Mutex<hyperv_rdp_extras::clipboard::FormatListDedup> =
+    std::sync::Mutex::new(hyperv_rdp_extras::clipboard::FormatListDedup::new(
+        hyperv_rdp_extras::clipboard::FormatListDedup::DEFAULT_WINDOW,
+    ));
+
+/// `true` to handle this remote Format List; `false` when it repeats the
+/// previous one within the echo window (answer the PDU, do not re-handle
+/// the copy). Timestamps the handled list for the early-failure window.
+pub(super) fn admit_format_list<'a>(
+    formats: impl IntoIterator<Item = (u32, Option<&'a str>)>,
+    now: Instant,
+) -> bool {
+    let Some(mut dedup) = FORMAT_LIST_DEDUP.lock().ok() else {
+        return true;
+    };
+    let admit = dedup.admit(formats, now);
+    if admit {
+        on_handled_format_list(now);
+    }
+    admit
+}
+
+/// The guest announced its own formats (a local copy): the next remote
+/// Format List is a new copy, never an echo of the previous remote one.
+pub(super) fn on_local_format_announce() {
+    if let Ok(mut dedup) = FORMAT_LIST_DEDUP.lock() {
+        dedup.reset();
+    }
+    // A local copy also supersedes the remote one: stale eager-fetch
+    // failures must not consume the next copy's retry budget.
+    if let Ok(mut t) = LAST_HANDLED_FORMAT_LIST.lock() {
+        *t = None;
+    }
+}
 
 /// Server-specific clipboard backend factory
 ///
@@ -83,10 +165,6 @@ impl LamcoCliprdrFactory {
         tokio::spawn(async move {
             info!("🔗 RDP clipboard event bridge task started");
 
-            // One host copy can arrive as two identical Format Lists; handling
-            // both double-fetches the file list and vmconnect fails one fetch.
-            let mut format_list_dedup = hyperv_rdp_extras::clipboard::FormatListDedup::default();
-
             loop {
                 // Poll for events (ClipboardEventReceiver uses try_recv, not async recv)
                 if let Some(rdp_event) = receiver.try_recv() {
@@ -96,7 +174,7 @@ impl LamcoCliprdrFactory {
 
                     match rdp_event {
                         ClipboardEvent::RemoteCopy { formats } => {
-                            if !format_list_dedup.admit(
+                            if !admit_format_list(
                                 formats.iter().map(|f| (f.id().value(), f.name().map(|n| n.value()))),
                                 std::time::Instant::now(),
                             ) {
@@ -147,7 +225,9 @@ impl LamcoCliprdrFactory {
 
                         ClipboardEvent::FormatDataResponse { data, is_error } => {
                             if is_error {
-                                // Error response is expected when client doesn't have the format
+                                // Error response is expected when client doesn't have the format.
+                                // Retry timing is decided where the failure is handled
+                                // (handle_rdp_data_error) against the handled Format List.
                                 debug!(
                                     "🔗 Bridge: RDP FormatDataResponse (format unavailable) → ClipboardManager"
                                 );

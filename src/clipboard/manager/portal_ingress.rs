@@ -255,6 +255,11 @@ impl ClipboardOrchestrator {
             info!("   Format {}: ID={}, Name={:?}", idx, fmt.id.0, name_str);
         }
 
+        // The local selection now owns the clipboard: a Format List the
+        // remote sends next is a new copy, never an echo of its previous
+        // one, and any stale early-failure window is closed.
+        crate::clipboard::ironrdp_backend::on_local_format_announce();
+
         // Linux → Windows file copy: when the local clipboard offers files, record the
         // file list in IronRDP via initiate_file_copy. A plain initiate_copy leaves the
         // list empty, so the client's FileContentsRequest is rejected with "no file list

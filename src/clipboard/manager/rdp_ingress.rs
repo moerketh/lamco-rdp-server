@@ -58,6 +58,12 @@ static READ_FAILURE_LOG: std::sync::Mutex<Option<(String, std::time::Instant, u3
 /// rather than a new event.
 const READ_FAILURE_WINDOW: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// The re-request budget lives in [`crate::clipboard::ironrdp_backend`],
+/// shared with the bridge that timestamps failures against the announcing
+/// Format List. A retry still waiting when a new copy arrives must not
+/// fire for the old paste: the generation tag below retires it.
+static RETRY_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 impl ClipboardOrchestrator {
     /// Handle RDP format list announcement
     #[expect(
@@ -82,6 +88,8 @@ impl ClipboardOrchestrator {
         remote_owns_selection: &Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<()> {
         debug!("RDP format list received: {:?}", formats);
+        // A new copy: any retry still waiting is for the previous copy.
+        RETRY_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
         // Registered format IDs vary per session, store for later lookup
         {
@@ -1478,12 +1486,75 @@ impl ClipboardOrchestrator {
     pub(super) async fn handle_rdp_data_error(
         clipboard_provider: &SharedClipboardProvider,
         pending_portal_requests: &PendingPortalRequests,
+        current_rdp_formats: &Arc<RwLock<Vec<ClipboardFormat>>>,
+        server_event_sender: &ServerEventSender,
     ) -> Result<()> {
         debug!("RDP FormatDataResponse: format not available, notifying clipboard backend");
 
         let pending = pending_portal_requests.read().await;
         let entries: Vec<(u32, String)> = pending.iter().map(|(s, m, _)| (*s, m.clone())).collect();
         drop(pending);
+
+        // The client failed a request it can answer a moment later (vmconnect
+        // refuses requests that race its own Format List): ask again shortly
+        // instead of failing the paste. Covers an eager fetch (its sentinel
+        // stays queued for the retried response), a file paste waiting on the
+        // file list, and the data-control file-list fetch, which queues no
+        // entry at all. The budget itself was consulted when the failure
+        // arrived (the bridge timestamps it against the Format List); only
+        // the format id to re-request is decided here.
+        let eager_format = entries
+            .iter()
+            .find(|(s, _)| *s == EAGER_FETCH_SERIAL)
+            .and_then(|(_, m)| match m.as_str() {
+                "text/plain" => Some(13),
+                m => m
+                    .strip_prefix("eager-html:")
+                    .or_else(|| m.strip_prefix("eager-image:"))
+                    .and_then(|id| id.parse().ok()),
+            });
+        let wants_files = entries
+            .iter()
+            .any(|(_, m)| hyperv_rdp_extras::clipboard::FILE_PASTE_MIMES.contains(&m.as_str()));
+        let file_list_id = current_rdp_formats
+            .read()
+            .await
+            .iter()
+            .find(|f| f.name.as_deref() == Some("FileGroupDescriptorW"))
+            .map(|f| f.id);
+        let retry_format =
+            eager_format.or(file_list_id.filter(|_| wants_files || entries.is_empty()));
+        let generation = RETRY_GENERATION.load(std::sync::atomic::Ordering::SeqCst);
+        if let Some(format_id) = retry_format
+            && let Some(delay) =
+                crate::clipboard::ironrdp_backend::take_retry_delay(
+                    format_id,
+                    std::time::Instant::now(),
+                )
+        {
+            info!(
+                "RDP client failed the request for format {}; re-requesting in {} ms",
+                format_id,
+                delay.as_millis()
+            );
+            let sender = Arc::clone(server_event_sender);
+            tokio::spawn(async move {
+                tokio::time::sleep(delay).await;
+                // A new copy arrived while waiting: the retry is stale.
+                if RETRY_GENERATION.load(std::sync::atomic::Ordering::SeqCst) != generation {
+                    debug!("Retry for format {} retired by a new format list", format_id);
+                    return;
+                }
+                broadcast_server_event(&sender, || {
+                    use ironrdp_cliprdr::{backend::ClipboardMessage, pdu::ClipboardFormatId};
+                    ironrdp_server::ServerEvent::Clipboard(ClipboardMessage::SendInitiatePaste(
+                        ClipboardFormatId(format_id),
+                    ))
+                })
+                .await;
+            });
+            return Ok(());
+        }
 
         match *clipboard_provider.read().await {
             Some(ref provider) => {
